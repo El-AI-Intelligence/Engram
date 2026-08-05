@@ -1,0 +1,16 @@
+[Unit]
+Description=Engram Memory Vault — mock API + UI server
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/engram/ui
+ExecStart=/usr/bin/python3 server.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=engram-server
+
+[Install]
+WantedBy=multi-user.target
