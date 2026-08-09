@@ -2,7 +2,7 @@
 // Engram Memory Vault — SPA
 // ==========================================================================
 
-const API = 'http://localhost:8787';
+const API = '';  // relative to origin — Caddy reverse-proxies to localhost:8787
 
 // ── API client ────────────────────────────────────────────────────────────
 
@@ -64,7 +64,7 @@ function navigate(hash) {
 let currentCleanup = null;
 
 async function render() {
-  const hash = window.location.hash || '#/';
+  const hash = (window.location.hash || '#/').replace(/^#/, '');
   const app = document.getElementById('app');
   const statusbar = document.getElementById('statusbar');
 
