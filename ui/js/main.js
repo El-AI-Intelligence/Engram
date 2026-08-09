@@ -4,6 +4,29 @@
 
 const API = '';  // relative to origin — Caddy reverse-proxies to localhost:8787
 
+// ── Theme toggle ───────────────────────────────────────────────────────────
+
+(function initTheme() {
+  const saved = localStorage.getItem('engram-theme');
+  if (saved === 'light') document.documentElement.setAttribute('data-theme', 'light');
+  const btn = document.getElementById('theme-toggle');
+  if (btn) {
+    btn.textContent = saved === 'light' ? '☾' : '☀';
+    btn.addEventListener('click', () => {
+      const current = document.documentElement.getAttribute('data-theme');
+      if (current === 'light') {
+        document.documentElement.removeAttribute('data-theme');
+        localStorage.setItem('engram-theme', 'dark');
+        btn.textContent = '☀';
+      } else {
+        document.documentElement.setAttribute('data-theme', 'light');
+        localStorage.setItem('engram-theme', 'light');
+        btn.textContent = '☾';
+      }
+    });
+  }
+})();
+
 // ── API client ────────────────────────────────────────────────────────────
 
 async function get(path) {
