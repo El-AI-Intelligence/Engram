@@ -1,0 +1,27 @@
+// ── Engram Memory Vault — public API ────────────────────────────────────
+export { MemoryVault, APIError, ConnectionError } from "./client.js";
+export type {
+  Memory,
+  EngramLink,
+  EvidenceRef,
+  VaultHealth,
+  Stats,
+  ContextAssembly,
+  ConsolidationResult,
+  TemporalPattern,
+  MemoryLayer,
+  MemoryScope,
+  ContentType,
+  MemorySource,
+  PrivacyLevel,
+  LinkType,
+  MemoryVaultOptions,
+  CaptureOptions,
+  SearchOptions,
+  UpdateOptions,
+  LinkOptions,
+  AssembleContextOptions,
+  ExportOptions,
+  PatternOptions,
+  ImportResult,
+} from "./types.js";

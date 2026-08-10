@@ -1,26 +1,68 @@
 {
   "name": "engramd",
   "version": "0.1.0",
-  "description": "Engram Memory Vault CLI — your AI deserves a memory.",
+  "description": "Engram Memory Vault — SDK + CLI. Your AI deserves a memory.",
   "license": "MIT",
   "author": "PixelPhantomAI",
   "repository": "github:PixelPhantomAI/Axiom-OS",
   "homepage": "https://github.com/PixelPhantomAI/Axiom-OS",
-  "keywords": ["memory", "ai", "llm", "claude", "agent", "vault", "engram"],
+  "keywords": [
+    "memory",
+    "ai",
+    "llm",
+    "claude",
+    "agent",
+    "vault",
+    "engram",
+    "mcp"
+  ],
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./mcp": {
+      "import": "./dist/mcp/server.js",
+      "types": "./dist/mcp/server.d.ts"
+    }
+  },
   "bin": {
     "engram": "./bin/engram",
-    "engramd": "./bin/engramd"
+    "engramd": "./bin/engramd",
+    "engramd-mcp": "./dist/mcp/server.js"
   },
   "scripts": {
-    "postinstall": "node install.js"
+    "build": "tsc",
+    "postinstall": "node install.cjs",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "typescript": "^5.6"
   },
   "engines": {
     "node": ">=18"
   },
-  "os": ["darwin", "linux"],
-  "cpu": ["x64", "arm64"],
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
   "files": [
-    "install.js",
-    "bin/"
+    "install.cjs",
+    "bin/",
+    "dist/",
+    "src/",
+    "README.md"
   ]
 }
