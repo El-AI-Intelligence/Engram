@@ -15,7 +15,8 @@ export type MemorySource =
   | "mic"
   | "agent"
   | "research"
-  | "system";
+  | "system"
+  | "observation";
 export type PrivacyLevel = "strict_local" | "hybrid" | "cloud_first" | "enterprise";
 export type LinkType = "associative" | "causal" | "analogical" | "temporal";
 export type EvidenceRelationship = "supports" | "contradicts" | "context_for";

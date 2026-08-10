@@ -13,6 +13,7 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { MemoryVault, APIError, ConnectionError } from "../client.js";
+import { AutoCapture } from "./observer.js";
 import type {
   MemoryLayer,
   MemorySource,
@@ -42,6 +43,9 @@ function arr(args: MCPArgs, key: string): string[] {
 const vault = new MemoryVault({
   baseUrl: process.env.ENGRAMD_URL ?? "http://localhost:8787",
 });
+
+// ── Auto-capture observer (passive memory) ─────────────────────────────────
+const observer = new AutoCapture(vault);
 
 const server = new Server(
   { name: "engramd-mcp", version: "0.1.0" },
@@ -252,7 +256,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
 
 // ── Tool handlers ───────────────────────────────────────────────────────
 
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
+// ── Inner handler (unwrapped — does the real work) ───────────────────────
+async function handleToolCall(request: {
+  params: { name: string; arguments?: Record<string, unknown> };
+}): Promise<{ content: Array<{ type: string; text: string }> }> {
   const { name, arguments: args } = request.params;
   try {
     switch (name) {
@@ -382,7 +389,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       ],
     };
   }
-});
+}
+
+// Wrap the handler with auto-capture — non-engram tool calls become
+// passive memories (source: "observation") with content-hash dedup.
+server.setRequestHandler(CallToolRequestSchema, observer.wrapHandler(handleToolCall));
 
 // ── Entry point ─────────────────────────────────────────────────────────
 

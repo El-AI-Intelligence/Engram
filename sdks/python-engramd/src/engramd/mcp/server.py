@@ -26,9 +26,11 @@ from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
 from ..client import DEFAULT_BASE, APIError, ConnectionError, MemoryVault
+from .observer import AutoCapture
 
 
 vault = MemoryVault(base_url=os.environ.get("ENGRAMD_URL", DEFAULT_BASE))
+observer = AutoCapture(vault)
 server = Server("engramd-mcp")
 
 
@@ -244,7 +246,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 privacy_level=arguments.get("privacy_level", "cloud_first"),
                 imagined=arguments.get("imagined", False),
             )
-            return [TextContent(type="text", text=f"Memory captured: {mem.id}\n{_json(mem)}")]
+            result = [TextContent(type="text", text=f"Memory captured: {mem.id}\n{_json(mem)}")]
 
         elif name == "engram_search":
             results = vault.search(
@@ -256,12 +258,11 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             text = f"Found {len(results)} memories:\n\n"
             for m in results:
                 text += f"### {m.id} [{m.layer}] strength={m.strength:.2f}\n{m.content[:200]}\n\n"
-            return [TextContent(type="text", text=text)]
+            result = [TextContent(type="text", text=text)]
 
         elif name == "engram_get":
             mem = vault.get(arguments["memory_id"])
-            txt = _json(mem)
-            return [TextContent(type="text", text=txt)]
+            result = [TextContent(type="text", text=_json(mem))]
 
         elif name == "engram_link":
             vault.link(
@@ -270,7 +271,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 weight=arguments.get("weight", 0.5),
                 link_type=arguments.get("link_type", "associative"),
             )
-            return [TextContent(type="text", text=f"Linked {arguments['source_id']} → {arguments['target_id']}")]
+            result = [TextContent(type="text", text=f"Linked {arguments['source_id']} → {arguments['target_id']}")]
 
         elif name == "engram_assemble_context":
             ctx = vault.assemble_context(
@@ -278,18 +279,28 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 token_budget=arguments.get("token_budget", 8192),
                 max_engrams=arguments.get("max_engrams", 12),
             )
-            return [TextContent(type="text", text=_json(ctx))]
+            result = [TextContent(type="text", text=_json(ctx))]
 
         elif name == "engram_health":
             h = vault.health()
-            return [TextContent(type="text", text=_json(h))]
+            result = [TextContent(type="text", text=_json(h))]
 
         elif name == "engram_decay":
             r = vault.run_decay()
-            return [TextContent(type="text", text=f"Decay complete: {r.message}")]
+            result = [TextContent(type="text", text=f"Decay complete: {r.message}")]
 
         else:
-            return [TextContent(type="text", text=f"Unknown tool: {name}")]
+            result = [TextContent(type="text", text=f"Unknown tool: {name}")]
+
+        # Auto-capture non-engram tool calls as passive memories.
+        # Fire-and-forget — capture failures must never break the MCP loop.
+        if not name.startswith("engram_"):
+            try:
+                observer.observe(name, arguments)
+            except Exception:
+                pass
+
+        return result
 
     except APIError as e:
         return [TextContent(type="text", text=f"API error [{e.status}]: {e.detail}")]

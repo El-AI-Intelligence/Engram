@@ -9,6 +9,7 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema, } from "@modelcontextprotocol/sdk/types.js";
 import { MemoryVault, APIError, ConnectionError } from "../client.js";
+import { AutoCapture } from "./observer.js";
 function str(args, key, def = "") {
     return args?.[key] ?? def;
 }
@@ -24,6 +25,8 @@ function arr(args, key) {
 const vault = new MemoryVault({
     baseUrl: process.env.ENGRAMD_URL ?? "http://localhost:8787",
 });
+// ── Auto-capture observer (passive memory) ─────────────────────────────────
+const observer = new AutoCapture(vault);
 const server = new Server({ name: "engramd-mcp", version: "0.1.0" }, { capabilities: { tools: {} } });
 // ── Tool definitions ────────────────────────────────────────────────────
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
@@ -212,7 +215,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     ],
 }));
 // ── Tool handlers ───────────────────────────────────────────────────────
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
+// ── Inner handler (unwrapped — does the real work) ───────────────────────
+async function handleToolCall(request) {
     const { name, arguments: args } = request.params;
     try {
         switch (name) {
@@ -329,7 +333,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             ],
         };
     }
-});
+}
+// Wrap the handler with auto-capture — non-engram tool calls become
+// passive memories (source: "observation") with content-hash dedup.
+server.setRequestHandler(CallToolRequestSchema, observer.wrapHandler(handleToolCall));
 // ── Entry point ─────────────────────────────────────────────────────────
 async function main() {
     const transport = new StdioServerTransport();

@@ -1,7 +1,7 @@
 export type MemoryLayer = "episodic" | "semantic" | "imagined";
 export type MemoryScope = "moment" | "episode" | "narrative" | "rule";
 export type ContentType = "text" | "frames" | "conversation" | "context";
-export type MemorySource = "interaction" | "sensor" | "consolidation" | "chat" | "window" | "mic" | "agent" | "research" | "system";
+export type MemorySource = "interaction" | "sensor" | "consolidation" | "chat" | "window" | "mic" | "agent" | "research" | "system" | "observation";
 export type PrivacyLevel = "strict_local" | "hybrid" | "cloud_first" | "enterprise";
 export type LinkType = "associative" | "causal" | "analogical" | "temporal";
 export type EvidenceRelationship = "supports" | "contradicts" | "context_for";
