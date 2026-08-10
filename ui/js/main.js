@@ -2,6 +2,8 @@
 // Engram Memory Vault — SPA
 // ==========================================================================
 
+import { MemoryGraph } from './graph.js';
+
 const API = '';  // relative to origin — Caddy reverse-proxies to localhost:8787
 
 // ── Theme toggle ───────────────────────────────────────────────────────────
@@ -244,13 +246,13 @@ route('/', async () => {
     return;
   }
 
-  const layerPct = (n) => stats.total_memories ? ((n / stats.total_memories) * 100).toFixed(1) : 0;
+  const layerPct = (n) => stats.total ? ((n / stats.total) * 100).toFixed(1) : 0;
 
   app.innerHTML = `
     <div class="page dashboard">
       <div class="stat-grid">
         <div class="stat-card">
-          <div class="stat-num">${stats.total_memories?.toLocaleString() || 0}</div>
+          <div class="stat-num">${(stats.total || 0).toLocaleString()}</div>
           <div class="stat-label">Memories</div>
         </div>
         <div class="stat-card">
@@ -313,8 +315,9 @@ route('/', async () => {
   try {
     const r = await api.memories.search({ sort_by: 'recency', limit: 5 });
     const feed = document.getElementById('recent-feed');
-    if (r.results && r.results.length) {
-      feed.innerHTML = r.results.map(m => `
+    const feedResults = Array.isArray(r) ? r : (r.results || []);
+    if (feedResults.length) {
+      feed.innerHTML = feedResults.map(m => `
         <a href="#/memories/${m.id}" class="feed-item">
           ${layerIcon(m.layer)} <span class="faint">[${m.source || '?'}]</span>
           ${esc((m.content || '').slice(0, 120))}${(m.content || '').length > 120 ? '…' : ''}
@@ -366,13 +369,14 @@ route('/memories', async () => {
     const sort = document.getElementById('filter-sort').value;
     const results = document.getElementById('explorer-results');
     results.innerHTML = '<div class="loading-sm">Searching…</div>';
-    api.memories.search({ query: q, layer: layer || null, sort_by: sort, limit: 20 }).then(r => {
-      document.getElementById('result-count').textContent = `${r.total || 0} results (${resultLabel(r.search_type)}, ${r.took_ms}ms)`;
-      if (!r.results || !r.results.length) {
+    api.memories.search({ query: q, layer: layer || null, limit: 20 }).then(r => {
+      const list = Array.isArray(r) ? r : (r.results || []);
+      document.getElementById('result-count').textContent = `${list.length} results`;
+      if (!list.length) {
         results.innerHTML = '<div class="faint" style="padding:1rem;">No results.</div>';
         return;
       }
-      results.innerHTML = r.results.map(m => `
+      results.innerHTML = list.map(m => `
         <a href="#/memories/${m.id}" class="memory-card">
           <div class="card-top">
             ${layerIcon(m.layer)}
@@ -383,7 +387,7 @@ route('/memories', async () => {
           <div class="card-content">${esc((m.content || '').slice(0, 200))}${(m.content || '').length > 200 ? '…' : ''}</div>
           <div class="card-footer">
             ${tagList(m.tags)}
-            ${m.links_out && m.links_out.length ? `<span class="faint">→ ${m.links_out.length} links</span>` : ''}
+            ${m.links && m.links.length ? `<span class="faint">→ ${m.links.length} links</span>` : ''}
             ${m.imagined && !m.grounded ? '<span class="badge badge-quarantined">⚠ quarantined</span>' : ''}
           </div>
         </a>
@@ -413,11 +417,12 @@ route('/memories/:id', async (id) => {
     let linksHtml = '';
     try {
       const l = await api.memories.links(id);
-      if (l.outgoing && l.outgoing.length) {
+      const linkList = Array.isArray(l) ? l : (l.outgoing || l.incoming || []);
+      if (linkList.length) {
         linksHtml = `
           <div class="panel" style="margin-top:1rem;">
-            <div class="panel-header">Links (${l.outgoing.length} outgoing)</div>
-            ${l.outgoing.map(ln => `
+            <div class="panel-header">Links (${linkList.length} outgoing)</div>
+            ${linkList.map(ln => `
               <a href="#/memories/${ln.target_id}" class="feed-item">
                 ${ln.link_type === 'causal' ? '▶' : ln.link_type === 'associative' ? '··' : ln.link_type === 'analogical' ? '--' : '··>'}
                 <span class="faint">${ln.link_type}</span>
@@ -485,177 +490,112 @@ route('/graph', async () => {
     <div class="page graph-page">
       <div class="graph-filters">
         <select id="gf-layer" class="filter-select"><option value="">All layers</option><option value="episodic">Episodic</option><option value="semantic">Semantic</option><option value="imagined">Imagined</option></select>
-        <input type="text" id="gf-search" class="search-input" placeholder="Focus on a memory ID…" style="width:260px;">
+        <input type="text" id="gf-search" class="search-input" placeholder="Focus on a memory ID…" style="width:220px;">
         <button class="btn btn-sm" id="gf-search-btn">Focus</button>
-        <button class="btn btn-sm" id="gf-reset">Reset</button>
+        <button class="btn btn-sm" id="gf-reset">Reset view</button>
       </div>
-      <div id="graph-canvas" class="graph-canvas">
-        <div class="faint" style="padding:3rem;text-align:center;">Loading graph data…</div>
-      </div>
-      <div id="graph-legend" class="graph-legend">
-        <span>${layerIcon('episodic')} Episodic</span>
-        <span>${layerIcon('semantic')} Semantic</span>
-        <span>${layerIcon('imagined')} Imagined</span>
-        <span class="faint">|</span>
-        <span style="border-bottom:2px dotted var(--text-faint);">Assoc</span>
-        <span style="border-bottom:2px solid var(--accent);">Causal</span>
-        <span style="border-bottom:2px dashed var(--text-faint);">Analog</span>
-        <span style="border-bottom:2px dotted var(--episodic);">Temp</span>
+      <div id="graph-canvas" class="graph-canvas"></div>
+      <div class="graph-legend">
+        <span class="lg-item"><span class="lg-dot" style="background:#f0a040"></span> Episodic</span>
+        <span class="lg-item"><span class="lg-dot" style="background:#48c0e0"></span> Semantic</span>
+        <span class="lg-item"><span class="lg-dot" style="background:#b080e0"></span> Imagined</span>
+        <span class="lg-sep">·</span>
+        <span class="lg-item"><span class="lg-edge assoc"></span> Assoc</span>
+        <span class="lg-item"><span class="lg-edge causal"></span> Causal</span>
+        <span class="lg-item"><span class="lg-edge analog"></span> Analog</span>
+        <span class="lg-item"><span class="lg-edge temp"></span> Temp</span>
+        <span class="lg-sep">·</span>
+        <span class="lg-hint">🖱 drag · scroll zoom · click expand · dblclick reset</span>
       </div>
     </div>
   `;
 
-  async function loadGraph(filterLayer, focusId) {
-    const canvas = document.getElementById('graph-canvas');
-    try {
-      const r = await api.memories.search({
-        query: focusId ? '' : '',
-        layer: filterLayer || null,
-        sort_by: 'strength',
-        limit: 50,
-        min_strength: 0.2
-      });
-      if (!r.results || !r.results.length) {
-        canvas.innerHTML = '<div class="faint" style="padding:3rem;text-align:center;">No memories to graph.</div>';
-        return;
-      }
+  const container = document.getElementById('graph-canvas');
+  const graph = new MemoryGraph(container);
 
-      const nodes = r.results.map(m => ({
+  // Listen for node expansion requests from the graph engine
+  container.addEventListener('mg-node-expand', async (e) => {
+    const { id } = e.detail;
+    try {
+      let relatedResp = await api.memories.related(id);
+      // Handle both array and {results:[...]} response formats
+      const list = Array.isArray(relatedResp) ? relatedResp : (relatedResp.results || []);
+      const newNodes = list.map(m => ({
         id: m.id,
         label: (m.content || m.id).slice(0, 60),
         layer: m.layer,
         strength: m.strength || 0.5,
         valence: m.valence || 0,
       }));
+      const newEdges = [];
+      for (const n of newNodes) {
+        try {
+          const l = await api.memories.links(n.id);
+          const outgoing = Array.isArray(l) ? l : (l.outgoing || []);
+          for (const ln of outgoing) {
+            if (ln.target_id === id || newNodes.find(x => x.id === ln.target_id)) {
+              newEdges.push({ source: n.id, target: ln.target_id, type: ln.link_type, weight: ln.weight });
+            }
+          }
+        } catch (_) { /* skip */ }
+      }
+      graph.expand(id, newNodes, newEdges);
+    } catch (err) {
+      toast('Expand failed: ' + esc(err.message), 'error');
+    }
+  });
 
-      // Fetch links for first 10 nodes (avoid N+1 storm)
+  async function loadGraph(filterLayer, focusId) {
+    try {
+      const r = await api.memories.search({
+        query: '',
+        layer: filterLayer || null,
+        limit: 50,
+      });
+      const searchResults = Array.isArray(r) ? r : (r.results || []);
+      if (!searchResults.length) {
+        container.innerHTML = '<div class="faint" style="padding:3rem;text-align:center;">No memories to graph.</div>';
+        return;
+      }
+      const nodes = searchResults.map(m => ({
+        id: m.id,
+        label: (m.content || m.id).slice(0, 60),
+        layer: m.layer,
+        strength: m.strength || 0.5,
+        valence: m.valence || 0,
+      }));
       const edges = [];
       for (const n of nodes.slice(0, 10)) {
         try {
           const l = await api.memories.links(n.id);
-          if (l.outgoing) {
-            for (const ln of l.outgoing) {
+          const outgoing = Array.isArray(l) ? l : (l.outgoing || []);
+          if (outgoing && outgoing.length) {
+            for (const ln of outgoing) {
               if (nodes.find(x => x.id === ln.target_id)) {
                 edges.push({ source: n.id, target: ln.target_id, type: ln.link_type, weight: ln.weight });
               }
             }
           }
-        } catch (e) { /* skip */ }
+        } catch (_) { /* skip */ }
       }
-
-      renderGraph(canvas, nodes, edges, focusId);
+      graph.load({ nodes, edges }, focusId || null);
     } catch (e) {
-      canvas.innerHTML = `<div class="error">${esc(e.message)}</div>`;
+      container.innerHTML = `<div class="error">${esc(e.message)}</div>`;
     }
   }
 
   document.getElementById('gf-search-btn').onclick = () => {
     const id = document.getElementById('gf-search').value.trim();
-    loadGraph(document.getElementById('gf-layer').value, id || null);
+    if (id) graph.focus(id);
   };
-  document.getElementById('gf-reset').onclick = () => {
-    document.getElementById('gf-search').value = '';
-    loadGraph('', null);
-  };
+  document.getElementById('gf-reset').onclick = () => graph.resetView();
   document.getElementById('gf-layer').onchange = () => {
-    loadGraph(document.getElementById('gf-layer').value, document.getElementById('gf-search').value.trim() || null);
+    loadGraph(document.getElementById('gf-layer').value, null);
   };
 
   await loadGraph('', null);
   updateStatus();
 });
-
-function renderGraph(container, nodes, edges, focusId) {
-  const w = container.clientWidth || 800;
-  const h = 500;
-  const cx = w / 2, cy = h / 2;
-
-  // Place nodes in a circle initially
-  const angle = (2 * Math.PI) / nodes.length;
-  nodes.forEach((n, i) => {
-    const r = Math.min(w, h) * 0.35;
-    n.x = cx + r * Math.cos(angle * i);
-    n.y = cy + r * Math.sin(angle * i);
-    n.vx = 0; n.vy = 0;
-  });
-
-  // Simple force layout (50 iterations)
-  for (let iter = 0; iter < 50; iter++) {
-    // Repulsion between all pairs
-    for (let i = 0; i < nodes.length; i++) {
-      for (let j = i + 1; j < nodes.length; j++) {
-        const dx = nodes[j].x - nodes[i].x;
-        const dy = nodes[j].y - nodes[i].y;
-        const d = Math.max(1, Math.sqrt(dx * dx + dy * dy));
-        const f = 2000 / (d * d);
-        const fx = (dx / d) * f;
-        const fy = (dy / d) * f;
-        nodes[i].vx -= fx; nodes[i].vy -= fy;
-        nodes[j].vx += fx; nodes[j].vy += fy;
-      }
-    }
-    // Attraction along edges
-    for (const e of edges) {
-      const s = nodes.find(n => n.id === e.source);
-      const t = nodes.find(n => n.id === e.target);
-      if (!s || !t) continue;
-      const dx = t.x - s.x;
-      const dy = t.y - s.y;
-      const d = Math.max(1, Math.sqrt(dx * dx + dy * dy));
-      const f = d * 0.01 * e.weight;
-      s.vx += (dx / d) * f; s.vy += (dy / d) * f;
-      t.vx -= (dx / d) * f; t.vy -= (dy / d) * f;
-    }
-    // Center gravity
-    for (const n of nodes) {
-      n.vx += (cx - n.x) * 0.001;
-      n.vy += (cy - n.y) * 0.001;
-    }
-    // Apply velocity with damping
-    for (const n of nodes) {
-      n.x += n.vx * 0.5;
-      n.y += n.vy * 0.5;
-      n.vx *= 0.9;
-      n.vy *= 0.9;
-      n.x = Math.max(40, Math.min(w - 40, n.x));
-      n.y = Math.max(20, Math.min(h - 20, n.y));
-    }
-  }
-
-  const layerColors = { episodic: 'var(--episodic)', semantic: 'var(--semantic)', imagined: 'var(--imagined)' };
-  const edgeStyles = { associative: '2,4', causal: '', analogical: '6,3', temporal: '2,4' };
-  const edgeColors = { associative: 'var(--text-faint)', causal: 'var(--accent)', analogical: 'var(--text-faint)', temporal: 'var(--episodic)' };
-
-  const edgeSvg = edges.map(e => {
-    const s = nodes.find(n => n.id === e.source);
-    const t = nodes.find(n => n.id === e.target);
-    if (!s || !t) return '';
-    const dash = edgeStyles[e.type] || '';
-    return `<line x1="${s.x}" y1="${s.y}" x2="${t.x}" y2="${t.y}" stroke="${edgeColors[e.type]}" stroke-width="${1 + e.weight}" stroke-dasharray="${dash}" opacity="0.5"/>`;
-  }).join('');
-
-  const nodeSvg = nodes.map(n => {
-    const r = 3 + (n.strength || 0.5) * 6;
-    const color = layerColors[n.layer] || 'var(--text)';
-    const glow = n.id === focusId ? `filter="url(#glow)"` : '';
-    return `<g>
-      <circle cx="${n.x}" cy="${n.y}" r="${r}" fill="${color}" opacity="0.9" ${glow}>
-        <title>${esc(n.label)} (${n.layer})</title>
-      </circle>
-      <text x="${n.x + r + 4}" y="${n.y + 3}" font-size="10" fill="var(--text-muted)" font-family="var(--mono)">${esc(n.label.slice(0, 30))}</text>
-    </g>`;
-  }).join('');
-
-  container.innerHTML = `
-    <svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" style="display:block;">
-      <defs>
-        <filter id="glow"><feGaussianBlur stdDeviation="3" result="g"/><feMerge><feMergeNode in="g"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
-      </defs>
-      <rect width="${w}" height="${h}" fill="var(--bg)"/>
-      ${edgeSvg}
-      ${nodeSvg}
-    </svg>`;
-}
 
 // ── Context ────────────────────────────────────────────────────────────────
 
@@ -722,7 +662,7 @@ route('/context', async () => {
     try {
       const r = await api.context.assemble({ query: q, token_budget: budget });
       prev.innerHTML = `
-        <div class="faint" style="margin-bottom:0.5rem;">${r.metadata?.total_tokens || 0} / ${r.metadata?.budget || budget} tokens · ${r.metadata?.engrams_retrieved || 0} engrams · ${r.metadata?.retrieval_took_ms || 0}ms</div>
+        <div class="faint" style="margin-bottom:0.5rem;">${r.token_count || 0} / ${budget} tokens · ${r.engrams_retrieved || 0} engrams · ${r.took_ms || 0}ms</div>
         <div class="messages-preview">${(r.messages || []).map(m =>
           `<div class="msg-row"><span class="msg-role">[${m.role}]</span> ${esc((m.content || '').slice(0, 300))}${(m.content || '').length > 300 ? '…' : ''}</div>`
         ).join('')}</div>`;
@@ -751,7 +691,7 @@ route('/context', async () => {
 route('/consolidation', async () => {
   const app = document.getElementById('app');
   let history, patterns, stats;
-  try { history = await api.consolidate.history(); } catch (e) { history = { runs: [] }; }
+  try { history = await api.consolidate.history(); } catch (e) { history = []; }
   try { stats = await api.stats(); } catch (e) { stats = null; }
   try { patterns = await api.patterns({ query: '', min_engrams: 3 }); } catch (e) { patterns = null; }
 
@@ -761,7 +701,7 @@ route('/consolidation', async () => {
 
       <div class="panel" style="margin-bottom:1rem;">
         <div class="panel-header">Run History</div>
-        ${(history.runs || []).length ? history.runs.map(r => `
+        ${(Array.isArray(history) ? history : []).length ? history.map(r => `
           <div class="feed-item">
             <span class="faint">${r.run_at || '?'}</span>
             <span class="badge badge-semantic">${r.type || '?'}</span>
@@ -838,8 +778,9 @@ route('/settings', async () => {
       <div class="panel" style="margin-bottom:1rem;">
         <div class="panel-header">Schedule</div>
         <div class="health-list">
-          <div class="health-row">Decay: <span>${config.decay_schedule || 'daily'}</span></div>
-          <div class="health-row">Consolidation: <span>${config.consolidation_schedule || 'weekly'}</span></div>
+          <div class="health-row">Decay: <span>every ${config.schedule?.decay_interval_hours || 1}h (auto: ${config.schedule?.auto_decay !== false ? 'on' : 'off'})</span></div>
+          <div class="health-row">Consolidation: <span>every ${config.schedule?.consolidation_interval_hours || 24}h (auto: ${config.schedule?.auto_consolidation !== false ? 'on' : 'off'})</span></div>
+          <div class="health-row">Embedding model: <span>${config.embedding?.model || 'text-embedding-3-small'} (${config.embedding?.enabled ? 'enabled' : 'disabled'})</span></div>
         </div>
       </div>
 

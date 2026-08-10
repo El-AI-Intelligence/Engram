@@ -1,16 +1,16 @@
 [Unit]
-Description=Engram Memory Vault — mock API + UI server
+Description=Engram Memory Vault — Rust engramd server
 After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=/root/engram/ui
-ExecStart=/usr/bin/python3 server.py
+WorkingDirectory=/root/engram
+ExecStart=/root/engram/engramd --vault /root/engram/vault --bind 127.0.0.1:8787
 Restart=always
 RestartSec=5
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=engram-server
+SyslogIdentifier=engramd
 
 [Install]
 WantedBy=multi-user.target

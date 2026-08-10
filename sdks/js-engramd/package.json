@@ -1,0 +1,26 @@
+{
+  "name": "engramd",
+  "version": "0.1.0",
+  "description": "Engram Memory Vault CLI — your AI deserves a memory.",
+  "license": "MIT",
+  "author": "PixelPhantomAI",
+  "repository": "github:PixelPhantomAI/Axiom-OS",
+  "homepage": "https://github.com/PixelPhantomAI/Axiom-OS",
+  "keywords": ["memory", "ai", "llm", "claude", "agent", "vault", "engram"],
+  "bin": {
+    "engram": "./bin/engram",
+    "engramd": "./bin/engramd"
+  },
+  "scripts": {
+    "postinstall": "node install.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "os": ["darwin", "linux"],
+  "cpu": ["x64", "arm64"],
+  "files": [
+    "install.js",
+    "bin/"
+  ]
+}

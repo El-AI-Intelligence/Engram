@@ -1,0 +1,74 @@
+# ── Engram — Publish workflow ───────────────────────────────────────────
+# Publishes the Python SDK to PyPI and the npm wrapper to npm.
+# Trigger: tag push python-v* or npm-v*, or workflow_dispatch.
+
+name: Publish
+
+on:
+  push:
+    tags: ['python-v*', 'npm-v*']
+  workflow_dispatch:
+    inputs:
+      package:
+        description: 'Package to publish (python, npm, all)'
+        required: true
+        default: 'all'
+        type: choice
+        options: ['python', 'npm', 'all']
+
+permissions:
+  contents: read
+
+jobs:
+  # ── Python SDK → PyPI ────────────────────────────────────────────────
+  pypi:
+    name: Publish Python SDK to PyPI
+    if: |
+      startsWith(github.ref, 'refs/tags/python-v') ||
+      github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdks/python-engramd
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install build tools
+        run: pip install build
+
+      - name: Build
+        run: python -m build
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: sdks/python-engramd/dist/
+
+  # ── npm wrapper → npm ────────────────────────────────────────────────
+  npm:
+    name: Publish npm wrapper to npm
+    if: |
+      startsWith(github.ref, 'refs/tags/npm-v') ||
+      github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdks/js-engramd
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Publish to npm
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

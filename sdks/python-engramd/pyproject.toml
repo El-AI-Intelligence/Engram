@@ -7,10 +7,9 @@ name = "engramd"
 version = "0.1.0"
 description = "Python client for the Engram Memory Vault"
 readme = "README.md"
-license = "Apache-2.0"
+license = "MIT"
 requires-python = ">=3.10"
 dependencies = [
-    "requests>=2.31",
     "sseclient-py>=1.8",
 ]
 
