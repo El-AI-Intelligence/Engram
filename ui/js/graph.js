@@ -50,6 +50,14 @@ export class MemoryGraph {
     this.focusNode     = null;
     this.focusPulse    = 0;    // 0–1 animation phase
 
+    // Layer visibility + temporal filter (graph v2)
+    this.layerVisible  = { episodic: true, semantic: true, imagined: true };
+    this.timeRange     = null; // { min, max } epoch ms, null = no filter
+
+    // Minimap (created lazily when > 20 nodes)
+    this.minimap       = null;
+    this.minimapCtx    = null;
+
     // Tooltip
     this.tooltip       = null;
     this.tooltipTimer  = null;
@@ -92,7 +100,9 @@ export class MemoryGraph {
     if (!this.simRunning) { this.simRunning = true; this._tick(); }
 
     // Fade nodes in
-    for (const n of this.nodes) { n.opacity = 0; n.targetOpacity = 1; n._fadeDelay = Math.random() * 0.4; }
+    for (const n of this.nodes) { n.opacity = 0; n.targetOpacity = this._nodeTargetOpacity(n); n._fadeDelay = Math.random() * 0.4; }
+
+    this._ensureMinimap();
   }
 
   /** Add new nodes + edges (expansion). Animate them outward from the parent node. */
@@ -107,7 +117,7 @@ export class MemoryGraph {
       if (existing.has(nd.id)) {
         // Already present — just make sure it's visible
         const existing = this.nodeMap.get(nd.id);
-        existing.targetOpacity = 1;
+        existing.targetOpacity = this._nodeTargetOpacity(existing);
         continue;
       }
       const node = {
@@ -119,7 +129,7 @@ export class MemoryGraph {
         radius: 3 + (nd.strength || 0.5) * 10,
         expanded: false,
         opacity: 0,
-        targetOpacity: 1,
+        targetOpacity: this._nodeTargetOpacity(nd),
         _fadeDelay: Math.random() * 0.3,
       };
       this.nodes.push(node);
@@ -137,6 +147,7 @@ export class MemoryGraph {
 
     this._seedParticles();
     this.simAlpha = Math.max(this.simAlpha, 0.15); // Re-heat simulation
+    this._ensureMinimap();
   }
 
   /** Focus a node by ID — smooth camera fly + pulse. */
@@ -145,10 +156,23 @@ export class MemoryGraph {
   /** Reset view to see all nodes. */
   resetView() { this._resetView(); }
 
+  /** Toggle a layer on/off — hidden layers fade nodes to 0.1 opacity, edges hide. */
+  setLayerVisible(layer, visible) {
+    this.layerVisible[layer] = !!visible;
+    this._applyFilters();
+  }
+
+  /** Restrict visible nodes to a capture-time window (epoch ms). null = show all. */
+  setTimeRange(min, max) {
+    this.timeRange = (min == null || max == null) ? null : { min, max };
+    this._applyFilters();
+  }
+
   destroy() {
     this.simRunning = false;
     if (this._resizeObs) this._resizeObs.disconnect();
     this._removeTooltip();
+    if (this.minimap) { this.minimap.remove(); this.minimap = null; this.minimapCtx = null; }
   }
 
   // ── Initialization ──────────────────────────────────────────────────────
@@ -210,6 +234,178 @@ export class MemoryGraph {
         this.edgeParticles.push({ edge: e, t: Math.random(), speed: 0.0008 + Math.random() * 0.0015 });
       }
     }
+  }
+
+  // ── Filters (layer toggle + temporal scrubber) ──────────────────────────
+
+  /** Opacity a node should settle at, given layer + time filters. */
+  _nodeTargetOpacity(n) {
+    let o = this.layerVisible[n.layer] === false ? 0.1 : 1;
+    if (this.timeRange && n.created) {
+      const t = new Date(n.created).getTime();
+      if (!(t >= this.timeRange.min && t <= this.timeRange.max)) o = 0;
+    }
+    return o;
+  }
+
+  _applyFilters() {
+    for (const n of this.nodes) n.targetOpacity = this._nodeTargetOpacity(n);
+  }
+
+  /** An edge renders only when both endpoints are fully visible. */
+  _edgeVisible(e) {
+    const s = e.sourceNode, t = e.targetNode;
+    if (this.layerVisible[s.layer] === false || this.layerVisible[t.layer] === false) return false;
+    if (s.targetOpacity === 0 || t.targetOpacity === 0) return false;
+    return true;
+  }
+
+  // ── Cluster labels (zoomed-out overview) ────────────────────────────────
+
+  _renderClusterLabels(ctx, vs) {
+    if (vs >= 0.6) return;
+    const nodes = this.nodes.filter(n => this._nodeTargetOpacity(n) > 0.5);
+    if (nodes.length < 5) return;
+
+    // Union-find over pairs within 200px (world space)
+    const parent = nodes.map((_, i) => i);
+    const find = (i) => { while (parent[i] !== i) { parent[i] = parent[parent[i]]; i = parent[i]; } return i; };
+    for (let i = 0; i < nodes.length; i++) {
+      for (let j = i + 1; j < nodes.length; j++) {
+        const dx = nodes[i].x - nodes[j].x;
+        const dy = nodes[i].y - nodes[j].y;
+        if (dx * dx + dy * dy < 200 * 200) {
+          const a = find(i), b = find(j);
+          if (a !== b) parent[a] = b;
+        }
+      }
+    }
+    const groups = new Map();
+    nodes.forEach((n, i) => {
+      const r = find(i);
+      if (!groups.has(r)) groups.set(r, []);
+      groups.get(r).push(n);
+    });
+
+    for (const members of groups.values()) {
+      if (members.length < 5) continue;
+      // Label = most common tag in the cluster
+      const counts = {};
+      let best = null, bestN = 0;
+      for (const m of members) {
+        for (const t of (m.tags || [])) {
+          counts[t] = (counts[t] || 0) + 1;
+          if (counts[t] > bestN) { bestN = counts[t]; best = t; }
+        }
+      }
+      if (!best) continue;
+      const cx = members.reduce((s, m) => s + m.x, 0) / members.length;
+      const cy = members.reduce((s, m) => s + m.y, 0) / members.length;
+
+      const text = `${best} · ${members.length}`;
+      const fontSize = 12 / vs;
+      const padX = 9 / vs;
+      const h = 22 / vs;
+      ctx.save();
+      ctx.font = `600 ${fontSize}px -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif`;
+      const w = ctx.measureText(text).width + padX * 2;
+      const rx = cx - w / 2, ry = cy - h / 2, rr = h / 2;
+      // Translucent pill at the cluster centroid
+      ctx.globalAlpha = 0.85;
+      ctx.beginPath();
+      ctx.moveTo(rx + rr, ry);
+      ctx.arcTo(rx + w, ry, rx + w, ry + h, rr);
+      ctx.arcTo(rx + w, ry + h, rx, ry + h, rr);
+      ctx.arcTo(rx, ry + h, rx, ry, rr);
+      ctx.arcTo(rx, ry, rx + w, ry, rr);
+      ctx.closePath();
+      ctx.fillStyle = 'rgba(17, 24, 32, 0.78)';
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(104, 216, 248, 0.35)';
+      ctx.lineWidth = 1 / vs;
+      ctx.stroke();
+      ctx.fillStyle = '#bcc8d8';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(text, cx, cy);
+      ctx.restore();
+    }
+  }
+
+  // ── Minimap ─────────────────────────────────────────────────────────────
+
+  _ensureMinimap() {
+    if (this.nodes.length <= 20) {
+      if (this.minimap) { this.minimap.remove(); this.minimap = null; this.minimapCtx = null; }
+      return;
+    }
+    if (this.minimap) return;
+    const mm = document.createElement('canvas');
+    mm.className = 'mg-minimap';
+    mm.width = 160; mm.height = 100;
+    mm.addEventListener('mousedown', (e) => this._onMinimapClick(e));
+    this.container.appendChild(mm);
+    this.minimap = mm;
+    this.minimapCtx = mm.getContext('2d');
+  }
+
+  _minimapTransform() {
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    for (const n of this.nodes) {
+      if (n.x < x0) x0 = n.x; if (n.x > x1) x1 = n.x;
+      if (n.y < y0) y0 = n.y; if (n.y > y1) y1 = n.y;
+    }
+    if (!isFinite(x0)) return null;
+    const pad = 30;
+    x0 -= pad; y0 -= pad; x1 += pad; y1 += pad;
+    const W = this.minimap.width, H = this.minimap.height;
+    const k = Math.min(W / Math.max(1, x1 - x0), H / Math.max(1, y1 - y0));
+    const ox = (W - (x1 - x0) * k) / 2, oy = (H - (y1 - y0) * k) / 2;
+    return { sx: (wx) => ox + (wx - x0) * k, sy: (wy) => oy + (wy - y0) * k, k, x0, y0, ox, oy };
+  }
+
+  _renderMinimap() {
+    if (!this.minimap) return;
+    const t = this._minimapTransform();
+    if (!t) return;
+    const ctx = this.minimapCtx;
+    const W = this.minimap.width, H = this.minimap.height;
+
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = 'rgba(8, 12, 18, 0.72)';
+    ctx.fillRect(0, 0, W, H);
+
+    // Nodes as dots
+    for (const n of this.nodes) {
+      if (this.layerVisible[n.layer] === false || n.targetOpacity === 0) continue;
+      const colors = LAYER_COLORS[n.layer] || LAYER_COLORS.episodic;
+      ctx.fillStyle = colors.fill;
+      ctx.globalAlpha = 0.8;
+      ctx.beginPath();
+      ctx.arc(t.sx(n.x), t.sy(n.y), 1.6, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    // Viewport rectangle
+    const tl = this._screenToWorld(0, 0);
+    const br = this._screenToWorld(this.W, this.H);
+    ctx.strokeStyle = 'rgba(188, 200, 216, 0.75)';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(t.sx(tl.x), t.sy(tl.y), (br.x - tl.x) * t.k, (br.y - tl.y) * t.k);
+  }
+
+  _onMinimapClick(e) {
+    const t = this._minimapTransform();
+    if (!t) return;
+    const rect = this.minimap.getBoundingClientRect();
+    const mx = (e.clientX - rect.left) * (this.minimap.width / rect.width);
+    const my = (e.clientY - rect.top) * (this.minimap.height / rect.height);
+    // Convert minimap coords back to world, center the view there
+    const wx = t.x0 + (mx - t.ox) / t.k;
+    const wy = t.y0 + (my - t.oy) / t.k;
+    this.view.targetX = this.W / 2 - wx * this.view.targetScale;
+    this.view.targetY = this.H / 2 - wy * this.view.targetScale;
   }
 
   // ── Simulation ──────────────────────────────────────────────────────────
@@ -341,6 +537,7 @@ export class MemoryGraph {
 
     // ── Edges ─────────────────────────────────────────────────────────────
     for (const e of this.edges) {
+      if (!this._edgeVisible(e)) continue;
       const style = EDGE_STYLES[e.type] || EDGE_STYLES.associative;
       const sx = e.sourceNode.x, sy = e.sourceNode.y;
       const tx = e.targetNode.x, ty = e.targetNode.y;
@@ -367,6 +564,7 @@ export class MemoryGraph {
     ctx.fillStyle = this.particleGrad;
     for (const p of this.edgeParticles) {
       const e = p.edge;
+      if (!this._edgeVisible(e)) continue;
       const sx = e.sourceNode.x, sy = e.sourceNode.y;
       const tx = e.targetNode.x, ty = e.targetNode.y;
       const px = sx + (tx - sx) * p.t;
@@ -454,7 +652,13 @@ export class MemoryGraph {
       ctx.restore();
     }
 
+    // ── Cluster labels (only when zoomed out) ─────────────────────────────
+    this._renderClusterLabels(ctx, vs);
+
     ctx.restore();
+
+    // ── Minimap overlay ───────────────────────────────────────────────────
+    this._renderMinimap();
   }
 
   // ── Interaction ─────────────────────────────────────────────────────────

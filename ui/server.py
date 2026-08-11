@@ -1140,7 +1140,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _static(self, path):
         if path in ("/", ""):
-            path = "/index.html"
+            path = "/landing.html"
         rel = os.path.normpath(path).lstrip("/")
         full = os.path.join(BASE_DIR, rel)
         if not full.startswith(BASE_DIR) or not os.path.isfile(full):
