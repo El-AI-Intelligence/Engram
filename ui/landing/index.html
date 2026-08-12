@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Engram — Your AI deserves a memory</title>
+<style>
+:root {
+  --bg: #0a0a0f;
+  --surface: #13131a;
+  --border: #1e1e2e;
+  --text: #cdd6f4;
+  --text-muted: #6c7086;
+  --accent: #cba6f7;
+  --accent2: #89b4fa;
+  --green: #a6e3a1;
+  --code-bg: #11111b;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: system-ui, -apple-system, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.6;
+  min-height: 100vh;
+}
+.container { max-width: 720px; margin: 0 auto; padding: 2rem 1.5rem; }
+.hero { text-align: center; padding: 5rem 0 3rem; }
+.hero h1 { font-size: 3rem; font-weight: 800; letter-spacing: -0.02em; }
+.hero h1 span { color: var(--accent); }
+.hero p { color: var(--text-muted); font-size: 1.2rem; margin-top: 0.75rem; max-width: 480px; margin-left: auto; margin-right: auto; }
+.install-box {
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1rem 1.25rem;
+  margin: 2rem auto;
+  max-width: 440px;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+.install-box code {
+  flex: 1;
+  font-size: 0.9rem;
+  color: var(--green);
+  overflow-x: auto;
+  white-space: nowrap;
+}
+.copy-btn {
+  background: var(--accent);
+  color: #111;
+  border: none;
+  padding: 0.4rem 1rem;
+  border-radius: 6px;
+  font-weight: 600;
+  cursor: pointer;
+  font-size: 0.85rem;
+  white-space: nowrap;
+}
+.copy-btn:hover { opacity: 0.85; }
+.features {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 1.25rem;
+  margin: 3rem 0;
+}
+.feature {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1.5rem;
+}
+.feature h3 { font-size: 1.05rem; margin-bottom: 0.5rem; }
+.feature h3 span { margin-right: 0.5rem; }
+.feature p { color: var(--text-muted); font-size: 0.9rem; }
+.nav { display: flex; justify-content: center; gap: 1.5rem; margin-top: 2rem; }
+.nav a { color: var(--accent2); text-decoration: none; font-weight: 500; }
+.nav a:hover { text-decoration: underline; }
+.footer { text-align: center; color: var(--text-muted); font-size: 0.8rem; margin-top: 4rem; padding: 2rem 0; border-top: 1px solid var(--border); }
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="hero">
+    <h1><span>Engram</span> — Your AI deserves a memory.</h1>
+    <p>A local-first, encrypted memory vault that gives AI agents persistent recall across sessions.</p>
+    <div class="install-box">
+      <code>curl -fsSL https://engram.ellmstack.dev/install.sh | bash</code>
+      <button class="copy-btn" onclick="copy()">Copy</button>
+    </div>
+  </div>
+
+  <div class="features">
+    <div class="feature">
+      <h3><span>&#x1F512;</span> Zero-Knowledge Encryption</h3>
+      <p>SQLCipher AES-256. Your memories never leave your machine in plaintext. Even the sync server can't read them.</p>
+    </div>
+    <div class="feature">
+      <h3><span>&#x1F9E0;</span> Semantic Search</h3>
+      <p>Auto-downloads an ONNX embedding model (23MB). Find memories by meaning, not just keywords. Zero config.</p>
+    </div>
+    <div class="feature">
+      <h3><span>&#x1F4BB;</span> AI-Native API</h3>
+      <p>REST + WebSocket + MCP server. Claude Code, Cursor, Windsurf — one command to connect your AI tools.</p>
+    </div>
+    <div class="feature">
+      <h3><span>&#x2696;&#xFE0F;</span> Memory Hygiene</h3>
+      <p>Automatic decay, strengthening, and consolidation. Important memories get stronger; noise fades away.</p>
+    </div>
+    <div class="feature">
+      <h3><span>&#x1F504;</span> Cross-Device Sync</h3>
+      <p>E2E encrypted sync with AES-256-GCM + HMAC. Vector-clock conflict resolution. Self-hostable sync server.</p>
+    </div>
+    <div class="feature">
+      <h3><span>&#x1F6E1;&#xFE0F;</span> Privacy Controls</h3>
+      <p>Full audit trail, purge by criteria, retention policies. You control what's stored and for how long.</p>
+    </div>
+  </div>
+
+  <div class="nav">
+    <a href="/app/">Open Dashboard</a>
+    <a href="https://github.com/El-AI-Intelligence/engram">GitHub</a>
+    <a href="https://docs.ellmstack.dev">Docs</a>
+  </div>
+
+  <div class="footer">
+    Engram is built on the <strong>Axiom-OS</strong> kernel. Open source. MIT licensed.
+  </div>
+</div>
+<script src="js/landing.js"></script>
+</body>
+</html>

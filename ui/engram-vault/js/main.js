@@ -1,0 +1,1668 @@
+// ==========================================================================
+// Engram Memory Vault — SPA
+// ==========================================================================
+
+const API = '';  // relative to origin — Caddy reverse-proxies to localhost:8787
+
+// ── Theme toggle ───────────────────────────────────────────────────────────
+
+(function initTheme() {
+  const saved = localStorage.getItem('engram-theme');
+  if (saved === 'light') document.documentElement.setAttribute('data-theme', 'light');
+  const btn = document.getElementById('theme-toggle');
+  if (btn) {
+    btn.textContent = saved === 'light' ? '☾' : '☀';
+    btn.addEventListener('click', () => {
+      const current = document.documentElement.getAttribute('data-theme');
+      if (current === 'light') {
+        document.documentElement.removeAttribute('data-theme');
+        localStorage.setItem('engram-theme', 'dark');
+        btn.textContent = '☀';
+      } else {
+        document.documentElement.setAttribute('data-theme', 'light');
+        localStorage.setItem('engram-theme', 'light');
+        btn.textContent = '☾';
+      }
+    });
+  }
+})();
+
+// ── API client ────────────────────────────────────────────────────────────
+
+async function get(path) {
+  const r = await fetch(API + path);
+  if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+  return r.json();
+}
+
+async function post(path, body = {}) {
+  const r = await fetch(API + path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+  return r.json();
+}
+
+const api = {
+  health: () => get('/health'),
+  stats: () => get('/analytics/stats'),
+  memories: {
+    search: (q) => post('/memories/search', q),
+    get: (id) => get('/memories/' + id),
+    links: (id) => get('/memories/' + id + '/links'),
+    related: (id, limit = 10) => get('/memories/' + id + '/related?limit=' + limit),
+    ground: (id) => post('/memories/' + id + '/ground'),
+    delete: (id) => fetch(API + '/memories/' + id, { method: 'DELETE' }),
+  },
+  context: {
+    assemble: (q) => post('/context/assemble', q),
+  },
+  consolidate: {
+    decay: () => post('/consolidate/decay'),
+    weekly: () => post('/consolidate/weekly'),
+    history: () => get('/consolidate/history'),
+  },
+  patterns: (q) => post('/analytics/patterns', q),
+  export: (q) => post('/export', q || {}),
+  import: (body) => post('/import', body),
+  privacy: {
+    audit: () => get('/privacy/audit'),
+    purge: (criteria) => post('/privacy/purge', criteria),
+  },
+  config: {
+    get: () => get('/config'),
+    update: (c) => fetch(API + '/config', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(c) }),
+  },
+};
+
+// ── Router ────────────────────────────────────────────────────────────────
+
+const routes = {};
+function route(pattern, handler) {
+  routes[pattern] = handler;
+}
+
+function navigate(hash) {
+  window.location.hash = hash;
+}
+
+let currentCleanup = null;
+let renderGeneration = 0;
+
+async function render() {
+  const hash = (window.location.hash || '#/').replace(/^#/, '');
+  const app = document.getElementById('app');
+  const statusbar = document.getElementById('statusbar');
+
+  if (currentCleanup) { currentCleanup(); currentCleanup = null; }
+
+  // Increment generation counter to detect stale renders
+  const generation = ++renderGeneration;
+
+  // Highlight nav
+  document.querySelectorAll('.nav a').forEach(a => {
+    a.classList.toggle('active', a.getAttribute('href') === hash);
+  });
+
+  // Match route
+  for (const [pattern, handler] of Object.entries(routes)) {
+    const re = new RegExp('^' + pattern.replace(/:\w+/g, '([^/]+)') + '$');
+    const m = hash.match(re);
+    if (m) {
+      try {
+        app.innerHTML = '<div class="loading">Loading…</div>';
+        const result = handler(...m.slice(1));
+        if (result && typeof result.then === 'function') {
+          const cleanup = await result;
+          // Discard results from stale renders (async navigation race)
+          if (generation !== renderGeneration) return;
+          if (cleanup && typeof cleanup === 'function') currentCleanup = cleanup;
+        }
+      } catch (e) {
+        if (generation !== renderGeneration) return;
+        app.innerHTML = `<div class="error-panel"><p>Error: ${esc(e.message)}</p></div>`;
+      }
+      return;
+    }
+  }
+  if (generation !== renderGeneration) return;
+  app.innerHTML = '<div class="error-panel"><h2>404</h2><p>Page not found</p></div>';
+}
+
+window.addEventListener('hashchange', render);
+window.addEventListener('DOMContentLoaded', render);
+
+// ── Helpers ───────────────────────────────────────────────────────────────
+
+function esc(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function ago(ts) {
+  if (!ts) return '';
+  const d = (Date.now() - new Date(ts).getTime()) / 1000;
+  if (d < 60) return 'just now';
+  if (d < 3600) return Math.floor(d / 60) + 'm ago';
+  if (d < 86400) return Math.floor(d / 3600) + 'h ago';
+  return Math.floor(d / 86400) + 'd ago';
+}
+
+function layerIcon(layer) {
+  const icons = { episodic: '●', semantic: '◆', imagined: '✦' };
+  return `<span class="layer-icon ${esc(layer)}">${icons[layer] || '●'}</span>`;
+}
+
+function layerBadge(layer) {
+  return `<span class="badge badge-${layer}">${layerIcon(layer)} ${layer}</span>`;
+}
+
+function valenceLabel(v) {
+  if (v >= 0.5) return '<span class="valence joyful">😊 Joyful</span>';
+  if (v >= 0.1) return '<span class="valence positive">🙂 Positive</span>';
+  if (v >= -0.3) return '<span class="valence neutral">😐 Neutral</span>';
+  return '<span class="valence challenging">😟 Challenging</span>';
+}
+
+function strengthBar(s) {
+  const pct = Math.min(100, Math.max(0, (s / 2) * 100));
+  const color = pct > 60 ? 'var(--grounded)' : pct > 25 ? 'var(--episodic)' : 'var(--decaying)';
+  return `<div class="mini-bar"><div class="mini-bar-fill" style="width:${pct}%;background:${color};"></div></div>`;
+}
+
+function tagList(tags) {
+  if (!tags || !tags.length) return '';
+  return tags.map(t => `<span class="tag">${esc(t)}</span>`).join('');
+}
+
+function sourceIcon(src) {
+  const icons = { interaction: '💬', chat: '💭', window: '🖥', agent: '🤖', system: '⚙', consolidation: '🌙', imagined: '✦', research: '🔬', mic: '🎤', sensor: '📡' };
+  return icons[src] || '●';
+}
+
+function resultLabel(t) {
+  const labels = { fts5: 'FTS5', qem_cache: 'QEM', vector: 'VECTOR', like: 'LIKE', hybrid: 'HYBRID' };
+  return labels[t] || t;
+}
+
+function toast(msg, kind = 'info') {
+  const root = document.getElementById('toast-root');
+  const el = document.createElement('div');
+  el.className = `toast toast-${kind}`;
+  el.textContent = msg;
+  root.appendChild(el);
+  setTimeout(() => { el.remove(); }, 3000);
+}
+
+// ── Status bar ────────────────────────────────────────────────────────────
+
+async function updateStatus() {
+  try {
+    const h = await api.health();
+    const el = document.getElementById('statusbar');
+    el.innerHTML = `
+      <span class="status-item ok">● Connected</span>
+      <span class="status-item">${h.memories_total || 0} memories</span>
+      <span class="status-item">QEM ${Math.round((h.qem_hit_rate || 0) * 100)}%</span>
+      <span class="status-item">${formatBytes(h.db_size_bytes || 0)}</span>
+      <span class="status-item ok">Encrypted ✓</span>`;
+  } catch (e) {
+    const el = document.getElementById('statusbar');
+    el.innerHTML = '<span class="status-item warn">⚠ Server unreachable</span>';
+  }
+}
+
+function formatBytes(b) {
+  if (b < 1024) return b + ' B';
+  if (b < 1024 * 1024) return (b / 1024).toFixed(1) + ' KB';
+  return (b / (1024 * 1024)).toFixed(1) + ' MB';
+}
+
+// ==========================================================================
+// SCREENS
+// ==========================================================================
+
+// ── Dashboard ─────────────────────────────────────────────────────────────
+
+route('/', async () => {
+  let stats, health, history, sample;
+  try { stats = await api.stats(); } catch (e) { stats = null; }
+  try { health = await api.health(); } catch (e) { health = null; }
+
+  const app = document.getElementById('app');
+
+  if (!stats) {
+    app.innerHTML = `<div class="error-panel">
+      <h2>Cannot reach engramd</h2>
+      <p>Make sure <code>engramd</code> is running on port 8787.</p>
+    </div>`;
+    return;
+  }
+
+  try { history = await api.consolidate.history(); } catch (e) { history = { runs: [] }; }
+  try { sample = await api.memories.search({ sort_by: 'recency', limit: 200 }); } catch (e) { sample = { results: [] }; }
+
+  const layerPct = (n) => stats.total_memories ? ((n / stats.total_memories) * 100).toFixed(1) : 0;
+
+  // New today: captured since local midnight
+  const midnight = new Date(); midnight.setHours(0, 0, 0, 0);
+  const newToday = (sample.results || []).filter(m => m.created_at && new Date(m.created_at) >= midnight).length;
+
+  // Decayed last night: most recent decay run in history
+  const decayRun = (history.runs || []).filter(r => (r.type || '').includes('decay'))
+    .sort((a, b) => new Date(b.run_at || 0) - new Date(a.run_at || 0))[0];
+
+  // Strength distribution buckets (strength ranges 0.0–2.0)
+  const buckets = [
+    { label: 'Weak <0.5', cls: 'weak', count: 0 },
+    { label: 'Fading 0.5–1.0', cls: 'fading', count: 0 },
+    { label: 'Strong 1.0–1.5', cls: 'strong', count: 0 },
+    { label: 'Core ≥1.5', cls: 'core', count: 0 },
+  ];
+  for (const m of sample.results || []) {
+    const s = m.strength || 0;
+    buckets[s < 0.5 ? 0 : s < 1.0 ? 1 : s < 1.5 ? 2 : 3].count++;
+  }
+  const bucketMax = Math.max(1, ...buckets.map(b => b.count));
+
+  const qemWarm = (health?.qem_cache_entries || 0) > 0;
+  const uptimeSecs = health?.uptime_secs || 0;
+  const uptime = uptimeSecs >= 86400 ? Math.floor(uptimeSecs / 86400) + 'd'
+    : uptimeSecs >= 3600 ? Math.floor(uptimeSecs / 3600) + 'h'
+    : Math.floor(uptimeSecs / 60) + 'm';
+
+  app.innerHTML = `
+    <div class="page dashboard">
+      <div class="stat-grid">
+        <div class="stat-card">
+          <div class="stat-num">${stats.total_memories?.toLocaleString() || 0}</div>
+          <div class="stat-label">Memories</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-num">${Math.round((health?.qem_hit_rate || 0) * 100)}%</div>
+          <div class="stat-label">Cache hit rate (QEM)</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-num">${newToday}</div>
+          <div class="stat-label">New today</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-num">${decayRun ? (decayRun.engrams_decayed || 0) : '—'}</div>
+          <div class="stat-label">Decayed last night</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-num">${stats.by_layer?.semantic || 0}</div>
+          <div class="stat-label">Semantic memories</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-num">${stats.by_layer?.imagined || 0}</div>
+          <div class="stat-label">Imagined (quarantined)</div>
+        </div>
+      </div>
+
+      <div class="panel-grid">
+        <div class="panel">
+          <div class="panel-header">Layer Breakdown</div>
+          <div class="layer-breakdown">
+            <div class="layer-row">
+              <span>${layerIcon('episodic')} Episodic</span>
+              <span class="faint">${stats.by_layer?.episodic || 0} · ${layerPct(stats.by_layer?.episodic || 0)}%</span>
+            </div>
+            <div class="layer-bar"><div class="layer-bar-fill episodic" style="width:${layerPct(stats.by_layer?.episodic || 0)}%"></div></div>
+            <div class="layer-row">
+              <span>${layerIcon('semantic')} Semantic</span>
+              <span class="faint">${stats.by_layer?.semantic || 0} · ${layerPct(stats.by_layer?.semantic || 0)}%</span>
+            </div>
+            <div class="layer-bar"><div class="layer-bar-fill semantic" style="width:${layerPct(stats.by_layer?.semantic || 0)}%"></div></div>
+            <div class="layer-row">
+              <span>${layerIcon('imagined')} Imagined</span>
+              <span class="faint">${stats.by_layer?.imagined || 0} · ${layerPct(stats.by_layer?.imagined || 0)}%</span>
+            </div>
+            <div class="layer-bar"><div class="layer-bar-fill imagined" style="width:${layerPct(stats.by_layer?.imagined || 0)}%"></div></div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-header">Vault Health</div>
+          <div class="health-list">
+            <div class="health-row"><span class="ok">●</span> Vault encrypted</div>
+            <div class="health-row"><span>${formatBytes(health?.db_size_bytes || 0)}</span> / no limit</div>
+            <div class="health-row">QEM cache: <span class="${qemWarm ? 'ok' : 'faint'}">${qemWarm ? `warm (${health.qem_cache_entries} entries)` : 'cold'}</span></div>
+            <div class="health-row">Uptime: <span>${uptime}</span></div>
+            <div class="health-row">Last decay: <span>${stats.last_decay ? ago(stats.last_decay) : 'never'}</span></div>
+            <div class="health-row">Last consolidation: <span>${stats.last_consolidation ? ago(stats.last_consolidation) : 'never'}</span></div>
+            <div class="health-row"><span>${stats.total_links || 0}</span> links</div>
+            <div class="health-row"><span>${stats.total_embeddings || 0}</span> embeddings</div>
+            <div class="health-row faint">Avg strength: ${(stats.avg_strength || 0).toFixed(2)}</div>
+            <div class="health-row faint">Avg valence: ${(stats.avg_valence || 0).toFixed(2)}</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel" style="margin-top:1rem;">
+        <div class="panel-header">Strength Distribution</div>
+        <div class="strength-dist">
+          ${buckets.map(b => `
+            <div class="sd-row">
+              <span class="sd-label faint">${b.label}</span>
+              <div class="layer-bar sd-bar"><div class="layer-bar-fill sd-${b.cls}" style="width:${(b.count / bucketMax) * 100}%"></div></div>
+              <span class="sd-count mono">${b.count}</span>
+            </div>
+          `).join('')}
+        </div>
+        <div class="faint" style="padding:0 1rem 0.75rem;font-size:var(--text-xs);">Based on the ${(sample.results || []).length} most recent memories.</div>
+      </div>
+
+      <div class="panel" style="margin-top:1rem;">
+        <div class="panel-header">Recent Captures</div>
+        <div id="recent-feed">Loading…</div>
+      </div>
+    </div>
+  `;
+
+  // Load recent captures
+  try {
+    const feed = document.getElementById('recent-feed');
+    const recent = (sample.results || []).slice(0, 5);
+    if (recent.length) {
+      feed.innerHTML = recent.map(m => `
+        <a href="#/memories/${encodeURIComponent(m.id)}" class="feed-item">
+          ${layerIcon(m.layer)} <span class="faint">[${esc(m.source || '?')}]</span>
+          ${esc((m.content || '').slice(0, 120))}${(m.content || '').length > 120 ? '…' : ''}
+          <span class="faint ml-auto">${ago(m.created_at)}</span>
+        </a>
+      `).join('');
+    } else {
+      feed.innerHTML = '<div class="faint" style="padding:1rem;">No memories captured yet.</div>';
+    }
+  } catch (e) {
+    document.getElementById('recent-feed').innerHTML = '<div class="faint">Unable to load recent captures.</div>';
+  }
+
+  updateStatus();
+});
+
+// ── Explorer ──────────────────────────────────────────────────────────────
+
+route('/memories', async () => {
+  const app = document.getElementById('app');
+  app.innerHTML = `
+    <div class="page explorer">
+      <div class="search-bar">
+        <input type="text" id="search-input" class="search-input" placeholder="Search memories…" autofocus>
+        <button id="search-btn" class="btn btn-primary">Search</button>
+      </div>
+      <div class="filter-row">
+        <select id="filter-layer" class="filter-select">
+          <option value="">All layers</option>
+          <option value="episodic">Episodic</option>
+          <option value="semantic">Semantic</option>
+          <option value="imagined">Imagined</option>
+        </select>
+        <select id="filter-sort" class="filter-select">
+          <option value="relevance">Relevance</option>
+          <option value="strength">Strength</option>
+          <option value="recency">Recency</option>
+          <option value="valence">Valence</option>
+        </select>
+        <span class="faint" style="margin-left:auto;" id="result-count"></span>
+      </div>
+      <div id="explorer-results" class="explorer-results"></div>
+    </div>
+  `;
+
+  function doSearch() {
+    const q = document.getElementById('search-input').value;
+    const layer = document.getElementById('filter-layer').value;
+    const sort = document.getElementById('filter-sort').value;
+    const results = document.getElementById('explorer-results');
+    results.innerHTML = '<div class="loading-sm">Searching…</div>';
+    api.memories.search({ query: q, layer: layer || null, sort_by: sort, limit: 20 }).then(r => {
+      document.getElementById('result-count').textContent = `${r.total || 0} results (${resultLabel(r.search_type)}, ${r.took_ms}ms)`;
+      if (!r.results || !r.results.length) {
+        results.innerHTML = '<div class="faint" style="padding:1rem;">No results.</div>';
+        return;
+      }
+      results.innerHTML = r.results.map(m => `
+        <a href="#/memories/${encodeURIComponent(m.id)}" class="memory-card">
+          <div class="card-top">
+            ${layerIcon(m.layer)}
+            <span class="card-source">${sourceIcon(m.source)} ${esc(m.source || '?')}</span>
+            ${strengthBar(m.strength || 0)}
+            <span class="faint ml-auto">${ago(m.created_at)}</span>
+          </div>
+          <div class="card-content">${esc((m.content || '').slice(0, 200))}${(m.content || '').length > 200 ? '…' : ''}</div>
+          <div class="card-footer">
+            ${tagList(m.tags)}
+            ${m.links_out && m.links_out.length ? `<span class="faint">→ ${m.links_out.length} links</span>` : ''}
+            ${m.imagined && !m.grounded ? '<span class="badge badge-quarantined">⚠ quarantined</span>' : ''}
+          </div>
+        </a>
+      `).join('');
+    }).catch(e => {
+      results.innerHTML = `<div class="error">Search failed: ${esc(e.message)}</div>`;
+    });
+  }
+
+  document.getElementById('search-btn').onclick = doSearch;
+  document.getElementById('search-input').onkeydown = (e) => { if (e.key === 'Enter') doSearch(); };
+  document.getElementById('filter-layer').onchange = doSearch;
+  document.getElementById('filter-sort').onchange = doSearch;
+
+  doSearch();
+  updateStatus();
+});
+
+// ── Detail ────────────────────────────────────────────────────────────────
+
+route('/memories/:id', async (id) => {
+  const app = document.getElementById('app');
+  app.innerHTML = '<div class="loading">Loading memory…</div>';
+
+  try {
+    const m = await api.memories.get(id);
+    let linksHtml = '';
+    try {
+      const l = await api.memories.links(id);
+      if (l.outgoing && l.outgoing.length) {
+        linksHtml = `
+          <div class="panel" style="margin-top:1rem;">
+            <div class="panel-header">Links (${l.outgoing.length} outgoing)</div>
+            ${l.outgoing.map(ln => `
+              <a href="#/memories/${encodeURIComponent(ln.target_id)}" class="feed-item">
+                ${ln.link_type === 'causal' ? '▶' : ln.link_type === 'associative' ? '··' : ln.link_type === 'analogical' ? '--' : '··>'}
+                <span class="faint">${ln.link_type}</span>
+                <span>${esc(ln.target_id)}</span>
+                <span class="faint ml-auto">weight ${ln.weight.toFixed(2)}</span>
+              </a>
+            `).join('')}
+          </div>`;
+      }
+    } catch (e) { /* no links */ }
+
+    app.innerHTML = `
+      <div class="page detail">
+        <a href="#/memories" class="back-link">← Back to Explorer</a>
+        <div class="detail-card">
+          <div class="detail-header">
+            ${layerIcon(m.layer)} <span class="detail-layer">${esc(m.layer?.toUpperCase() || '')} MEMORY</span>
+            ${strengthBar(m.strength || 0)}
+            <span class="faint ml-auto">${esc(m.id)}</span>
+          </div>
+          <div class="detail-content">${esc(m.content || '')}</div>
+          <div class="detail-meta">
+            <div class="meta-row"><span class="faint">Valence</span> ${valenceLabel(m.valence || 0)}</div>
+            <div class="meta-row"><span class="faint">Created</span> ${m.created_at ? new Date(m.created_at).toLocaleString() : '?'} · ${ago(m.created_at)}</div>
+            <div class="meta-row"><span class="faint">Last retrieved</span> ${m.last_retrieved ? ago(m.last_retrieved) : 'never'}</div>
+            <div class="meta-row"><span class="faint">Retrievals</span> ${m.retrieval_count || 0}</div>
+            <div class="meta-row"><span class="faint">Source</span> ${sourceIcon(m.source)} ${esc(m.source || '?')}</div>
+            <div class="meta-row"><span class="faint">Project</span> ${esc(m.project || '—')}</div>
+            <div class="meta-row">${tagList(m.tags)}</div>
+          </div>
+        </div>
+        ${linksHtml}
+        <div class="detail-actions">
+          ${m.imagined && !m.grounded ? '<button class="btn" id="btn-ground">Ground memory</button>' : ''}
+          <button class="btn btn-danger" id="btn-delete">Delete</button>
+        </div>
+      </div>
+    `;
+
+    if (m.imagined && !m.grounded) {
+      document.getElementById('btn-ground').onclick = async () => {
+        try {
+          await api.memories.ground(id);
+          toast('Memory grounded', 'ok');
+          render();
+        } catch (e) { toast(e.message || 'Ground failed', 'error'); }
+      };
+    }
+    document.getElementById('btn-delete').onclick = async () => {
+      if (confirm('Delete this memory permanently?')) {
+        try {
+          const r = await api.memories.delete(id);
+          if (!r.ok) { const err = await r.json().catch(() => ({})); toast(err.error || 'Delete failed', 'error'); return; }
+          toast('Deleted', 'warn');
+          navigate('#/memories');
+        } catch (e) { toast(e.message || 'Delete failed', 'error'); }
+      }
+    };
+  } catch (e) {
+    app.innerHTML = `<div class="error-panel"><h2>Not found</h2><p>Memory ${esc(id)} not found.</p><a href="#/memories">← Back</a></div>`;
+  }
+  updateStatus();
+});
+
+// ── Graph ─────────────────────────────────────────────────────────────────
+
+route('/graph', async () => {
+  const app = document.getElementById('app');
+  app.innerHTML = `
+    <div class="page graph-page">
+      <div class="graph-filters">
+        <select id="gf-layer" class="filter-select"><option value="">All layers</option><option value="episodic">Episodic</option><option value="semantic">Semantic</option><option value="imagined">Imagined</option></select>
+        <input type="text" id="gf-search" class="search-input" placeholder="Focus on a memory ID…" style="width:260px;">
+        <button class="btn btn-sm" id="gf-search-btn">Focus</button>
+        <button class="btn btn-sm" id="gf-reset">Reset</button>
+      </div>
+      <div id="graph-canvas" class="graph-canvas">
+        <div class="faint" style="padding:3rem;text-align:center;">Loading graph data…</div>
+      </div>
+      <div id="graph-legend" class="graph-legend">
+        <span>${layerIcon('episodic')} Episodic</span>
+        <span>${layerIcon('semantic')} Semantic</span>
+        <span>${layerIcon('imagined')} Imagined</span>
+        <span class="faint">|</span>
+        <span style="border-bottom:2px dotted var(--text-faint);">Assoc</span>
+        <span style="border-bottom:2px solid var(--accent);">Causal</span>
+        <span style="border-bottom:2px dashed var(--text-faint);">Analog</span>
+        <span style="border-bottom:2px dotted var(--episodic);">Temp</span>
+      </div>
+    </div>
+  `;
+
+  async function loadGraph(filterLayer, focusId) {
+    const canvas = document.getElementById('graph-canvas');
+    try {
+      // NB: never send an empty query string — the server rejects it (content_empty)
+      const r = await api.memories.search({
+        layer: filterLayer || null,
+        sort_by: 'strength',
+        limit: 50,
+        min_strength: 0.2
+      });
+      if (!r.results || !r.results.length) {
+        canvas.innerHTML = '<div class="faint" style="padding:3rem;text-align:center;">No memories to graph.</div>';
+        return;
+      }
+
+      const nodes = r.results.map(m => ({
+        id: m.id,
+        label: (m.content || m.id).slice(0, 60),
+        layer: m.layer,
+        strength: m.strength || 0.5,
+        valence: m.valence || 0,
+      }));
+
+      // Fetch links for first 10 nodes (avoid N+1 storm)
+      const edges = [];
+      for (const n of nodes.slice(0, 10)) {
+        try {
+          const l = await api.memories.links(n.id);
+          if (l.outgoing) {
+            for (const ln of l.outgoing) {
+              if (nodes.find(x => x.id === ln.target_id)) {
+                edges.push({ source: n.id, target: ln.target_id, type: ln.link_type, weight: ln.weight });
+              }
+            }
+          }
+        } catch (e) { /* skip */ }
+      }
+
+      renderGraph(canvas, nodes, edges, focusId);
+    } catch (e) {
+      canvas.innerHTML = `<div class="error">${esc(e.message)}</div>`;
+    }
+  }
+
+  document.getElementById('gf-search-btn').onclick = () => {
+    const id = document.getElementById('gf-search').value.trim();
+    loadGraph(document.getElementById('gf-layer').value, id || null);
+  };
+  document.getElementById('gf-reset').onclick = () => {
+    document.getElementById('gf-search').value = '';
+    loadGraph('', null);
+  };
+  document.getElementById('gf-layer').onchange = () => {
+    loadGraph(document.getElementById('gf-layer').value, document.getElementById('gf-search').value.trim() || null);
+  };
+
+  await loadGraph('', null);
+  updateStatus();
+});
+
+function renderGraph(container, nodes, edges, focusId) {
+  const w = container.clientWidth || 800;
+  const h = 500;
+  const cx = w / 2, cy = h / 2;
+
+  // Place nodes in a circle initially
+  const angle = (2 * Math.PI) / nodes.length;
+  nodes.forEach((n, i) => {
+    const r = Math.min(w, h) * 0.35;
+    n.x = cx + r * Math.cos(angle * i);
+    n.y = cy + r * Math.sin(angle * i);
+    n.vx = 0; n.vy = 0;
+  });
+
+  // Simple force layout (50 iterations)
+  for (let iter = 0; iter < 50; iter++) {
+    // Repulsion between all pairs
+    for (let i = 0; i < nodes.length; i++) {
+      for (let j = i + 1; j < nodes.length; j++) {
+        const dx = nodes[j].x - nodes[i].x;
+        const dy = nodes[j].y - nodes[i].y;
+        const d = Math.max(1, Math.sqrt(dx * dx + dy * dy));
+        const f = 2000 / (d * d);
+        const fx = (dx / d) * f;
+        const fy = (dy / d) * f;
+        nodes[i].vx -= fx; nodes[i].vy -= fy;
+        nodes[j].vx += fx; nodes[j].vy += fy;
+      }
+    }
+    // Attraction along edges
+    for (const e of edges) {
+      const s = nodes.find(n => n.id === e.source);
+      const t = nodes.find(n => n.id === e.target);
+      if (!s || !t) continue;
+      const dx = t.x - s.x;
+      const dy = t.y - s.y;
+      const d = Math.max(1, Math.sqrt(dx * dx + dy * dy));
+      const f = d * 0.01 * e.weight;
+      s.vx += (dx / d) * f; s.vy += (dy / d) * f;
+      t.vx -= (dx / d) * f; t.vy -= (dy / d) * f;
+    }
+    // Center gravity
+    for (const n of nodes) {
+      n.vx += (cx - n.x) * 0.001;
+      n.vy += (cy - n.y) * 0.001;
+    }
+    // Apply velocity with damping
+    for (const n of nodes) {
+      n.x += n.vx * 0.5;
+      n.y += n.vy * 0.5;
+      n.vx *= 0.9;
+      n.vy *= 0.9;
+      n.x = Math.max(40, Math.min(w - 40, n.x));
+      n.y = Math.max(20, Math.min(h - 20, n.y));
+    }
+  }
+
+  const layerColors = { episodic: 'var(--episodic)', semantic: 'var(--semantic)', imagined: 'var(--imagined)' };
+  const edgeStyles = { associative: '2,4', causal: '', analogical: '6,3', temporal: '2,4' };
+  const edgeColors = { associative: 'var(--text-faint)', causal: 'var(--accent)', analogical: 'var(--text-faint)', temporal: 'var(--episodic)' };
+
+  const edgeSvg = edges.map(e => {
+    const s = nodes.find(n => n.id === e.source);
+    const t = nodes.find(n => n.id === e.target);
+    if (!s || !t) return '';
+    const dash = edgeStyles[e.type] || '';
+    return `<line x1="${s.x}" y1="${s.y}" x2="${t.x}" y2="${t.y}" stroke="${edgeColors[e.type]}" stroke-width="${1 + e.weight}" stroke-dasharray="${dash}" opacity="0.5"/>`;
+  }).join('');
+
+  const nodeSvg = nodes.map(n => {
+    const r = 3 + (n.strength || 0.5) * 6;
+    const color = layerColors[n.layer] || 'var(--text)';
+    const glow = n.id === focusId ? `filter="url(#glow)"` : '';
+    return `<g>
+      <circle cx="${n.x}" cy="${n.y}" r="${r}" fill="${color}" opacity="0.9" ${glow}>
+        <title>${esc(n.label)} (${n.layer})</title>
+      </circle>
+      <text x="${n.x + r + 4}" y="${n.y + 3}" font-size="10" fill="var(--text-muted)" font-family="var(--mono)">${esc(n.label.slice(0, 30))}</text>
+    </g>`;
+  }).join('');
+
+  container.innerHTML = `
+    <svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" style="display:block;">
+      <defs>
+        <filter id="glow"><feGaussianBlur stdDeviation="3" result="g"/><feMerge><feMergeNode in="g"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+      </defs>
+      <rect width="${w}" height="${h}" fill="var(--bg)"/>
+      ${edgeSvg}
+      ${nodeSvg}
+    </svg>`;
+}
+
+// ── Context ────────────────────────────────────────────────────────────────
+
+route('/context', async () => {
+  const app = document.getElementById('app');
+  let config;
+  try { config = await api.config.get(); } catch (e) { config = { context: { default_budget: 8192, high_priority_reserve: 0.6, max_recent_turns: 12, max_engrams: 10 } }; }
+
+  app.innerHTML = `
+    <div class="page context-page">
+      <h2>Context Assembly Config</h2>
+
+      <div class="panel" style="margin-bottom:1rem;">
+        <div class="panel-header">Token Budget</div>
+        <div class="config-row">
+          <label>Default budget</label>
+          <input type="range" id="cfg-budget" min="1024" max="32768" step="1024" value="${config.context?.default_budget || 8192}">
+          <span id="cfg-budget-val" class="mono">${config.context?.default_budget || 8192}</span>
+        </div>
+        <div class="config-row">
+          <label>High-priority reserve</label>
+          <input type="range" id="cfg-reserve" min="10" max="100" step="5" value="${Math.round((config.context?.high_priority_reserve || 0.6) * 100)}">
+          <span id="cfg-reserve-val" class="mono">${Math.round((config.context?.high_priority_reserve || 0.6) * 100)}%</span>
+        </div>
+      </div>
+
+      <div class="panel" style="margin-bottom:1rem;">
+        <div class="panel-header">Retrieval Config</div>
+        <div class="config-row">
+          <label>Max recent turns</label>
+          <input type="number" id="cfg-turns" min="1" max="50" value="${config.context?.max_recent_turns || 12}" class="input-sm">
+        </div>
+        <div class="config-row">
+          <label>Max engrams per assembly</label>
+          <input type="number" id="cfg-max-engrams" min="1" max="50" value="${config.context?.max_engrams || 10}" class="input-sm">
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-header">Live Preview</div>
+        <div class="config-row">
+          <input type="text" id="cfg-test-query" class="search-input" placeholder="Test query: What should I work on next?" style="flex:1;">
+          <button id="cfg-assemble-btn" class="btn btn-primary">Assemble</button>
+        </div>
+        <div id="cfg-preview" class="preview-box"></div>
+      </div>
+
+      <button id="cfg-save" class="btn btn-primary mutation" style="margin-top:1rem;">Save config</button>
+    </div>
+  `;
+
+  document.getElementById('cfg-budget').oninput = function() {
+    document.getElementById('cfg-budget-val').textContent = this.value;
+  };
+  document.getElementById('cfg-reserve').oninput = function() {
+    document.getElementById('cfg-reserve-val').textContent = this.value + '%';
+  };
+
+  document.getElementById('cfg-assemble-btn').onclick = async () => {
+    const q = document.getElementById('cfg-test-query').value || 'What should I work on next?';
+    const budget = parseInt(document.getElementById('cfg-budget').value);
+    const prev = document.getElementById('cfg-preview');
+    prev.innerHTML = '<div class="loading-sm">Assembling…</div>';
+    try {
+      const r = await api.context.assemble({ query: q, token_budget: budget });
+      prev.innerHTML = `
+        <div class="faint" style="margin-bottom:0.5rem;">${r.metadata?.total_tokens || 0} / ${r.metadata?.budget || budget} tokens · ${r.metadata?.engrams_retrieved || 0} engrams · ${r.metadata?.retrieval_took_ms || 0}ms</div>
+        <div class="messages-preview">${(r.messages || []).map(m =>
+          `<div class="msg-row"><span class="msg-role">[${m.role}]</span> ${esc((m.content || '').slice(0, 300))}${(m.content || '').length > 300 ? '…' : ''}</div>`
+        ).join('')}</div>`;
+    } catch (e) {
+      prev.innerHTML = `<div class="error">Assembly failed: ${esc(e.message)}</div>`;
+    }
+  };
+
+  document.getElementById('cfg-save').onclick = async () => {
+    try {
+      const r = await api.config.update({
+        context: {
+          default_budget: parseInt(document.getElementById('cfg-budget').value),
+          high_priority_reserve: parseInt(document.getElementById('cfg-reserve').value) / 100,
+          max_recent_turns: parseInt(document.getElementById('cfg-turns').value),
+          max_engrams: parseInt(document.getElementById('cfg-max-engrams').value),
+        }
+      });
+      if (!r.ok) { const err = await r.json().catch(() => ({})); toast(err.error || 'Save failed', 'error'); return; }
+      toast('Config saved', 'ok');
+    } catch (e) { toast(e.message || 'Save failed', 'error'); }
+  };
+
+  updateStatus();
+});
+
+// ── Consolidation ──────────────────────────────────────────────────────────
+
+route('/consolidation', async () => {
+  const app = document.getElementById('app');
+  let history, patterns, stats;
+  try { history = await api.consolidate.history(); } catch (e) { history = { runs: [] }; }
+  try { stats = await api.stats(); } catch (e) { stats = null; }
+  try { patterns = await api.patterns({ query: '', min_engrams: 3 }); } catch (e) { patterns = null; }
+
+  app.innerHTML = `
+    <div class="page consolidation-page">
+      <h2>Consolidation History</h2>
+
+      <div class="panel" style="margin-bottom:1rem;">
+        <div class="panel-header">Run History</div>
+        ${(history.runs || []).length ? history.runs.map(r => `
+          <div class="feed-item">
+            <span class="faint">${r.run_at || '?'}</span>
+            <span class="badge badge-semantic">${r.type || '?'}</span>
+            <span>${r.episodes_processed || 0} episodes</span>
+            <span>${r.semantics_created || 0} promoted</span>
+            <span>${r.engrams_decayed || 0} decayed</span>
+            ${r.notes ? `<span class="faint">${esc(r.notes)}</span>` : ''}
+          </div>
+        `).join('') : '<div class="faint" style="padding:1rem;">No consolidation runs yet.</div>'}
+      </div>
+
+      <div class="panel-grid">
+        <div class="panel">
+          <div class="panel-header">Stats</div>
+          <div class="health-list">
+            <div class="health-row">Last consolidation: <span>${stats?.last_consolidation || 'never'}</span></div>
+            <div class="health-row">Last decay: <span>${stats?.last_decay || 'never'}</span></div>
+            <div class="health-row">Total links: <span>${stats?.total_links || 0}</span></div>
+            <div class="health-row">Embeddings: <span>${stats?.total_embeddings || 0}</span></div>
+          </div>
+        </div>
+        <div class="panel">
+          <div class="panel-header">Patterns</div>
+          ${patterns && patterns.pattern ? `
+            <div class="pattern-card">
+              <div class="card-content">${esc(patterns.pattern.description || 'No patterns detected.')}</div>
+              <div class="faint">sample: ${patterns.pattern.sample_size || 0} engrams</div>
+            </div>
+          ` : '<div class="faint" style="padding:1rem;">No temporal patterns detected yet.</div>'}
+        </div>
+      </div>
+
+      <div class="mutation" style="margin-top:1rem;display:flex;gap:0.5rem;">
+        <button class="btn" id="btn-decay">Run decay now</button>
+        <button class="btn" id="btn-consolidate">Run consolidation now</button>
+      </div>
+    </div>
+  `;
+
+  document.getElementById('btn-decay').onclick = async () => {
+    try {
+      const r = await api.consolidate.decay();
+      toast(`Decayed: ${r.decayed || 0}, Strengthened: ${r.strengthened || 0}, Pruned: ${r.pruned || 0}`, 'ok');
+      render();
+    } catch (e) { toast(e.message || 'Decay failed', 'error'); }
+  };
+  document.getElementById('btn-consolidate').onclick = async () => {
+    try {
+      const r = await api.consolidate.weekly();
+      toast(`Promoted: ${r.promoted_to_semantic || 0}, Pruned imagined: ${r.pruned_imagined || 0}`, 'ok');
+      render();
+    } catch (e) { toast(e.message || 'Consolidation failed', 'error'); }
+  };
+
+  updateStatus();
+});
+
+// ── Settings ───────────────────────────────────────────────────────────────
+
+route('/settings', async () => {
+  const app = document.getElementById('app');
+  let config, audit;
+  try { config = await api.config.get(); } catch (e) { config = { vault_path: '~/.engram/vaults/default', encryption: 'sqlcipher' }; }
+  try { audit = await api.privacy.audit(); } catch (e) { audit = null; }
+
+  const ctx = config.context || {};
+  const sched = config.schedule || {};
+  const emb = config.embedding || {};
+  const breakdown = audit?.breakdown || {};
+
+  const breakdownRows = (items, key, iconFn) => (items || []).length
+    ? items.map(i => `<div class="health-row">${iconFn ? iconFn(i[key]) + ' ' : ''}${esc(i[key] || '—')}<span class="ml-auto mono">${i.count}</span></div>`).join('')
+    : '<div class="health-row faint">No data.</div>';
+
+  app.innerHTML = `
+    <div class="page settings-page">
+      <h2>Vault Settings</h2>
+
+      <div class="panel" style="margin-bottom:1rem;">
+        <div class="panel-header">Vault</div>
+        <div class="health-list">
+          <div class="health-row">Name: <span class="mono">default</span></div>
+          <div class="health-row">Path: <span class="mono">${esc(config.vault_path || '~/.engram/vaults/default')}</span></div>
+          <div class="health-row">Encryption: <span class="ok">${esc(config.encryption || 'sqlcipher')}</span></div>
+          <div class="health-row">Version: <span class="mono">${esc(config.version || '?')}</span></div>
+        </div>
+      </div>
+
+      <div class="panel" style="margin-bottom:1rem;">
+        <div class="panel-header">Context Defaults</div>
+        <div class="config-row">
+          <label>Default token budget</label>
+          <input type="range" id="set-budget" min="1024" max="32768" step="1024" value="${ctx.default_budget || 8192}">
+          <span id="set-budget-val" class="mono">${ctx.default_budget || 8192}</span>
+        </div>
+        <div class="config-row">
+          <label>High-priority reserve</label>
+          <input type="range" id="set-reserve" min="10" max="100" step="5" value="${Math.round((ctx.high_priority_reserve || 0.6) * 100)}">
+          <span id="set-reserve-val" class="mono">${Math.round((ctx.high_priority_reserve || 0.6) * 100)}%</span>
+        </div>
+        <div class="config-row">
+          <label>Max engrams per assembly</label>
+          <input type="number" id="set-max-engrams" min="1" max="50" value="${ctx.max_engrams || 10}" class="input-sm">
+        </div>
+        <div class="config-row">
+          <label>Max recent turns</label>
+          <input type="number" id="set-max-turns" min="1" max="50" value="${ctx.max_recent_turns || 12}" class="input-sm">
+        </div>
+        <div class="mutation" style="padding:0 1rem 1rem;"><button class="btn btn-primary" id="set-context-save">Save context defaults</button></div>
+      </div>
+
+      <div class="panel" style="margin-bottom:1rem;">
+        <div class="panel-header">Schedule</div>
+        <div class="config-row">
+          <label>Decay every (hours)</label>
+          <input type="number" id="set-decay-h" min="1" max="168" value="${sched.decay_interval_hours || 1}" class="input-sm">
+          <label class="checkbox-label"><input type="checkbox" id="set-auto-decay" ${sched.auto_decay !== false ? 'checked' : ''}> auto</label>
+        </div>
+        <div class="config-row">
+          <label>Consolidation every (hours)</label>
+          <input type="number" id="set-cons-h" min="1" max="720" value="${sched.consolidation_interval_hours || 24}" class="input-sm">
+          <label class="checkbox-label"><input type="checkbox" id="set-auto-cons" ${sched.auto_consolidation !== false ? 'checked' : ''}> auto</label>
+        </div>
+        <div class="mutation" style="padding:0 1rem 1rem;"><button class="btn btn-primary" id="set-schedule-save">Save schedule</button></div>
+      </div>
+
+      <div class="panel" style="margin-bottom:1rem;">
+        <div class="panel-header">Embeddings</div>
+        <div class="health-list">
+          <div class="health-row">Model: <span class="mono">${esc(emb.model || '—')}</span></div>
+          <div class="health-row">Dimensions: <span class="mono">${emb.dimensions || '—'}</span></div>
+          <div class="health-row">Status: <span class="${emb.enabled ? 'ok' : 'faint'}">${emb.enabled ? 'enabled' : 'disabled'}</span></div>
+        </div>
+      </div>
+
+      <div class="panel" style="margin-bottom:1rem;">
+        <div class="panel-header">Remote Access</div>
+        <div class="settings-note">
+          API key authentication is configured server-side via the <code>ENGRAMD_API_KEY</code>
+          environment variable when <code>engramd</code> starts. It cannot be changed from the UI.
+          See <code>docs/engram-product/DEPLOY.md</code> for exposing the vault behind Caddy.
+        </div>
+      </div>
+
+      <div class="panel" style="margin-bottom:1rem;">
+        <div class="panel-header">Privacy — What's Stored</div>
+        ${audit ? `
+          <div class="health-list">
+            <div class="health-row">Total memories: <span class="mono">${audit.total_memories ?? 0}</span></div>
+            <div class="health-row">Oldest: <span>${audit.oldest_date ? esc(String(audit.oldest_date).slice(0, 10)) : '—'}</span> · Newest: <span>${audit.newest_date ? esc(String(audit.newest_date).slice(0, 10)) : '—'}</span></div>
+            <div class="health-row">Avg age: <span>${(audit.avg_age_days ?? 0).toFixed ? audit.avg_age_days.toFixed(1) : (audit.avg_age_days ?? 0)} days</span></div>
+            <div class="health-row">Size: <span class="mono">${esc(audit.estimated_db_size_human || formatBytes(audit.db_size_bytes || 0))}</span></div>
+            <div class="health-row"><span class="ok">●</span> Local-only vault — nothing leaves this machine unless sync is configured.</div>
+          </div>
+          <div class="audit-grid">
+            <div>
+              <div class="panel-header" style="padding:0.5rem 1rem 0.25rem;">By layer</div>
+              <div class="health-list">${breakdownRows(breakdown.by_layer, 'layer', (l) => layerIcon(l))}</div>
+            </div>
+            <div>
+              <div class="panel-header" style="padding:0.5rem 1rem 0.25rem;">By source</div>
+              <div class="health-list">${breakdownRows(breakdown.by_source, 'source', (s) => sourceIcon(s))}</div>
+            </div>
+            <div>
+              <div class="panel-header" style="padding:0.5rem 1rem 0.25rem;">By project</div>
+              <div class="health-list">${breakdownRows(breakdown.by_project, 'project', null)}</div>
+            </div>
+          </div>
+        ` : '<div class="settings-note">Privacy audit unavailable (requires engramd ≥ privacy routes).</div>'}
+      </div>
+
+      <div class="panel danger-zone" style="margin-bottom:1rem;">
+        <div class="panel-header">Danger Zone — Purge Memories</div>
+        <div class="settings-note">
+          Permanently delete memories matching <em>at least one</em> criterion. This cannot be undone.
+          Consider <button class="link-btn" id="purge-export-first">exporting first</button>.
+        </div>
+        <div class="purge-form">
+          <select id="purge-source" class="filter-select">
+            <option value="">Any source</option>
+            ${(breakdown.by_source || []).map(s => `<option value="${esc(s.source)}">${esc(s.source)}</option>`).join('')}
+          </select>
+          <select id="purge-layer" class="filter-select">
+            <option value="">Any layer</option>
+            <option value="episodic">Episodic</option>
+            <option value="semantic">Semantic</option>
+            <option value="imagined">Imagined</option>
+          </select>
+          <input type="text" id="purge-project" class="input-sm" placeholder="Project (optional)" style="min-width:140px;">
+          <input type="date" id="purge-before" class="input-sm" title="Delete memories created before this date">
+          <button class="btn btn-danger" id="purge-btn">Purge…</button>
+        </div>
+      </div>
+
+      <div class="panel" style="margin-bottom:1rem;">
+        <div class="panel-header">Import / Export</div>
+        <div class="mutation" style="display:flex;gap:0.5rem;padding:1rem;flex-wrap:wrap;">
+          <button class="btn" id="btn-export">Export (JSONL)</button>
+          <label class="btn" style="cursor:pointer;">
+            Import
+            <input type="file" id="import-file" accept=".jsonl,.json" style="display:none;" onchange="document.getElementById('import-btn').style.display='inline-block';">
+          </label>
+          <button class="btn" id="import-btn" style="display:none;">Upload & Import</button>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-header">Onboarding &amp; Demo Data</div>
+        <div class="settings-note">
+          Demo memories are everyday examples tagged with <code>demo</code> (project
+          <code>demo</code>) so the Explorer and Graph come alive. Remove them all at any
+          time — only memories tagged <code>demo</code> are touched.
+        </div>
+        <div style="padding:0 1rem 1rem;display:flex;gap:0.5rem;flex-wrap:wrap;">
+          <a class="btn" href="#/tour">Open Tour &amp; Demo</a>
+          <button class="btn" id="btn-load-demo">Load demo memories</button>
+          <button class="btn" id="btn-remove-demo">Remove demo memories</button>
+          <button class="btn" id="btn-replay-onboarding">Replay onboarding wizard</button>
+        </div>
+      </div>
+    </div>
+  `;
+
+  // ── Slider value labels
+  document.getElementById('set-budget').oninput = function() {
+    document.getElementById('set-budget-val').textContent = this.value;
+  };
+  document.getElementById('set-reserve').oninput = function() {
+    document.getElementById('set-reserve-val').textContent = this.value + '%';
+  };
+
+  // ── Save context defaults (server replaces the whole sub-object — send all fields)
+  document.getElementById('set-context-save').onclick = async () => {
+    try {
+      const r = await api.config.update({
+        context: {
+          default_budget: parseInt(document.getElementById('set-budget').value),
+          high_priority_reserve: parseInt(document.getElementById('set-reserve').value) / 100,
+          max_engrams: parseInt(document.getElementById('set-max-engrams').value),
+          max_recent_turns: parseInt(document.getElementById('set-max-turns').value),
+        }
+      });
+      if (!r.ok) { const err = await r.json().catch(() => ({})); toast(err.error?.message || err.error || 'Save failed', 'error'); return; }
+      toast('Context defaults saved', 'ok');
+    } catch (e) { toast(e.message || 'Save failed', 'error'); }
+  };
+
+  // ── Save schedule
+  document.getElementById('set-schedule-save').onclick = async () => {
+    try {
+      const r = await api.config.update({
+        schedule: {
+          decay_interval_hours: parseInt(document.getElementById('set-decay-h').value),
+          consolidation_interval_hours: parseInt(document.getElementById('set-cons-h').value),
+          auto_decay: document.getElementById('set-auto-decay').checked,
+          auto_consolidation: document.getElementById('set-auto-cons').checked,
+        }
+      });
+      if (!r.ok) { const err = await r.json().catch(() => ({})); toast(err.error?.message || err.error || 'Save failed', 'error'); return; }
+      toast('Schedule saved', 'ok');
+    } catch (e) { toast(e.message || 'Save failed', 'error'); }
+  };
+
+  // ── Export / import
+  async function doExport() {
+    const r = await api.export({ format: 'jsonl' });
+    const memories = r.memories || [];
+    const jsonl = memories.map(m => JSON.stringify(m)).join('\n');
+    const blob = new Blob([jsonl], { type: 'application/x-ndjson' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `engrams-export-${new Date().toISOString().slice(0,10)}.jsonl`;
+    a.click();
+    return memories.length;
+  }
+
+  document.getElementById('btn-export').onclick = async () => {
+    try {
+      const n = await doExport();
+      toast(`Exported ${n} memories`, 'ok');
+    } catch (e) { toast(e.message || 'Export failed', 'error'); }
+  };
+
+  document.getElementById('purge-export-first').onclick = async () => {
+    try {
+      const n = await doExport();
+      toast(`Exported ${n} memories — safe to purge`, 'ok');
+    } catch (e) { toast(e.message || 'Export failed', 'error'); }
+  };
+
+  document.getElementById('import-btn').onclick = async () => {
+    try {
+      const file = document.getElementById('import-file').files[0];
+      if (!file) return;
+      const text = await file.text();
+      // Parse JSONL or JSON, then send as { memories: [...] }
+      let memories;
+      try {
+        const parsed = JSON.parse(text);
+        memories = Array.isArray(parsed) ? parsed : (parsed.memories || [parsed]);
+      } catch {
+        memories = text.split('\n')
+          .filter(line => line.trim())
+          .map(line => { try { return JSON.parse(line); } catch {} return null; })
+          .filter(Boolean);
+      }
+      const r = await api.import({ memories });
+      toast(`Imported ${r.imported || 0} memories (${r.skipped || 0} skipped)`, 'ok');
+    } catch (e) { toast(e.message || 'Import failed', 'error'); }
+  };
+
+  // ── Purge with confirmation modal
+  document.getElementById('purge-btn').onclick = () => {
+    const source = document.getElementById('purge-source').value;
+    const layer = document.getElementById('purge-layer').value;
+    const project = document.getElementById('purge-project').value.trim();
+    const before = document.getElementById('purge-before').value;
+
+    const criteria = {};
+    const desc = [];
+    if (source) { criteria.source = source; desc.push(`source = "${source}"`); }
+    if (layer) { criteria.layer = layer; desc.push(`layer = "${layer}"`); }
+    if (project) { criteria.project = project; desc.push(`project = "${project}"`); }
+    if (before) { criteria.before_date = new Date(before + 'T00:00:00Z').toISOString(); desc.push(`created before ${before}`); }
+
+    if (!desc.length) {
+      toast('Select at least one purge criterion', 'error');
+      return;
+    }
+
+    const root = document.getElementById('modal-root');
+    root.innerHTML = `
+      <div class="ob-overlay">
+        <div class="ob-modal purge-modal">
+          <h3>Confirm purge</h3>
+          <p>Permanently delete all memories where <strong>${esc(desc.join(' AND '))}</strong>?</p>
+          <p class="faint">This cannot be undone.</p>
+          <div class="ob-actions">
+            <button class="btn" id="purge-cancel">Cancel</button>
+            <button class="btn btn-danger" id="purge-confirm">Delete permanently</button>
+          </div>
+        </div>
+      </div>`;
+    document.getElementById('purge-cancel').onclick = () => { root.innerHTML = ''; };
+    document.getElementById('purge-confirm').onclick = async () => {
+      try {
+        const r = await api.privacy.purge(criteria);
+        root.innerHTML = '';
+        toast(`Purged ${r.deleted ?? r.purged ?? 0} memories`, 'warn');
+        render();
+      } catch (e) {
+        root.innerHTML = '';
+        toast(e.message || 'Purge failed', 'error');
+      }
+    };
+  };
+
+  // ── Onboarding & demo data
+  document.getElementById('btn-load-demo').onclick = async () => {
+    try {
+      const r = await loadDemoMemories();
+      if (r.already) {
+        toast('Demo memories are already loaded', 'info');
+      } else {
+        toast(`Loaded ${r.loaded} demo memories`, 'ok');
+      }
+      updateStatus();
+    } catch (e) { toast(e.message || 'Demo load failed', 'error'); }
+  };
+  document.getElementById('btn-remove-demo').onclick = async () => {
+    if (!confirm('Remove all demo memories? Only memories tagged "demo" are deleted.')) return;
+    try {
+      const n = await removeDemoMemories();
+      toast(`Removed ${n} demo memories`, 'warn');
+      updateStatus();
+    } catch (e) { toast(e.message || 'Demo removal failed', 'error'); }
+  };
+  document.getElementById('btn-replay-onboarding').onclick = () => {
+    localStorage.removeItem('engram_onboarded');
+    showOnboarding();
+  };
+
+  updateStatus();
+});
+
+// ── Demo memories ──────────────────────────────────────────────────────────
+// Guided-tour dataset. Everything is captured with project "demo" (and a
+// "demo" tag) so it can be removed in one click from Settings → Privacy
+// (purge by project).
+
+const DEMO_MEMORIES = [
+  { content: 'Had coffee with Sarah — she wants to try the new project-management tool next week', layer: 'episodic', source: 'interaction', tags: ['people', 'sarah'], valence: 0.6 },
+  { content: 'Spent the morning debugging the login page — turned out to be a timezone issue', layer: 'episodic', source: 'window', tags: ['work', 'debugging'], valence: -0.4 },
+  { content: 'I prefer concise answers with code examples over long explanations', layer: 'semantic', source: 'interaction', tags: ['preferences'], valence: 0.3 },
+  { content: 'The staging server deploys every Tuesday at 10am — never deploy on a Friday', layer: 'semantic', source: 'agent', tags: ['work', 'deploys', 'rule'], valence: 0 },
+  { content: 'Asked the assistant to plan a birthday dinner for 8 people — shortlisted three restaurants', layer: 'episodic', source: 'chat', tags: ['personal', 'planning'], valence: 0.5 },
+  { content: 'Always book vegetarian options for team dinners — two teammates are vegetarian', layer: 'semantic', source: 'research', tags: ['team', 'food', 'rule'], valence: 0.2 },
+  { content: 'What if the calendar warned me before I book meetings during my low-energy afternoons?', layer: 'imagined', source: 'system', tags: ['idea', 'calendar'], valence: 0.1 },
+  { content: 'A travel mode that batches non-urgent notifications while abroad', layer: 'imagined', source: 'system', tags: ['idea', 'notifications'], valence: 0.2 },
+  { content: 'Thursday evening is usually gym time — skipped it this week for a deadline', layer: 'episodic', source: 'system', tags: ['health', 'routine'], valence: -0.2 },
+  { content: 'Pattern noticed: the most productive deep-work sessions happen on Tuesday and Thursday mornings', layer: 'semantic', source: 'consolidation', tags: ['pattern', 'productivity'], valence: 0.4 },
+  { content: 'Finished reading "Thinking in Systems" — took notes on feedback loops', layer: 'episodic', source: 'interaction', tags: ['reading', 'books'], valence: 0.5 },
+  { content: 'The feedback loops from that book are exactly how memory decay works in this vault', layer: 'semantic', source: 'research', tags: ['reading', 'memory'], valence: 0.3 },
+];
+
+// Pairs of indices into DEMO_MEMORIES to connect, so the Graph screen has edges.
+const DEMO_LINKS = [
+  [4, 5, 'causal'],       // dinner planning → vegetarian rule
+  [10, 11, 'analogical'], // systems book → memory decay insight
+  [8, 9, 'associative'],  // gym routine → deep-work pattern
+  [0, 4, 'associative'],  // Sarah → dinner planning
+];
+
+async function loadDemoMemories() {
+  // Guard against duplicates — don't load twice
+  const existing = await api.memories.search({ sort_by: 'recency', limit: 200 });
+  if ((existing.results || []).some(m => (m.tags || []).includes('demo'))) {
+    return { loaded: 0, already: true };
+  }
+  const ids = [];
+  for (const d of DEMO_MEMORIES) {
+    const r = await post('/memories', {
+      content: d.content, layer: d.layer, source: d.source,
+      tags: [...d.tags, 'demo'], valence: d.valence, project: 'demo',
+    });
+    ids.push(r.id);
+  }
+  for (const [a, b, type] of DEMO_LINKS) {
+    if (ids[a] && ids[b]) {
+      try { await post('/memories/link', { source_id: ids[a], target_id: ids[b], link_type: type, weight: 0.7 }); } catch (e) { /* links are decorative */ }
+    }
+  }
+  return { loaded: ids.length, already: false };
+}
+
+async function removeDemoMemories() {
+  const r = await api.privacy.purge({ project: 'demo' });
+  return r.deleted ?? r.purged ?? 0;
+}
+
+// ── Onboarding wizard ──────────────────────────────────────────────────────
+
+function showOnboarding() {
+  const root = document.getElementById('modal-root');
+  let step = 1;
+  let capturedContent = '';
+  let demoLoaded = false;
+  const STEPS = 5;
+
+  function close() {
+    localStorage.setItem('engram_onboarded', '1');
+    root.innerHTML = '';
+    updateStatus();
+  }
+
+  function dots() {
+    return `<div class="ob-dots">${Array.from({ length: STEPS }, (_, i) =>
+      `<span class="ob-dot${i + 1 === step ? ' active' : ''}"></span>`).join('')}</div>`;
+  }
+
+  function shell(content, actions) {
+    root.innerHTML = `
+      <div class="ob-overlay">
+        <div class="ob-modal">
+          ${dots()}
+          ${content}
+          <div class="ob-actions">${actions}</div>
+        </div>
+      </div>`;
+  }
+
+  function renderStep() {
+    if (step === 1) {
+      shell(`
+        <h3>Welcome — this is your AI's memory</h3>
+        <p>AI assistants forget everything the moment a conversation ends. Engram changes that:
+        it gives your AI a <strong>long-term memory</strong>, so it can remember your preferences,
+        past conversations, and what you were working on.</p>
+        <p>This app is the window into that memory. Everything you see here is stored
+        <strong>on this computer only</strong>, inside an encrypted vault. Nothing is uploaded
+        or shared — you can browse, search, and delete it all.</p>
+        <p>Over the next few steps we'll show you how it works. No technical knowledge needed.</p>`,
+        `<button class="btn" id="ob-skip">Skip tour</button>
+         <button class="btn btn-primary" id="ob-next">How it works →</button>`);
+      document.getElementById('ob-skip').onclick = close;
+      document.getElementById('ob-next').onclick = () => { step = 2; renderStep(); };
+
+    } else if (step === 2) {
+      shell(`
+        <h3>Three kinds of memory</h3>
+        <p>Just like people, your AI keeps different <em>kinds</em> of memories, shown in
+        different colors throughout the app:</p>
+        <div class="ob-legend">
+          <div>${layerIcon('episodic')} <strong>Episodic — things that happened.</strong><br>
+          <span class="faint">Like a journal: "Deployed the website on Tuesday", "Had coffee with Sarah".</span></div>
+          <div>${layerIcon('semantic')} <strong>Semantic — things that were learned.</strong><br>
+          <span class="faint">Facts, preferences and rules: "You prefer short answers", "Never deploy on Fridays".</span></div>
+          <div>${layerIcon('imagined')} <strong>Imagined — ideas the AI came up with.</strong><br>
+          <span class="faint">Suggestions it dreamed up on its own. These stay <em>quarantined</em> — clearly marked and never treated as fact — until you approve ("ground") them.</span></div>
+        </div>
+        <p>Two more things you'll see on every memory:</p>
+        <div class="ob-legend">
+          <div><strong>Strength</strong> — memories fade when unused and grow stronger when they prove useful, mirroring how human memory works.</div>
+          <div><strong>Valence</strong> — the emotional tone, from challenging to joyful, so your AI knows which experiences went well.</div>
+        </div>`,
+        `<button class="btn" id="ob-back">← Back</button>
+         <button class="btn btn-primary" id="ob-next">See it in action →</button>`);
+      document.getElementById('ob-back').onclick = () => { step = 1; renderStep(); };
+      document.getElementById('ob-next').onclick = () => { step = 3; renderStep(); };
+
+    } else if (step === 3) {
+      shell(`
+        <h3>Look around with demo memories</h3>
+        <p>The easiest way to understand Engram is to see it full. We can load
+        <strong>12 ready-made demo memories</strong> — everyday examples like dinner plans,
+        work rules, and a few AI-generated ideas — already linked together so the
+        <strong>Graph</strong> view lights up.</p>
+        <p>They're completely fake, clearly marked with a <span class="mono">demo</span> tag,
+        and you can remove every one of them with a single click in
+        <strong>Settings → Onboarding &amp; Demo Data</strong> whenever you're done exploring.</p>
+        <div id="ob-demo-result" class="ob-result">
+          <button class="btn btn-primary" id="ob-load-demo">Load demo memories</button>
+        </div>
+        <p class="faint">After the tour, open <strong>Explorer</strong> to browse them and
+        <strong>Graph</strong> to see how they connect — or skip this and use your own data.</p>`,
+        `<button class="btn" id="ob-back">← Back</button>
+         <button class="btn" id="ob-next">Skip demo →</button>`);
+      document.getElementById('ob-back').onclick = () => { step = 2; renderStep(); };
+      document.getElementById('ob-next').onclick = () => { step = 4; renderStep(); };
+      document.getElementById('ob-load-demo').onclick = async () => {
+        const out = document.getElementById('ob-demo-result');
+        out.innerHTML = '<span class="faint">Loading demo memories…</span>';
+        try {
+          const r = await loadDemoMemories();
+          if (r.already) {
+            out.innerHTML = '<span class="ok">✓ Demo memories are already loaded.</span> <span class="faint">Remove them from Settings when you\'re done.</span>';
+          } else {
+            demoLoaded = true;
+            out.innerHTML = `<span class="ok">✓ ${r.loaded} demo memories loaded.</span> <span class="faint">They'll show up everywhere in the app.</span>`;
+            toast(`${r.loaded} demo memories loaded`, 'ok');
+          }
+          updateStatus();
+          setTimeout(() => { step = 4; renderStep(); }, 1200);
+        } catch (e) {
+          out.innerHTML = `<span class="error">Couldn't load demo memories: ${esc(e.message)}</span>`;
+        }
+      };
+
+    } else if (step === 4) {
+      shell(`
+        <h3>Capture a memory of your own</h3>
+        <p>Normally your tools remember things for you automatically. But you can also
+        teach your AI something directly — try it now. Anything works:</p>
+        <div class="ob-legend">
+          <div class="faint">• A preference: "I prefer dark mode and short answers"</div>
+          <div class="faint">• A fact: "My team's standup is at 9:30 on Mondays"</div>
+          <div class="faint">• Something that happened: "Started the garden project this weekend"</div>
+        </div>
+        <textarea id="ob-content" class="ob-textarea" rows="3" placeholder="Something worth remembering… (or leave empty to skip)"></textarea>
+        <input type="text" id="ob-tags" class="search-input" placeholder="Tags, comma-separated — optional labels for finding this later" style="margin-top:0.5rem;">
+        <div id="ob-capture-result" class="ob-result"></div>`,
+        `<button class="btn" id="ob-back">← Back</button>
+         <button class="btn btn-primary" id="ob-next">Save &amp; continue →</button>`);
+      document.getElementById('ob-back').onclick = () => { step = 3; renderStep(); };
+      document.getElementById('ob-next').onclick = async () => {
+        const content = document.getElementById('ob-content').value.trim();
+        const tags = document.getElementById('ob-tags').value.split(',').map(t => t.trim()).filter(Boolean);
+        if (!content) { step = 5; renderStep(); return; }
+        try {
+          const r = await post('/memories', { content, tags: tags.length ? tags : undefined, source: 'interaction' });
+          capturedContent = content;
+          document.getElementById('ob-capture-result').innerHTML =
+            `<span class="ok">✓ Remembered.</span> <span class="faint">Your AI can recall this from now on.</span>`;
+          toast('Memory captured', 'ok');
+          setTimeout(() => { step = 5; renderStep(); }, 900);
+        } catch (e) {
+          toast(e.message || 'Capture failed', 'error');
+        }
+      };
+
+    } else {
+      shell(`
+        <h3>What your AI actually sees</h3>
+        <p>Here's the payoff. When you talk to your AI, Engram quietly picks the most
+        relevant memories and slips them into the instructions the AI receives —
+        that's how it "remembers".</p>
+        <p>Press the button to see the exact message your AI would get
+        ${demoLoaded || capturedContent ? 'right now, with your memories in it' : 'once you have some memories'}:</p>
+        <div id="ob-context-preview" class="ob-result">
+          <button class="btn" id="ob-assemble">Show me what my AI receives</button>
+        </div>
+        <p class="faint">You can do this any time on the <strong>Context</strong> screen.
+        That's it — explore the Dashboard, browse the Explorer, and check the Graph.
+        Everything is yours, and everything can be deleted from Settings.</p>`,
+        `<button class="btn" id="ob-back">← Back</button>
+         <button class="btn btn-primary" id="ob-finish">Start exploring →</button>`);
+      document.getElementById('ob-back').onclick = () => { step = 4; renderStep(); };
+      document.getElementById('ob-finish').onclick = () => { close(); navigate('#/'); };
+      document.getElementById('ob-assemble').onclick = async () => {
+        const out = document.getElementById('ob-context-preview');
+        out.innerHTML = '<span class="faint">Assembling…</span>';
+        try {
+          const r = await api.context.assemble({ query: capturedContent || 'What do you remember about me?' });
+          out.innerHTML = `
+            <div class="faint" style="margin-bottom:0.5rem;">${r.metadata?.total_tokens || 0} tokens · ${r.metadata?.engrams_retrieved || 0} memories included</div>
+            <div class="messages-preview">${(r.messages || []).map(m =>
+              `<div class="msg-row"><span class="msg-role">[${m.role}]</span> ${esc((m.content || '').slice(0, 300))}${(m.content || '').length > 300 ? '…' : ''}</div>`).join('')}
+            </div>`;
+        } catch (e) {
+          out.innerHTML = `<span class="error">${esc(e.message)}</span>`;
+        }
+      };
+    }
+  }
+
+  renderStep();
+}
+
+// ── Tour & Demo section ────────────────────────────────────────────────────
+// A full page (not a modal) with the plain-language explanation and the live
+// demo, accessible at any time from the nav and the "?" topbar button.
+
+route('/tour', async () => {
+  const app = document.getElementById('app');
+
+  // Detect whether demo memories are currently loaded
+  let demoCount = 0;
+  try {
+    const s = await api.memories.search({ sort_by: 'recency', limit: 200 });
+    demoCount = (s.results || []).filter(m => (m.tags || []).includes('demo')).length;
+  } catch (e) { /* API unreachable — demoCount stays 0 */ }
+
+  app.innerHTML = `
+    <div class="page tour-page">
+      <div class="tour-hero">
+        <h2>Your AI forgets everything. <span class="accent">Engram remembers.</span></h2>
+        <p>This is a tour of your AI's memory. Read the explanation, then make the app
+        come alive with demo memories — fake, clearly marked, and removable in one click.</p>
+      </div>
+
+      <div class="panel-grid">
+        <div class="panel">
+          <div class="panel-header">How it works</div>
+          <div class="tour-body">
+            <p>AI assistants forget everything the moment a conversation ends. Engram gives
+            your AI a <strong>long-term memory</strong> — it quietly records the important
+            moments, and recalls them in later conversations.</p>
+            <p>Everything is stored <strong>on this computer only</strong>, inside an encrypted
+            vault. Nothing is uploaded or shared. You can browse, search, and delete it all.</p>
+
+            <h4>Three kinds of memory</h4>
+            <div class="ob-legend">
+              <div>${layerIcon('episodic')} <strong>Episodic — things that happened.</strong><br>
+              <span class="faint">Like a journal: "Deployed the website on Tuesday", "Had coffee with Sarah".</span></div>
+              <div>${layerIcon('semantic')} <strong>Semantic — things that were learned.</strong><br>
+              <span class="faint">Facts, preferences and rules: "You prefer short answers", "Never deploy on Fridays".</span></div>
+              <div>${layerIcon('imagined')} <strong>Imagined — ideas the AI came up with.</strong><br>
+              <span class="faint">Suggestions it dreamed up on its own. These stay <em>quarantined</em> — clearly
+              marked and never treated as fact — until you approve ("ground") them.</span></div>
+            </div>
+
+            <h4>Two more things on every memory</h4>
+            <div class="ob-legend">
+              <div><strong>Strength</strong> — memories fade when unused and grow stronger when they prove useful,
+              mirroring how human memory works.</div>
+              <div><strong>Valence</strong> — the emotional tone, from challenging to joyful, so your AI knows which
+              experiences went well.</div>
+            </div>
+
+            <p class="faint" style="margin-top:1rem;">Prefer a guided walkthrough?
+            <a href="#/tour" id="tour-replay-wizard" class="link">Open the step-by-step wizard</a> instead.</p>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-header">Live demo</div>
+          <div class="tour-body">
+            <p>The easiest way to understand Engram is to see it full. Load
+            <strong>12 ready-made demo memories</strong> — everyday examples like dinner plans,
+            work rules, and a few AI-generated ideas — already linked together so the
+            <strong>Graph</strong> view lights up.</p>
+            <p>They're completely fake, clearly marked with a <span class="mono">demo</span> tag,
+            and every one of them can be removed with a single click.</p>
+
+            <div class="tour-demo-state" id="tour-demo-state">
+              ${demoCount > 0
+                ? `<span class="ok">● ${demoCount} demo memories are currently loaded</span>
+                   <span class="faint">They appear in the Explorer and Graph alongside your real memories.</span>`
+                : `<span class="faint">No demo memories loaded right now.</span>`}
+            </div>
+
+            <div class="tour-demo-actions">
+              <button class="btn btn-primary" id="tour-load-demo">Load demo memories</button>
+              <button class="btn" id="tour-remove-demo" ${demoCount > 0 ? '' : 'disabled'}>Remove demo memories</button>
+            </div>
+            <div id="tour-demo-result" class="ob-result"></div>
+
+            <h4>Where to look</h4>
+            <div class="tour-demo-actions">
+              <a class="btn" href="#/memories">Explorer — browse them</a>
+              <a class="btn" href="#/graph">Graph — see them connect</a>
+              <a class="btn" href="#/context">Context — what your AI receives</a>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-header">Try it yourself</div>
+          <div class="tour-body">
+            <p>Normally your tools remember things for you automatically. But you can also
+            teach your AI something directly — anything works:</p>
+            <div class="ob-legend">
+              <div class="faint">• A preference: "I prefer dark mode and short answers"</div>
+              <div class="faint">• A fact: "My team's standup is at 9:30 on Mondays"</div>
+              <div class="faint">• Something that happened: "Started the garden project this weekend"</div>
+            </div>
+            <textarea id="tour-content" class="ob-textarea" rows="3" placeholder="Something worth remembering…"></textarea>
+            <input type="text" id="tour-tags" class="search-input" placeholder="Tags, comma-separated — optional labels for finding this later" style="margin-top:0.5rem;">
+            <div class="tour-demo-actions" style="margin-top:0.75rem;">
+              <button class="btn btn-primary" id="tour-capture">Remember this</button>
+            </div>
+            <div id="tour-capture-result" class="ob-result"></div>
+
+            <h4>What your AI sees</h4>
+            <p class="faint">Engram quietly picks the most relevant memories and slips them into the
+            instructions your AI receives — that's how it "remembers". Press the button to see
+            the exact message your AI would get:</p>
+            <div class="tour-demo-actions">
+              <button class="btn" id="tour-assemble">Show me what my AI receives</button>
+            </div>
+            <div id="tour-context-preview" class="ob-result"></div>
+          </div>
+        </div>
+      </div>
+    </div>`;
+
+  // ── Wizard replay link
+  document.getElementById('tour-replay-wizard').onclick = (e) => {
+    e.preventDefault();
+    showOnboarding();
+  };
+
+  // ── Demo load / remove
+  document.getElementById('tour-load-demo').onclick = async () => {
+    const out = document.getElementById('tour-demo-result');
+    out.innerHTML = '<span class="faint">Loading demo memories…</span>';
+    try {
+      const r = await loadDemoMemories();
+      if (r.already) {
+        out.innerHTML = '<span class="ok">✓ Demo memories are already loaded.</span>';
+      } else {
+        out.innerHTML = `<span class="ok">✓ ${r.loaded} demo memories loaded.</span> <span class="faint">They'll show up everywhere in the app.</span>`;
+        toast(`${r.loaded} demo memories loaded`, 'ok');
+      }
+      updateStatus();
+      // Refresh the demo-state line without a full re-render
+      const state = document.getElementById('tour-demo-state');
+      if (state) state.innerHTML = `<span class="ok">● ${r.loaded || 12} demo memories are currently loaded</span>
+        <span class="faint">They appear in the Explorer and Graph alongside your real memories.</span>`;
+      const rm = document.getElementById('tour-remove-demo');
+      if (rm) rm.disabled = false;
+    } catch (e) {
+      out.innerHTML = `<span class="error">Couldn't load demo memories: ${esc(e.message)}</span>`;
+    }
+  };
+
+  document.getElementById('tour-remove-demo').onclick = async () => {
+    const out = document.getElementById('tour-demo-result');
+    out.innerHTML = '<span class="faint">Removing demo memories…</span>';
+    try {
+      const n = await removeDemoMemories();
+      out.innerHTML = `<span class="ok">✓ Removed ${n} demo memories.</span>`;
+      toast(`Removed ${n} demo memories`, 'ok');
+      updateStatus();
+      const state = document.getElementById('tour-demo-state');
+      if (state) state.innerHTML = '<span class="faint">No demo memories loaded right now.</span>';
+      document.getElementById('tour-remove-demo').disabled = true;
+    } catch (e) {
+      out.innerHTML = `<span class="error">Couldn't remove demo memories: ${esc(e.message)}</span>`;
+    }
+  };
+
+  // ── Capture
+  document.getElementById('tour-capture').onclick = async () => {
+    const content = document.getElementById('tour-content').value.trim();
+    if (!content) { toast('Type something worth remembering first', 'info'); return; }
+    const tags = document.getElementById('tour-tags').value.split(',').map(t => t.trim()).filter(Boolean);
+    const out = document.getElementById('tour-capture-result');
+    out.innerHTML = '<span class="faint">Saving…</span>';
+    try {
+      const r = await post('/memories', { content, tags: tags.length ? tags : undefined, source: 'interaction' });
+      document.getElementById('tour-content').value = '';
+      document.getElementById('tour-tags').value = '';
+      out.innerHTML = `<span class="ok">✓ Remembered.</span> <span class="faint">Your AI can recall this from now on.</span>`;
+      toast('Memory captured', 'ok');
+      updateStatus();
+    } catch (e) {
+      out.innerHTML = `<span class="error">${esc(e.message)}</span>`;
+    }
+  };
+
+  // ── Context preview
+  document.getElementById('tour-assemble').onclick = async () => {
+    const out = document.getElementById('tour-context-preview');
+    out.innerHTML = '<span class="faint">Assembling…</span>';
+    try {
+      const r = await api.context.assemble({ query: 'What do you remember about me?' });
+      out.innerHTML = `
+        <div class="faint" style="margin-bottom:0.5rem;">${r.metadata?.total_tokens || 0} tokens · ${r.metadata?.engrams_retrieved || 0} memories included</div>
+        <div class="messages-preview">${(r.messages || []).map(m =>
+          `<div class="msg-row"><span class="msg-role">[${m.role}]</span> ${esc((m.content || '').slice(0, 300))}${(m.content || '').length > 300 ? '…' : ''}</div>`).join('')}
+        </div>`;
+    } catch (e) {
+      out.innerHTML = `<span class="error">${esc(e.message)}</span>`;
+    }
+  };
+});
+
+// ── Init ──────────────────────────────────────────────────────────────────
+
+updateStatus();
+setInterval(updateStatus, 30000);
+
+// Tour & demo: accessible at any time from the topbar
+document.getElementById('tour-btn').addEventListener('click', () => navigate('#/tour'));
+
+// Mobile read-only flag (K3: mobile is browse-only)
+const mobileMq = window.matchMedia('(max-width: 767px)');
+const applyMobileFlag = () => document.body.classList.toggle('mobile', mobileMq.matches);
+if (mobileMq.addEventListener) mobileMq.addEventListener('change', applyMobileFlag);
+applyMobileFlag();
+
+// Onboarding: show on first visit, or whenever the vault is empty
+(async () => {
+  const onboarded = localStorage.getItem('engram_onboarded');
+  let empty = false;
+  try {
+    const s = await api.stats();
+    empty = (s.total_memories || 0) === 0;
+  } catch (e) {
+    return; // server down — don't onboard against a dead API
+  }
+  if (!onboarded || empty) showOnboarding();
+})();

@@ -1,0 +1,52 @@
+// Shared application state types used by both the binary (main.rs) and
+// integration tests (via lib.rs).
+
+use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::{broadcast, Mutex};
+
+use axiom_engram::{EngramStore, EngramStoreAdapter, QemCache};
+use axiom_engram::embed::Embedder;
+
+/// A live event broadcast to connected WebSocket clients.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum LiveEvent {
+    Capture {
+        memory_id: String,
+        content_snippet: String,
+        layer: String,
+        source: String,
+        tags: Vec<String>,
+        timestamp: String,
+    },
+    Decay {
+        strengthened: usize,
+        decayed: usize,
+        timestamp: String,
+    },
+    Consolidation {
+        promoted: usize,
+        pruned: usize,
+        timestamp: String,
+    },
+}
+
+/// Alias for the QEM-wrapped vault.
+pub type CachedStore = QemCache<EngramStoreAdapter>;
+
+/// The shared application state, accessible from every route handler.
+#[derive(Clone)]
+pub struct AppState {
+    pub vault: Arc<Mutex<EngramStore>>,
+    /// L1 holographic cache (associative lookup, novelty filter, hit-rate tracking)
+    pub qem: Arc<CachedStore>,
+    pub vault_path: PathBuf,
+    pub start_time: chrono::DateTime<chrono::Utc>,
+    /// Broadcast channel for live WebSocket events (capture, decay, consolidation)
+    pub events_tx: broadcast::Sender<LiveEvent>,
+    /// Persistent device identity (stored in vault_path/device.json).
+    pub device_id: String,
+    /// Optional embedding provider for vector search.
+    pub embedder: Option<Arc<dyn Embedder>>,
+}

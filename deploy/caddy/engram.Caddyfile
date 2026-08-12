@@ -1,0 +1,92 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# engram.ellmstack.dev — Engram Memory Vault
+#
+# Caddy v2 site config. Import from the main Caddyfile with:
+#
+#     import /etc/caddy/engram.Caddyfile
+#
+# Architecture:
+#   browser → Caddy :443 (automatic TLS via Let's Encrypt)
+#     ├── /              → static landing page (/srv/engram/landing)   [public]
+#     ├── /app           → static vault UI SPA (/srv/engram/vault)     [basic_auth]
+#     └── API paths      → reverse_proxy 127.0.0.1:8787 (engramd)      [basic_auth]
+#
+# Routing note: the API proxy MUST be a `handle` block, not a bare
+# reverse_proxy directive. A bare reverse_proxy compiles AFTER the catch-all
+# `handle {}` in Caddy's handler chain, so the landing file_server would
+# swallow every API request with a 404 before the proxy ever runs.
+#
+# Required environment variables (Caddy substitutes these at config-load time;
+# set them via a systemd override for the caddy service, e.g.
+# /etc/systemd/system/caddy.service.d/engram.conf with Environment= lines):
+#
+#   ENGRAMD_API_KEY      — API key engramd requires (crates/engramd/src/auth.rs).
+#                          Caddy injects it as `Authorization: Bearer <key>` on
+#                          proxied requests so the SPA's same-origin fetches
+#                          pass engramd's auth middleware. Must match the value
+#                          in /etc/engram/engramd.env.
+#   ENGRAM_UI_USER       — username for HTTP basic auth (vault UI + API).
+#   ENGRAM_UI_PASS_HASH  — bcrypt hash of the basic-auth password.
+#                          Generate with: caddy hash-password --plaintext <pw>
+#
+# Note on URL layout: the vault SPA calls fetch(API + path) with API = ''
+# (ui/engram-vault/js/main.js:5) and root-absolute paths like '/health', so
+# API requests resolve to the ORIGIN ROOT, not under /app. The API matchers
+# below are therefore root paths.
+# ─────────────────────────────────────────────────────────────────────────────
+
+engram.ellmstack.dev {
+	encode zstd gzip
+
+	# ── Authentication ──────────────────────────────────────────────────────
+	# Everything except the public landing page sits behind HTTP basic auth.
+	# Path prefixes mirror engramd's routers (crates/engramd/src/routes/*.rs).
+	@protected path /app /app/* /health /memories* /context* /consolidate* /analytics* /config /export /import /ws* /annotations* /searches* /privacy* /sync*
+	basic_auth @protected {
+		{$ENGRAM_UI_USER} {$ENGRAM_UI_PASS_HASH}
+	}
+
+	# ── SSE: real-time context stream (must precede @api: both match) ────────
+	# /context/stream is Server-Sent Events (crates/engramd/src/routes/context.rs).
+	# flush_interval -1 disables response buffering so events arrive immediately.
+	handle /context/stream {
+		reverse_proxy 127.0.0.1:8787 {
+			header_up Authorization "Bearer {$ENGRAMD_API_KEY}"
+			flush_interval -1
+		}
+	}
+
+	# ── JSON REST API → engramd on 127.0.0.1:8787 ──────────────────────────
+	# (/ws/events upgrades to WebSocket transparently through this proxy.)
+	@api path /health /memories* /context* /consolidate* /analytics* /config /export /import /ws* /annotations* /searches* /privacy* /sync*
+	handle @api {
+		reverse_proxy 127.0.0.1:8787 {
+			header_up Authorization "Bearer {$ENGRAMD_API_KEY}"
+		}
+	}
+
+	# ── Vault UI SPA at /app ────────────────────────────────────────────────
+	# No-build static SPA with hash routing (#/, #/memories, ...), so the only
+	# fallback needed is index.html; no history-API rewrite complexity.
+	redir /app /app/ 308
+	handle_path /app/* {
+		root * /srv/engram/vault
+		try_files {path} /index.html
+		file_server
+	}
+
+	# ── Public landing page ─────────────────────────────────────────────────
+	handle {
+		root * /srv/engram/landing
+		file_server
+	}
+
+	header {
+		X-Frame-Options "DENY"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+	}
+
+	header / Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; img-src 'self' data:; connect-src 'self'; font-src 'self' https://fonts.gstatic.com; form-action 'self'; frame-ancestors 'none'; base-uri 'self'"
+}

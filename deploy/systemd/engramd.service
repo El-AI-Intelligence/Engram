@@ -1,0 +1,33 @@
+[Unit]
+Description=Engram Memory Vault daemon (engramd)
+Documentation=https://engram.ellmstack.dev
+After=network.target
+
+[Service]
+Type=simple
+User=engram
+Group=engram
+ExecStart=/usr/local/bin/engramd daemon --vault /var/lib/engram/vault
+Environment=RUST_LOG=info
+# Optional env file: ENGRAMD_API_KEY, ENGRAM_PASSPHRASE, ENGRAM_CORS_ORIGINS
+EnvironmentFile=-/etc/engram/engramd.env
+Restart=always
+RestartSec=5
+
+# ── Sandboxing ──────────────────────────────────────────────────────────────
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/engram
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
