@@ -640,7 +640,7 @@ pub async fn handle_mcp(command: String) -> Result<()> {
         _ => {
             println!("MCP server status:");
             println!("  Command:  engramd-mcp --engramd-url http://127.0.0.1:8787");
-            println!("  Tools:    7 (capture, search, get, link, assemble_context, health, decay)");
+            println!("  Tools:    6 (engram_search, engram_capture, engram_get, engram_context, engram_health, engram_decay)");
             println!("  Transport: stdio");
             println!();
             println!("To install: engram mcp install");

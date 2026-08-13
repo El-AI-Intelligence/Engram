@@ -27,3 +27,4 @@ sdks/python-engramd/dist/
 # Python cache
 __pycache__/
 *.pyc
+.mcp.json
