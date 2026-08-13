@@ -365,6 +365,11 @@ async fn run_daemon(
     let embedder: Option<Arc<dyn Embedder>> = Some(Arc::new(axiom_engram::OnnxEmbedder::new()));
     info!("ONNX embedder enabled (MiniLM model loads lazily on first embed)");
 
+    // Manual sync trigger channel — /sync/now bumps the counter, the sync
+    // loop's select! wakes for an immediate cycle.
+    let (sync_trigger_tx, sync_trigger_rx) = tokio::sync::watch::channel(0u64);
+    let sync_trigger_tx = Arc::new(sync_trigger_tx);
+
     let state = AppState {
         vault: vault.clone(),
         qem,
@@ -375,6 +380,7 @@ async fn run_daemon(
         embedder,
         inference: load_inference_provider(&vault_path),
         noise_ignored_sources: load_noise_ignored_sources(&vault_path),
+        sync_trigger: sync_trigger_tx.clone(),
     };
 
     // ── Background scheduler ──────────────────────────────────────────────
@@ -414,11 +420,20 @@ async fn run_daemon(
                     .unwrap_or(60)
                     .max(5); // minimum 5s to avoid busy-loop on misconfiguration
 
-                // The vault_id is derived from the vault path name (stable identifier)
-                let vault_id = vault_path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "default".into());
+                // The vault_id is derived from the vault path name (stable
+                // identifier), unless the config pins an explicit one — so
+                // multiple vault directories can join one logical vault.
+                let vault_id = cfg
+                    .get("sync")
+                    .and_then(|s| s.get("vault_id"))
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| {
+                        vault_path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| "default".into())
+                    });
 
                 // Passphrase: for sync, we use the same passphrase used to open the vault.
                 // If no passphrase was provided, sync won't work (encryption is required).
@@ -443,6 +458,7 @@ async fn run_daemon(
                         vault.clone(),
                         vault_path.clone(),
                         std::time::Duration::from_secs(interval_secs),
+                        sync_trigger_rx,
                     );
                 } else {
                     tracing::error!(

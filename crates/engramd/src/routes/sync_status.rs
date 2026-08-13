@@ -10,7 +10,7 @@ use crate::AppState;
 
 use axum::{
     extract::State,
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use serde::Serialize;
@@ -18,6 +18,47 @@ use serde::Serialize;
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/sync/status", get(status))
+        .route("/sync/now", post(trigger_sync))
+}
+
+/// POST /sync/now — force an immediate sync cycle.
+///
+/// Bumps the trigger counter watched by the sync loop. Returns 202 when the
+/// trigger was sent, 409 when sync isn't enabled in config.json (nothing to
+/// wake).
+async fn trigger_sync(
+    State(state): State<AppState>,
+) -> Result<
+    (axum::http::StatusCode, Json<serde_json::Value>),
+    (axum::http::StatusCode, Json<serde_json::Value>),
+> {
+    let config_path = state.vault_path.join("config.json");
+    let enabled = std::fs::read_to_string(&config_path)
+        .ok()
+        .and_then(|data| serde_json::from_str::<serde_json::Value>(&data).ok())
+        .and_then(|cfg| {
+            cfg.get("sync")
+                .and_then(|s| s.get("enabled"))
+                .and_then(|v| v.as_bool())
+        })
+        .unwrap_or(false);
+    if !enabled {
+        return Err((
+            axum::http::StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": {
+                    "code": "sync_disabled",
+                    "message": "Sync is not enabled in config.json"
+                }
+            })),
+        ));
+    }
+
+    state.sync_trigger.send_modify(|n| *n += 1);
+    Ok((
+        axum::http::StatusCode::ACCEPTED,
+        Json(serde_json::json!({"status": "sync_triggered"})),
+    ))
 }
 
 #[derive(Debug, Serialize)]

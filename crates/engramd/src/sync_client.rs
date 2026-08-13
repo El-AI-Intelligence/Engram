@@ -369,6 +369,7 @@ pub fn spawn_sync_loop(
     vault: Arc<Mutex<axiom_engram::EngramStore>>,
     vault_path: std::path::PathBuf,
     interval: std::time::Duration,
+    mut trigger: tokio::sync::watch::Receiver<u64>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // Delay first sync so the server has time to start.
@@ -666,7 +667,13 @@ pub fn spawn_sync_loop(
                 }
             }
 
-            tokio::time::sleep(interval).await;
+            // Wait for the next cycle: the interval elapses, or /sync/now
+            // bumps the trigger counter for an immediate cycle. A watch
+            // channel (not a Notify) so a trigger fired mid-cycle isn't lost.
+            tokio::select! {
+                _ = trigger.changed() => {}
+                _ = tokio::time::sleep(interval) => {}
+            }
         }
     })
 }

@@ -400,6 +400,37 @@ impl EngramStore {
                 return Self::finish_open(conn).await;
             }
 
+            // 3. Machine-key fallback (NO rekey): vaults created without a
+            // passphrase are machine-keyed. A passphrase on the CLI doesn't
+            // mean the vault was passphrase-keyed — it may be supplied for
+            // sync E2E keys only. Try the machine key (and legacy SipHash,
+            // with its legacy→machine rekey) before declaring a mismatch.
+            let machine_key = derive_vault_key();
+            if let Some(conn) = try_key(&db_path, &machine_key) {
+                tracing::warn!(
+                    "Vault is machine-keyed (created without a passphrase). \
+                     The provided passphrase will be used for sync keys only; \
+                     vault encryption is unchanged."
+                );
+                return Self::finish_open(conn).await;
+            }
+
+            let legacy_key = derive_legacy_key();
+            if let Some(conn) = try_key(&db_path, &legacy_key) {
+                // Legacy key works — migrate to machine key in place
+                conn.execute_batch(&format!("PRAGMA rekey = '{}';", machine_key))
+                    .map_err(|e| {
+                        EngramError::Validation(format!(
+                            "rekey migration from legacy SipHash failed: {e}"
+                        ))
+                    })?;
+                tracing::warn!(
+                    "Vault was legacy-machine-keyed and has been migrated to the machine key. \
+                     The provided passphrase will be used for sync keys only."
+                );
+                return Self::finish_open(conn).await;
+            }
+
             // Wrong passphrase
             return Err(EngramError::Validation(
                 "vault key mismatch: wrong passphrase or corrupt vault.".to_string(),
@@ -2031,6 +2062,35 @@ mod tests {
             EngramSource::Interaction,
             serde_json::json!({}),
         )
+    }
+
+    /// Machine-keyed vaults open successfully with a passphrase via the
+    /// machine-key fallback (the passphrase serves sync keys only) and must
+    /// NOT be rekeyed — reopening without a passphrase must still work.
+    #[tokio::test]
+    async fn test_passphrase_open_falls_back_to_machine_key_without_rekey() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+
+        // Create a machine-keyed vault (the daemon default: no passphrase)
+        {
+            let store = EngramStore::open(&path).await.unwrap();
+            store.write(&make_engram("machine keyed content")).await.unwrap();
+        }
+
+        // Open with a passphrase — must succeed via the fallback
+        {
+            let store = EngramStore::open_with_passphrase(&path, "sync-passphrase").await.unwrap();
+            let list = store.list(10, 0).await.unwrap();
+            assert!(list.iter().any(|e| e.content == "machine keyed content"));
+        }
+
+        // Reopen without a passphrase — no rekey may have happened
+        {
+            let store = EngramStore::open(&path).await.unwrap();
+            let list = store.list(10, 0).await.unwrap();
+            assert!(list.iter().any(|e| e.content == "machine keyed content"));
+        }
     }
 
     #[tokio::test]

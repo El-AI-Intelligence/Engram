@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{broadcast, watch, Mutex};
 
 use axiom_engram::{EngramStore, EngramStoreAdapter, QemCache};
 use axiom_engram::embed::Embedder;
@@ -59,4 +59,8 @@ pub struct AppState {
     /// /config requires a restart to take effect. Default: ["ai-session",
     /// "ai-tool"] (transcript-redundant agent captures).
     pub noise_ignored_sources: Vec<String>,
+    /// Watch channel for manual sync triggers (`POST /sync/now`). Each
+    /// increment wakes the sync loop for an immediate cycle; a counter
+    /// rather than a Notify so a trigger fired mid-cycle isn't lost.
+    pub sync_trigger: Arc<watch::Sender<u64>>,
 }
