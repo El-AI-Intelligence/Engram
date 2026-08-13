@@ -4,13 +4,17 @@
 #
 #   - Syncs the static landing page and vault UI into /srv/engram/
 #   - Installs the Caddy site config (imported from the main Caddyfile)
-#   - Installs and starts the engramd systemd unit
+#   - Installs the engramd systemd unit (ONLY if none exists — an existing
+#     unit is host-specific and is never overwritten)
+#   - Optionally ships target/release/engramd when a release build exists
 #   - Validates and reloads Caddy (if installed)
 #
 # Usage: sudo ./deploy.sh [-y]
 #   -y   skip the confirmation prompt
 #
 # This script only touches this machine — it does not deploy anywhere remote.
+# It does NOT create vault data directories: the vault path is whatever the
+# systemd unit declares (this box uses /root/engram/vault, not /var/lib/engram).
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -47,7 +51,7 @@ elif ! grep -qE '^ENGRAMD_API_KEY=.+' /etc/engram/engramd.env; then
 fi
 
 if [[ $ASSUME_YES -ne 1 ]]; then
-  read -r -p "Deploy Engram (landing, vault UI, Caddyfile, engramd unit) to this host? [y/N] " reply
+  read -r -p "Deploy Engram (landing, vault UI, Caddyfile, engramd unit if absent) to this host? [y/N] " reply
   if [[ ! "$reply" =~ ^[Yy]$ ]]; then
     echo "Aborted."
     exit 0
@@ -71,20 +75,43 @@ echo "    import /etc/caddy/engram.Caddyfile"
 
 # ── engramd systemd unit ─────────────────────────────────────────────────────
 
-install -m 0644 "$REPO_ROOT/deploy/systemd/engramd.service" /etc/systemd/system/engramd.service
-
-# Vault data directory (owned by the service user if it exists).
-install -d -m 0750 /var/lib/engram /var/lib/engram/vault
-if id engram >/dev/null 2>&1; then
-  chown -R engram:engram /var/lib/engram
+if [[ -f /etc/systemd/system/engramd.service ]]; then
+  echo "NOTE: /etc/systemd/system/engramd.service already exists — leaving it"
+  echo "      untouched (host-specific unit; deploy does not overwrite it)."
 else
-  echo "WARNING: 'engram' user does not exist; create it before starting the service:"
-  echo "    useradd --system --home /var/lib/engram --shell /usr/sbin/nologin engram"
+  install -m 0644 "$REPO_ROOT/deploy/systemd/engramd.service" /etc/systemd/system/engramd.service
+  echo "Installed /etc/systemd/system/engramd.service (new host — review its"
+  echo "ExecStart paths before enabling)."
+fi
+
+# Report the vault path the unit actually declares (the box's real location,
+# whatever it is — this script creates no data directories).
+if [[ -f /etc/systemd/system/engramd.service ]]; then
+  vault_line="$(grep -oE '\-\-vault [^ ]+' /etc/systemd/system/engramd.service | head -1 || true)"
+  echo "Detected unit vault path: ${vault_line:-'(not set — unit uses its default)'}"
 fi
 
 systemctl daemon-reload
-systemctl enable --now engramd
-echo "engramd service enabled and started (check: journalctl -u engramd -f)"
+if systemctl list-unit-files engramd.service >/dev/null 2>&1; then
+  systemctl enable --now engramd
+  echo "engramd service enabled and started (check: journalctl -u engramd -f)"
+else
+  echo "NOTE: no engramd unit present; skipping enable/start."
+fi
+
+# ── engramd binary (optional — only when a release build exists) ─────────────
+
+if [[ -f "$REPO_ROOT/target/release/engramd" ]]; then
+  install -m 0755 "$REPO_ROOT/target/release/engramd" /usr/local/bin/engramd
+  echo "Installed target/release/engramd to /usr/local/bin/engramd"
+  if systemctl list-unit-files engramd.service >/dev/null 2>&1; then
+    systemctl restart engramd
+    echo "Restarted engramd with the new binary."
+  fi
+else
+  echo "NOTE: target/release/engramd not found (run: cargo build --release -p engramd)."
+  echo "      Static assets deployed; the running daemon keeps its existing binary."
+fi
 
 # ── Validate & reload Caddy ──────────────────────────────────────────────────
 
