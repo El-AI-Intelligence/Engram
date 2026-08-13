@@ -23,3 +23,7 @@ engram-data/
 node_modules/
 dist/
 sdks/python-engramd/dist/
+
+# Python cache
+__pycache__/
+*.pyc

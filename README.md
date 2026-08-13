@@ -46,6 +46,8 @@ Or from source: `cargo install --path crates/engramd` (also provides the `engram
 | `crates/engramd-mcp/` | MCP server exposing capture/search/link/context tools to AI agents |
 | `ui/engram-vault/` | The vault web UI (vanilla JS SPA, no build step) |
 | `ui/landing/` | Landing page |
+| `sdks/python-engramd/` | Python client + MCP server with passive auto-capture observer |
+| `sdks/js-engramd/` | TypeScript client + MCP server (npm) |
 | `deploy/` | Caddy config, systemd unit, deploy script for the live site |
 | `docs/engram-product/` | API surface, deploy/install guides, sync spec, UI spec, revenue roadmap |
 

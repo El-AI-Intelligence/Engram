@@ -262,11 +262,11 @@ Add [data-theme="light"] to <html> and define:
 
 ### Files to edit
 
-1. /home/e/engram/ui/styles.css — full rewrite, keep the existing :root
+1. ui/engram-vault/styles.css — full rewrite, keep the existing :root
    tokens as a starting point
-2. /home/e/engram/ui/index.html — minor additions only
+2. ui/engram-vault/index.html — minor additions only
 
-Read /home/e/engram/ui/js/main.js for context on what CSS classes each
+Read ui/engram-vault/js/main.js for context on what CSS classes each
 view generates. The JS uses these key selectors you should handle:
   .app, .loading, .error-panel, .mini-bar, .mini-bar-fill,
   .badge-episodic, .badge-semantic, .badge-imagined,

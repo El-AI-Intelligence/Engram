@@ -2,6 +2,8 @@
 // Engram Memory Vault — SPA
 // ==========================================================================
 
+import { MemoryGraph } from './graph.js';
+
 const API = '';  // relative to origin — Caddy reverse-proxies to localhost:8787
 
 // ── Theme toggle ───────────────────────────────────────────────────────────
@@ -51,10 +53,25 @@ const api = {
   memories: {
     search: (q) => post('/memories/search', q),
     get: (id) => get('/memories/' + id),
+    create: (m) => post('/memories', m),
     links: (id) => get('/memories/' + id + '/links'),
     related: (id, limit = 10) => get('/memories/' + id + '/related?limit=' + limit),
     ground: (id) => post('/memories/' + id + '/ground'),
     delete: (id) => fetch(API + '/memories/' + id, { method: 'DELETE' }),
+    annotations: (id) => get('/memories/' + id + '/annotations'),
+    annotate: (id, content) => post('/memories/' + id + '/annotations', { content }),
+  },
+  annotations: {
+    delete: (id) => fetch(API + '/annotations/' + id, { method: 'DELETE' }),
+  },
+  analytics: {
+    activity: (days = 30) => get('/analytics/activity?days=' + days),
+    co2: () => get('/analytics/co2'),
+  },
+  savedSearches: {
+    list: () => get('/searches'),
+    create: (s) => post('/searches', s),
+    delete: (id) => fetch(API + '/searches/' + id, { method: 'DELETE' }),
   },
   context: {
     assemble: (q) => post('/context/assemble', q),
@@ -89,7 +106,6 @@ function navigate(hash) {
 }
 
 let currentCleanup = null;
-let renderGeneration = 0;
 
 async function render() {
   const hash = (window.location.hash || '#/').replace(/^#/, '');
@@ -97,9 +113,6 @@ async function render() {
   const statusbar = document.getElementById('statusbar');
 
   if (currentCleanup) { currentCleanup(); currentCleanup = null; }
-
-  // Increment generation counter to detect stale renders
-  const generation = ++renderGeneration;
 
   // Highlight nav
   document.querySelectorAll('.nav a').forEach(a => {
@@ -116,18 +129,14 @@ async function render() {
         const result = handler(...m.slice(1));
         if (result && typeof result.then === 'function') {
           const cleanup = await result;
-          // Discard results from stale renders (async navigation race)
-          if (generation !== renderGeneration) return;
           if (cleanup && typeof cleanup === 'function') currentCleanup = cleanup;
         }
       } catch (e) {
-        if (generation !== renderGeneration) return;
         app.innerHTML = `<div class="error-panel"><p>Error: ${esc(e.message)}</p></div>`;
       }
       return;
     }
   }
-  if (generation !== renderGeneration) return;
   app.innerHTML = '<div class="error-panel"><h2>404</h2><p>Page not found</p></div>';
 }
 
@@ -151,7 +160,7 @@ function ago(ts) {
 
 function layerIcon(layer) {
   const icons = { episodic: '●', semantic: '◆', imagined: '✦' };
-  return `<span class="layer-icon ${esc(layer)}">${icons[layer] || '●'}</span>`;
+  return `<span class="layer-icon ${layer}">${icons[layer] || '●'}</span>`;
 }
 
 function layerBadge(layer) {
@@ -195,6 +204,173 @@ function toast(msg, kind = 'info') {
   setTimeout(() => { el.remove(); }, 3000);
 }
 
+// ── Live event stream (WebSocket + polling fallback) ─────────────────────
+
+/**
+ * Connect to /ws/events. Falls back to polling /memories/search every 5s
+ * when the socket is down, and keeps trying to reconnect in the background.
+ * onEvent({ type, memory, timestamp }) · onStatus('live'|'polling'|'reconnecting')
+ * Returns { close() } — call from route cleanup.
+ */
+function connectEventStream({ onEvent, onStatus }) {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const url = `${proto}//${location.host}/ws/events`;
+  let ws = null;
+  let stopped = false;
+  let pollTimer = null;
+  let retryTimer = null;
+
+  const status = (s) => { if (onStatus) onStatus(s); };
+
+  async function pollOnce() {
+    try {
+      const r = await api.memories.search({ sort_by: 'recency', limit: 10 });
+      const list = Array.isArray(r) ? r : (r.results || []);
+      // Oldest first so the feed prepends newest last; callers dedupe by id.
+      for (let i = list.length - 1; i >= 0; i--) {
+        onEvent({ type: 'capture', memory: list[i], timestamp: list[i].created_at });
+      }
+    } catch (e) { /* server down — keep polling */ }
+  }
+
+  function startPolling() {
+    if (pollTimer || stopped) return;
+    status('polling');
+    pollTimer = setInterval(pollOnce, 5000);
+    pollOnce();
+  }
+
+  function stopPolling() {
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  }
+
+  function scheduleRetry() {
+    if (retryTimer || stopped) return;
+    retryTimer = setTimeout(() => { retryTimer = null; connect(); }, 8000);
+  }
+
+  function connect() {
+    if (stopped) return;
+    status('reconnecting');
+    try { ws = new WebSocket(url); } catch (e) { startPolling(); scheduleRetry(); return; }
+    ws.onopen = () => { stopPolling(); status('live'); };
+    ws.onmessage = (ev) => {
+      try {
+        const msg = JSON.parse(ev.data);
+        if (msg && msg.memory) onEvent(msg);
+      } catch (e) { /* malformed frame */ }
+    };
+    ws.onclose = () => {
+      if (stopped) return;
+      startPolling();
+      scheduleRetry();
+    };
+    ws.onerror = () => { try { ws.close(); } catch (e) { /* ignore */ } };
+  }
+
+  connect();
+
+  return {
+    close() {
+      stopped = true;
+      stopPolling();
+      if (retryTimer) clearTimeout(retryTimer);
+      if (ws) { ws.onclose = null; try { ws.close(); } catch (e) { /* ignore */ } }
+    },
+  };
+}
+
+// ── Sparkline (tiny SVG trend line, no axes) ─────────────────────────────
+
+function sparkline(values, w = 100, h = 30) {
+  if (!values || !values.length) return '';
+  const max = Math.max(...values, 1e-9);
+  const min = Math.min(...values, 0);
+  const span = (max - min) || 1;
+  const step = w / Math.max(1, values.length - 1);
+  const pts = values.map((v, i) =>
+    `${(i * step).toFixed(1)},${(h - 2 - ((v - min) / span) * (h - 4)).toFixed(1)}`);
+  return `<svg class="sparkline" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" aria-hidden="true">` +
+    `<polyline points="${pts.join(' ')}" fill="none" stroke="var(--semantic)" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/></svg>`;
+}
+
+// ── Activity line chart (captures vs retrievals) ─────────────────────────
+
+function activityChart(days) {
+  if (!days || !days.length) {
+    return '<div class="faint" style="padding:1rem;">No activity data yet.</div>';
+  }
+  const W = 640, H = 220, padL = 36, padR = 10, padT = 12, padB = 26;
+  const iw = W - padL - padR, ih = H - padT - padB;
+  const maxV = Math.max(1, ...days.map(d => Math.max(d.captures || 0, d.retrievals || 0)));
+  const x = (i) => padL + (i / Math.max(1, days.length - 1)) * iw;
+  const y = (v) => padT + ih - (v / maxV) * ih;
+  const line = (key) => days.map((d, i) =>
+    `${i === 0 ? 'M' : 'L'}${x(i).toFixed(1)},${y(d[key] || 0).toFixed(1)}`).join(' ');
+
+  let grid = '';
+  for (let g = 0; g <= 4; g++) {
+    const v = (maxV / 4) * g;
+    const gy = y(v).toFixed(1);
+    grid += `<line class="chart-grid" x1="${padL}" y1="${gy}" x2="${W - padR}" y2="${gy}"/>` +
+      `<text class="chart-text" x="${padL - 6}" y="${+gy + 3}" text-anchor="end">${Math.round(v)}</text>`;
+  }
+  let xlabels = '';
+  const step = Math.ceil(days.length / 6);
+  days.forEach((d, i) => {
+    if (i % step === 0) {
+      xlabels += `<text class="chart-text" x="${x(i).toFixed(1)}" y="${H - 8}" text-anchor="middle">${esc((d.date || '').slice(5))}</text>`;
+    }
+  });
+
+  return `<svg class="activity-chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="Memory activity, last ${days.length} days">
+    ${grid}
+    <line class="chart-axis" x1="${padL}" y1="${padT}" x2="${padL}" y2="${padT + ih}"/>
+    <line class="chart-axis" x1="${padL}" y1="${padT + ih}" x2="${W - padR}" y2="${padT + ih}"/>
+    ${xlabels}
+    <path d="${line('captures')}" fill="none" stroke="var(--episodic)" stroke-width="2" stroke-linejoin="round"/>
+    <path d="${line('retrievals')}" fill="none" stroke="var(--semantic)" stroke-width="2" stroke-linejoin="round"/>
+  </svg>`;
+}
+
+// ── Layer distribution (horizontal stacked bar) ───────────────────────────
+
+function layerDistribution(byLayer) {
+  const e = byLayer?.episodic || 0, s = byLayer?.semantic || 0, i = byLayer?.imagined || 0;
+  const total = (e + s + i) || 1;
+  const pct = (n) => (n / total) * 100;
+  return `
+    <div class="stacked-bar" role="img" aria-label="Layer distribution">
+      <div class="seg episodic" style="width:${pct(e)}%"></div>
+      <div class="seg semantic" style="width:${pct(s)}%"></div>
+      <div class="seg imagined" style="width:${pct(i)}%"></div>
+    </div>
+    <div class="stacked-legend">
+      <span>${layerIcon('episodic')} Episodic <b>${e}</b> · ${pct(e).toFixed(1)}%</span>
+      <span>${layerIcon('semantic')} Semantic <b>${s}</b> · ${pct(s).toFixed(1)}%</span>
+      <span>${layerIcon('imagined')} Imagined <b>${i}</b> · ${pct(i).toFixed(1)}%</span>
+    </div>`;
+}
+
+// ── Shared feed/cards bits ────────────────────────────────────────────────
+
+function notesBadge(m) {
+  const n = m.annotations_count ?? m.annotation_count ??
+    (Array.isArray(m.annotations) ? m.annotations.length : 0);
+  return n > 0 ? `<span class="badge badge-notes" title="${n} note${n > 1 ? 's' : ''}">📝 ${n}</span>` : '';
+}
+
+function liveFeedItem(m) {
+  const content = m.content || '';
+  return `
+    <a href="#/memories/${m.id}" class="feed-item live-item">
+      ${layerIcon(m.layer)}
+      <span class="faint" title="${esc(m.source || '?')}">${sourceIcon(m.source)}</span>
+      <span class="feed-text">${esc(content.slice(0, 120))}${content.length > 120 ? '…' : ''}</span>
+      <span class="faint ml-auto">${ago(m.created_at)}</span>
+    </a>`;
+}
+
 // ── Status bar ────────────────────────────────────────────────────────────
 
 async function updateStatus() {
@@ -219,6 +395,22 @@ function formatBytes(b) {
   return (b / (1024 * 1024)).toFixed(1) + ' MB';
 }
 
+// ── Modal ─────────────────────────────────────────────────────────────────
+
+function showModal(title, bodyHtml) {
+  const root = document.getElementById('modal-root');
+  root.innerHTML = `
+    <div class="modal-overlay" onclick="this.closest('#modal-root').innerHTML=''">
+      <div class="modal" onclick="event.stopPropagation()">
+        <div class="modal-header">
+          <h2>${title}</h2>
+          <button class="modal-close" onclick="this.closest('#modal-root').innerHTML=''">&times;</button>
+        </div>
+        <div class="modal-body">${bodyHtml}</div>
+      </div>
+    </div>`;
+}
+
 // ==========================================================================
 // SCREENS
 // ==========================================================================
@@ -226,161 +418,432 @@ function formatBytes(b) {
 // ── Dashboard ─────────────────────────────────────────────────────────────
 
 route('/', async () => {
-  let stats, health, history, sample;
+  let stats, health, activity, co2, history;
   try { stats = await api.stats(); } catch (e) { stats = null; }
-  try { health = await api.health(); } catch (e) { health = null; }
 
   const app = document.getElementById('app');
 
   if (!stats) {
     app.innerHTML = `<div class="error-panel">
       <h2>Cannot reach engramd</h2>
-      <p>Make sure <code>engramd</code> is running on port 8787.</p>
+      <p>Make sure <code>python3 server.py</code> is running on port 8787.</p>
     </div>`;
     return;
   }
 
-  try { history = await api.consolidate.history(); } catch (e) { history = { runs: [] }; }
-  try { sample = await api.memories.search({ sort_by: 'recency', limit: 200 }); } catch (e) { sample = { results: [] }; }
+  try { health = await api.health(); } catch (e) { health = null; }
+  try { activity = await api.analytics.activity(30); } catch (e) { activity = null; }
+  try { co2 = await api.analytics.co2(); } catch (e) { co2 = null; }
+  try { history = await api.consolidate.history(); } catch (e) { history = []; }
+  const runs = Array.isArray(history) ? history : (history.runs || []);
 
-  const layerPct = (n) => stats.total_memories ? ((n / stats.total_memories) * 100).toFixed(1) : 0;
+  // One recency-sorted sample drives the at-risk count, histogram and initial feed
+  let sample = [];
+  try {
+    const r = await api.memories.search({ sort_by: 'recency', limit: 200 });
+    sample = Array.isArray(r) ? r : (r.results || []);
+  } catch (e) { /* feed stays empty */ }
 
-  // New today: captured since local midnight
-  const midnight = new Date(); midnight.setHours(0, 0, 0, 0);
-  const newToday = (sample.results || []).filter(m => m.created_at && new Date(m.created_at) >= midnight).length;
+  const total = stats.total ?? stats.total_memories ?? 0;
+  const layerPct = (n) => total ? ((n / total) * 100).toFixed(1) : 0;
 
-  // Decayed last night: most recent decay run in history
-  const decayRun = (history.runs || []).filter(r => (r.type || '').includes('decay'))
-    .sort((a, b) => new Date(b.run_at || 0) - new Date(a.run_at || 0))[0];
+  const days = activity?.days || [];
+  const tokensToday = days.length
+    ? (days[days.length - 1].tokens_saved || 0)
+    : (co2?.daily?.length ? co2.daily[co2.daily.length - 1].tokens_saved || 0 : 0);
+  const tokensSpark = days.map(d => d.tokens_saved || 0);
+  const co2TotalG = co2?.co2_grams_total ?? activity?.totals?.co2_grams ?? 0;
+  const co2Spark = days.map(d => d.co2_grams || 0);
 
-  // Strength distribution buckets (strength ranges 0.0–2.0)
-  const buckets = [
-    { label: 'Weak <0.5', cls: 'weak', count: 0 },
-    { label: 'Fading 0.5–1.0', cls: 'fading', count: 0 },
-    { label: 'Strong 1.0–1.5', cls: 'strong', count: 0 },
-    { label: 'Core ≥1.5', cls: 'core', count: 0 },
-  ];
-  for (const m of sample.results || []) {
-    const s = m.strength || 0;
-    buckets[s < 0.5 ? 0 : s < 1.0 ? 1 : s < 1.5 ? 2 : 3].count++;
-  }
-  const bucketMax = Math.max(1, ...buckets.map(b => b.count));
+  const atRisk = sample.filter(m => (m.strength ?? 1) < 0.3).length;
 
-  const qemWarm = (health?.qem_cache_entries || 0) > 0;
-  const uptimeSecs = health?.uptime_secs || 0;
-  const uptime = uptimeSecs >= 86400 ? Math.floor(uptimeSecs / 86400) + 'd'
-    : uptimeSecs >= 3600 ? Math.floor(uptimeSecs / 3600) + 'h'
-    : Math.floor(uptimeSecs / 60) + 'm';
+  // Strength histogram buckets: 0–0.5, 0.5–1.0, 1.0–1.5, 1.5–2.0
+  const bucketLabels = ['0–0.5', '0.5–1.0', '1.0–1.5', '1.5–2.0'];
+  const buckets = [0, 0, 0, 0];
+  for (const m of sample) buckets[Math.max(0, Math.min(3, Math.floor((m.strength ?? 0) / 0.5)))]++;
+  const maxBucket = Math.max(1, ...buckets);
+
+  // Decay forecast: last decay run's decayed count
+  const lastDecay = runs.find(r => r.type === 'decay');
+  const forecast = lastDecay ? (lastDecay.engrams_decayed || 0) : 0;
 
   app.innerHTML = `
     <div class="page dashboard">
       <div class="stat-grid">
         <div class="stat-card">
-          <div class="stat-num">${stats.total_memories?.toLocaleString() || 0}</div>
-          <div class="stat-label">Memories</div>
+          <div class="stat-num">${total.toLocaleString()}</div>
+          <div class="stat-label">Total memories</div>
+          <div class="stat-sub">QEM ${Math.round((health?.qem_hit_rate || 0) * 100)}% · ${formatBytes(health?.db_size_bytes || stats.db_size_bytes || 0)}</div>
         </div>
         <div class="stat-card">
-          <div class="stat-num">${Math.round((health?.qem_hit_rate || 0) * 100)}%</div>
-          <div class="stat-label">Cache hit rate (QEM)</div>
+          <div class="stat-num">${tokensToday.toLocaleString()}</div>
+          <div class="stat-label">Tokens saved today</div>
+          ${sparkline(tokensSpark)}
         </div>
         <div class="stat-card">
-          <div class="stat-num">${newToday}</div>
-          <div class="stat-label">New today</div>
+          <div class="stat-num">${(co2TotalG / 1000).toFixed(1)}<span class="stat-unit">kg</span></div>
+          <div class="stat-label">CO₂ avoided (cumulative)</div>
+          ${sparkline(co2Spark)}
         </div>
         <div class="stat-card">
-          <div class="stat-num">${decayRun ? (decayRun.engrams_decayed || 0) : '—'}</div>
-          <div class="stat-label">Decayed last night</div>
+          <div class="stat-num">${atRisk}</div>
+          <div class="stat-label">At risk of decay</div>
+          <div class="stat-sub">strength &lt; 0.3</div>
+        </div>
+      </div>
+
+      <div class="dashboard-grid">
+        <div class="panel live-panel">
+          <div class="panel-header">Live Feed <span id="live-status" class="live-status reconnecting">○ connecting…</span></div>
+          <div class="quick-capture">
+            <textarea id="qc-input" rows="2" placeholder="Quick capture — what's happening?"></textarea>
+            <button id="qc-btn" class="btn btn-primary">Capture</button>
+          </div>
+          <div id="live-feed" class="live-feed"></div>
+        </div>
+
+        <div class="dashboard-side">
+          <div class="panel">
+            <div class="panel-header">Layer Breakdown</div>
+            <div class="layer-breakdown">
+              <div class="layer-row">
+                <span>${layerIcon('episodic')} Episodic</span>
+                <span class="faint">${stats.by_layer?.episodic || 0} · ${layerPct(stats.by_layer?.episodic || 0)}%</span>
+              </div>
+              <div class="layer-bar"><div class="layer-bar-fill episodic" style="width:${layerPct(stats.by_layer?.episodic || 0)}%"></div></div>
+              <div class="layer-row">
+                <span>${layerIcon('semantic')} Semantic</span>
+                <span class="faint">${stats.by_layer?.semantic || 0} · ${layerPct(stats.by_layer?.semantic || 0)}%</span>
+              </div>
+              <div class="layer-bar"><div class="layer-bar-fill semantic" style="width:${layerPct(stats.by_layer?.semantic || 0)}%"></div></div>
+              <div class="layer-row">
+                <span>${layerIcon('imagined')} Imagined</span>
+                <span class="faint">${stats.by_layer?.imagined || 0} · ${layerPct(stats.by_layer?.imagined || 0)}%</span>
+              </div>
+              <div class="layer-bar"><div class="layer-bar-fill imagined" style="width:${layerPct(stats.by_layer?.imagined || 0)}%"></div></div>
+
+              <div class="histogram">
+                <div class="hist-title faint">Strength distribution</div>
+                ${buckets.map((c, bi) => `
+                  <div class="hist-row">
+                    <span class="hist-label">${bucketLabels[bi]}</span>
+                    <div class="hist-bar"><div class="hist-fill h${bi}" style="width:${(c / maxBucket) * 100}%"></div></div>
+                    <span class="hist-count">${c}</span>
+                  </div>
+                `).join('')}
+              </div>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-header">Decay Forecast</div>
+            <div class="decay-forecast">
+              <span class="decay-icon">↓</span>
+              <div>
+                <div class="stat-num">${forecast}</div>
+                <div class="stat-label">memories will fall below the retrieval threshold this week</div>
+                <div class="stat-sub">${lastDecay ? 'based on the last decay run · ' + ago(lastDecay.run_at) : 'no decay runs recorded yet'}</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+
+  // ── Live feed wiring ────────────────────────────────────────────────────
+  const feedEl = document.getElementById('live-feed');
+  const seen = new Set();
+  const MAX_FEED = 30;
+
+  function addToFeed(m, animate) {
+    if (!m || !m.id || seen.has(m.id)) return;
+    seen.add(m.id);
+    feedEl.querySelector(':scope > .faint')?.remove(); // drop placeholder
+    const tmp = document.createElement('div');
+    tmp.innerHTML = liveFeedItem(m);
+    const el = tmp.firstElementChild;
+    if (animate) el.classList.add('slide-in');
+    feedEl.prepend(el);
+    while (feedEl.children.length > MAX_FEED) feedEl.lastElementChild.remove();
+  }
+
+  if (sample.length) {
+    for (let i = Math.min(sample.length, 10) - 1; i >= 0; i--) addToFeed(sample[i], false);
+  } else {
+    feedEl.innerHTML = '<div class="faint" style="padding:1rem;">No memories captured yet.</div>';
+  }
+
+  const statusEl = document.getElementById('live-status');
+  function setLiveStatus(s) {
+    statusEl.className = 'live-status ' + s;
+    statusEl.textContent = s === 'live' ? '● live'
+      : s === 'polling' ? '◐ polling · reconnecting…'
+      : '○ reconnecting…';
+  }
+
+  const stream = connectEventStream({
+    onEvent: (ev) => { if (ev.type === 'capture' && ev.memory) addToFeed(ev.memory, true); },
+    onStatus: setLiveStatus,
+  });
+
+  // ── Quick capture ───────────────────────────────────────────────────────
+  document.getElementById('qc-btn').onclick = async () => {
+    const ta = document.getElementById('qc-input');
+    const content = ta.value.trim();
+    if (!content) return;
+    try {
+      await api.memories.create({ content, layer: 'episodic', source: 'interaction' });
+      ta.value = '';
+      toast('Captured', 'ok');
+      // Pull the fresh memory into the feed (WS will dedupe by id)
+      const r = await api.memories.search({ sort_by: 'recency', limit: 3 });
+      const list = Array.isArray(r) ? r : (r.results || []);
+      for (let i = list.length - 1; i >= 0; i--) addToFeed(list[i], true);
+    } catch (e) {
+      toast('Capture failed: ' + e.message, 'error');
+    }
+  };
+  document.getElementById('qc-input').onkeydown = (e) => {
+    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) document.getElementById('qc-btn').click();
+  };
+
+  updateStatus();
+  return () => stream.close();
+});
+
+// ── Stats ─────────────────────────────────────────────────────────────────
+
+route('/stats', async () => {
+  const app = document.getElementById('app');
+  let co2, activity, stats;
+  try { co2 = await api.analytics.co2(); } catch (e) { co2 = null; }
+  try { activity = await api.analytics.activity(30); } catch (e) { activity = null; }
+  try { stats = await api.stats(); } catch (e) { stats = null; }
+
+  const days = activity?.days || [];
+  const totals = activity?.totals || {};
+  const co2G = co2?.co2_grams_total ?? totals.co2_grams ?? 0;
+  const tokensTotal = co2?.tokens_saved_total ?? totals.tokens_saved ?? 0;
+  const co2Kg = co2G / 1000;
+  const miles = co2G / 404; // 404 g CO₂ per driving mile
+  const co2Spark = days.map(d => d.co2_grams || 0);
+
+  // Token savings: 30-day average from the activity window, projected to a year
+  const windowTokens = totals.tokens_saved ?? (co2?.daily || []).reduce((s, d) => s + (d.tokens_saved || 0), 0);
+  const dailyAvg = days.length ? windowTokens / days.length : 0;
+  const projectedAnnual = dailyAvg * 365;
+
+  // Dedup impact: duplicates prevented × avg tokens saved per capture
+  const deduped = co2?.deduped_saves || 0;
+  const captures = totals.captures || 0;
+  const perCapture = captures ? (totals.tokens_saved || 0) / captures : 0;
+  const dedupTokens = Math.round(deduped * perCapture);
+
+  app.innerHTML = `
+    <div class="page stats-page">
+      <h2>Vault Impact</h2>
+
+      <div class="panel co2-hero" style="margin-bottom:1rem;">
+        <div class="panel-header">CO₂ Avoided</div>
+        <div class="co2-hero-body">
+          <div>
+            <div class="stat-num big">${co2Kg.toFixed(1)}<span class="stat-unit">kg</span></div>
+            <div class="stat-label">cumulative CO₂ saved by token compression</div>
+            <div class="stat-sub">Equivalent to driving ${miles.toFixed(1)} miles (404 g/mile)</div>
+          </div>
+          ${sparkline(co2Spark, 180, 48)}
+        </div>
+      </div>
+
+      <div class="stat-grid" style="grid-template-columns:repeat(3,1fr);margin-bottom:1rem;">
+        <div class="stat-card">
+          <div class="stat-num">${tokensTotal.toLocaleString()}</div>
+          <div class="stat-label">Tokens saved (cumulative)</div>
         </div>
         <div class="stat-card">
-          <div class="stat-num">${stats.by_layer?.semantic || 0}</div>
-          <div class="stat-label">Semantic memories</div>
+          <div class="stat-num">${Math.round(dailyAvg).toLocaleString()}</div>
+          <div class="stat-label">Daily average (30d)</div>
         </div>
         <div class="stat-card">
-          <div class="stat-num">${stats.by_layer?.imagined || 0}</div>
-          <div class="stat-label">Imagined (quarantined)</div>
+          <div class="stat-num">${Math.round(projectedAnnual).toLocaleString()}</div>
+          <div class="stat-label">Projected annual savings</div>
+        </div>
+      </div>
+
+      <div class="panel" style="margin-bottom:1rem;">
+        <div class="panel-header">Memory Activity — Last 30 Days</div>
+        <div class="chart-wrap">
+          ${activityChart(days)}
+          <div class="chart-legend">
+            <span><span class="lg-dot" style="background:var(--episodic)"></span> Captures</span>
+            <span><span class="lg-dot" style="background:var(--semantic)"></span> Retrievals</span>
+          </div>
         </div>
       </div>
 
       <div class="panel-grid">
         <div class="panel">
-          <div class="panel-header">Layer Breakdown</div>
-          <div class="layer-breakdown">
-            <div class="layer-row">
-              <span>${layerIcon('episodic')} Episodic</span>
-              <span class="faint">${stats.by_layer?.episodic || 0} · ${layerPct(stats.by_layer?.episodic || 0)}%</span>
-            </div>
-            <div class="layer-bar"><div class="layer-bar-fill episodic" style="width:${layerPct(stats.by_layer?.episodic || 0)}%"></div></div>
-            <div class="layer-row">
-              <span>${layerIcon('semantic')} Semantic</span>
-              <span class="faint">${stats.by_layer?.semantic || 0} · ${layerPct(stats.by_layer?.semantic || 0)}%</span>
-            </div>
-            <div class="layer-bar"><div class="layer-bar-fill semantic" style="width:${layerPct(stats.by_layer?.semantic || 0)}%"></div></div>
-            <div class="layer-row">
-              <span>${layerIcon('imagined')} Imagined</span>
-              <span class="faint">${stats.by_layer?.imagined || 0} · ${layerPct(stats.by_layer?.imagined || 0)}%</span>
-            </div>
-            <div class="layer-bar"><div class="layer-bar-fill imagined" style="width:${layerPct(stats.by_layer?.imagined || 0)}%"></div></div>
-          </div>
+          <div class="panel-header">Layer Distribution</div>
+          <div class="chart-wrap">${layerDistribution(stats?.by_layer)}</div>
         </div>
-
         <div class="panel">
-          <div class="panel-header">Vault Health</div>
-          <div class="health-list">
-            <div class="health-row"><span class="ok">●</span> Vault encrypted</div>
-            <div class="health-row"><span>${formatBytes(health?.db_size_bytes || 0)}</span> / no limit</div>
-            <div class="health-row">QEM cache: <span class="${qemWarm ? 'ok' : 'faint'}">${qemWarm ? `warm (${health.qem_cache_entries} entries)` : 'cold'}</span></div>
-            <div class="health-row">Uptime: <span>${uptime}</span></div>
-            <div class="health-row">Last decay: <span>${stats.last_decay ? ago(stats.last_decay) : 'never'}</span></div>
-            <div class="health-row">Last consolidation: <span>${stats.last_consolidation ? ago(stats.last_consolidation) : 'never'}</span></div>
-            <div class="health-row"><span>${stats.total_links || 0}</span> links</div>
-            <div class="health-row"><span>${stats.total_embeddings || 0}</span> embeddings</div>
-            <div class="health-row faint">Avg strength: ${(stats.avg_strength || 0).toFixed(2)}</div>
-            <div class="health-row faint">Avg valence: ${(stats.avg_valence || 0).toFixed(2)}</div>
+          <div class="panel-header">Deduplication Impact</div>
+          <div class="dedup-body">
+            <div class="stat-num">${deduped.toLocaleString()}</div>
+            <div class="stat-label">duplicates prevented</div>
+            <div class="stat-sub">≈ ${dedupTokens.toLocaleString()} tokens saved by dedup alone</div>
           </div>
         </div>
-      </div>
-
-      <div class="panel" style="margin-top:1rem;">
-        <div class="panel-header">Strength Distribution</div>
-        <div class="strength-dist">
-          ${buckets.map(b => `
-            <div class="sd-row">
-              <span class="sd-label faint">${b.label}</span>
-              <div class="layer-bar sd-bar"><div class="layer-bar-fill sd-${b.cls}" style="width:${(b.count / bucketMax) * 100}%"></div></div>
-              <span class="sd-count mono">${b.count}</span>
-            </div>
-          `).join('')}
-        </div>
-        <div class="faint" style="padding:0 1rem 0.75rem;font-size:var(--text-xs);">Based on the ${(sample.results || []).length} most recent memories.</div>
-      </div>
-
-      <div class="panel" style="margin-top:1rem;">
-        <div class="panel-header">Recent Captures</div>
-        <div id="recent-feed">Loading…</div>
       </div>
     </div>
   `;
 
-  // Load recent captures
-  try {
-    const feed = document.getElementById('recent-feed');
-    const recent = (sample.results || []).slice(0, 5);
-    if (recent.length) {
-      feed.innerHTML = recent.map(m => `
-        <a href="#/memories/${encodeURIComponent(m.id)}" class="feed-item">
-          ${layerIcon(m.layer)} <span class="faint">[${esc(m.source || '?')}]</span>
-          ${esc((m.content || '').slice(0, 120))}${(m.content || '').length > 120 ? '…' : ''}
+  updateStatus();
+});
+
+// ── Tracker (live capture stream) ─────────────────────────────────────────
+
+route('/tracker', async () => {
+  const app = document.getElementById('app');
+  const SOURCES = ['observation', 'interaction', 'agent', 'chat', 'window', 'system', 'consolidation', 'research', 'mic', 'sensor', 'imagined'];
+
+  app.innerHTML = `
+    <div class="page tracker-page">
+      <div class="filter-row">
+        <select id="tr-source" class="filter-select">
+          <option value="">All sources</option>
+          ${SOURCES.map(s => `<option value="${s}">${s}</option>`).join('')}
+        </select>
+        <select id="tr-layer" class="filter-select">
+          <option value="">All layers</option>
+          <option value="episodic">Episodic</option>
+          <option value="semantic">Semantic</option>
+          <option value="imagined">Imagined</option>
+        </select>
+        <button id="tr-pause" class="btn btn-sm">⏸ Pause</button>
+        <span id="tr-status" class="live-status reconnecting">○ connecting…</span>
+        <span class="faint ml-auto" id="tr-count"></span>
+      </div>
+      <div id="tracker-feed" class="tracker-feed"></div>
+    </div>
+  `;
+
+  const feedEl = document.getElementById('tracker-feed');
+  const pauseBtn = document.getElementById('tr-pause');
+  const countEl = document.getElementById('tr-count');
+  const seen = new Set();
+  const buffer = [];
+  let paused = false;
+  const MAX_ITEMS = 100;
+
+  function trackerItem(m) {
+    const content = m.content || '';
+    return `
+      <div class="tracker-item" data-id="${esc(m.id)}" data-source="${esc(m.source || '')}" data-layer="${esc(m.layer || '')}">
+        <div class="ti-head">
+          ${layerIcon(m.layer)}
+          <span class="ti-source">${sourceIcon(m.source)} ${esc(m.source || '?')}</span>
+          ${tagList((m.tags || []).slice(0, 4))}
+          ${notesBadge(m)}
           <span class="faint ml-auto">${ago(m.created_at)}</span>
-        </a>
-      `).join('');
-    } else {
-      feed.innerHTML = '<div class="faint" style="padding:1rem;">No memories captured yet.</div>';
-    }
-  } catch (e) {
-    document.getElementById('recent-feed').innerHTML = '<div class="faint">Unable to load recent captures.</div>';
+        </div>
+        <div class="ti-preview">${esc(content.slice(0, 140))}${content.length > 140 ? '…' : ''}</div>
+        <div class="ti-full">
+          <div class="ti-full-content">${esc(content)}</div>
+          <a href="#/memories/${m.id}" class="ti-open">Open detail →</a>
+        </div>
+      </div>`;
   }
 
+  function applyFilters() {
+    const fs = document.getElementById('tr-source').value;
+    const fl = document.getElementById('tr-layer').value;
+    let visible = 0;
+    feedEl.querySelectorAll('.tracker-item').forEach(el => {
+      const ok = (!fs || el.dataset.source === fs) && (!fl || el.dataset.layer === fl);
+      el.classList.toggle('hidden', !ok);
+      if (ok) visible++;
+    });
+    countEl.textContent = `${visible} shown · ${seen.size} total`;
+  }
+
+  function addItem(m, animate) {
+    if (!m || !m.id || seen.has(m.id)) return false;
+    seen.add(m.id);
+    feedEl.querySelector(':scope > .faint')?.remove(); // drop placeholder
+    const tmp = document.createElement('div');
+    tmp.innerHTML = trackerItem(m);
+    const el = tmp.firstElementChild;
+    if (animate) el.classList.add('slide-in');
+    feedEl.prepend(el);
+    while (feedEl.children.length > MAX_ITEMS) {
+      const last = feedEl.lastElementChild;
+      seen.delete(last.dataset.id);
+      last.remove();
+    }
+    return true;
+  }
+
+  function onEvent(ev) {
+    if (ev.type !== 'capture' || !ev.memory) return;
+    if (paused) {
+      if (!seen.has(ev.memory.id) && !buffer.some(b => b.id === ev.memory.id)) buffer.push(ev.memory);
+      pauseBtn.innerHTML = `▶ Resume <span class="pause-badge">${buffer.length} new</span>`;
+      return;
+    }
+    if (addItem(ev.memory, true)) applyFilters();
+  }
+
+  // Pause / resume
+  pauseBtn.onclick = () => {
+    paused = !paused;
+    if (paused) {
+      pauseBtn.classList.add('paused');
+      pauseBtn.textContent = '▶ Resume';
+    } else {
+      pauseBtn.classList.remove('paused');
+      pauseBtn.textContent = '⏸ Pause';
+      // Flush buffered items, oldest first so newest lands on top
+      for (const m of buffer) addItem(m, true);
+      buffer.length = 0;
+      applyFilters();
+    }
+  };
+
+  document.getElementById('tr-source').onchange = applyFilters;
+  document.getElementById('tr-layer').onchange = applyFilters;
+
+  // Click to expand / collapse
+  feedEl.addEventListener('click', (e) => {
+    if (e.target.closest('a')) return;
+    const item = e.target.closest('.tracker-item');
+    if (item) item.classList.toggle('expanded');
+  });
+
+  const statusEl = document.getElementById('tr-status');
+  function setStatus(s) {
+    statusEl.className = 'live-status ' + s;
+    statusEl.textContent = s === 'live' ? '● live'
+      : s === 'polling' ? '◐ polling · reconnecting…'
+      : '○ reconnecting…';
+  }
+
+  // Initial fill
+  try {
+    const r = await api.memories.search({ sort_by: 'recency', limit: 30 });
+    const list = Array.isArray(r) ? r : (r.results || []);
+    for (let i = list.length - 1; i >= 0; i--) addItem(list[i], false);
+  } catch (e) { /* stream will fill in */ }
+  if (!feedEl.children.length) {
+    feedEl.innerHTML = '<div class="faint" style="padding:1rem;">Waiting for captures…</div>';
+  }
+  applyFilters();
+
+  const stream = connectEventStream({ onEvent, onStatus: setStatus });
+
   updateStatus();
+  return () => stream.close();
 });
 
 // ── Explorer ──────────────────────────────────────────────────────────────
@@ -418,24 +881,26 @@ route('/memories', async () => {
     const sort = document.getElementById('filter-sort').value;
     const results = document.getElementById('explorer-results');
     results.innerHTML = '<div class="loading-sm">Searching…</div>';
-    api.memories.search({ query: q, layer: layer || null, sort_by: sort, limit: 20 }).then(r => {
-      document.getElementById('result-count').textContent = `${r.total || 0} results (${resultLabel(r.search_type)}, ${r.took_ms}ms)`;
-      if (!r.results || !r.results.length) {
+    api.memories.search({ query: q, layer: layer || null, limit: 20 }).then(r => {
+      const list = Array.isArray(r) ? r : (r.results || []);
+      document.getElementById('result-count').textContent = `${list.length} results`;
+      if (!list.length) {
         results.innerHTML = '<div class="faint" style="padding:1rem;">No results.</div>';
         return;
       }
-      results.innerHTML = r.results.map(m => `
-        <a href="#/memories/${encodeURIComponent(m.id)}" class="memory-card">
+      results.innerHTML = list.map(m => `
+        <a href="#/memories/${m.id}" class="memory-card">
           <div class="card-top">
             ${layerIcon(m.layer)}
-            <span class="card-source">${sourceIcon(m.source)} ${esc(m.source || '?')}</span>
+            <span class="card-source">${sourceIcon(m.source)} ${m.source || '?'}</span>
             ${strengthBar(m.strength || 0)}
             <span class="faint ml-auto">${ago(m.created_at)}</span>
           </div>
           <div class="card-content">${esc((m.content || '').slice(0, 200))}${(m.content || '').length > 200 ? '…' : ''}</div>
           <div class="card-footer">
             ${tagList(m.tags)}
-            ${m.links_out && m.links_out.length ? `<span class="faint">→ ${m.links_out.length} links</span>` : ''}
+            ${m.links && m.links.length ? `<span class="faint">→ ${m.links.length} links</span>` : ''}
+            ${notesBadge(m)}
             ${m.imagined && !m.grounded ? '<span class="badge badge-quarantined">⚠ quarantined</span>' : ''}
           </div>
         </a>
@@ -465,12 +930,13 @@ route('/memories/:id', async (id) => {
     let linksHtml = '';
     try {
       const l = await api.memories.links(id);
-      if (l.outgoing && l.outgoing.length) {
+      const linkList = Array.isArray(l) ? l : (l.outgoing || l.incoming || []);
+      if (linkList.length) {
         linksHtml = `
           <div class="panel" style="margin-top:1rem;">
-            <div class="panel-header">Links (${l.outgoing.length} outgoing)</div>
-            ${l.outgoing.map(ln => `
-              <a href="#/memories/${encodeURIComponent(ln.target_id)}" class="feed-item">
+            <div class="panel-header">Links (${linkList.length} outgoing)</div>
+            ${linkList.map(ln => `
+              <a href="#/memories/${ln.target_id}" class="feed-item">
                 ${ln.link_type === 'causal' ? '▶' : ln.link_type === 'associative' ? '··' : ln.link_type === 'analogical' ? '--' : '··>'}
                 <span class="faint">${ln.link_type}</span>
                 <span>${esc(ln.target_id)}</span>
@@ -486,9 +952,9 @@ route('/memories/:id', async (id) => {
         <a href="#/memories" class="back-link">← Back to Explorer</a>
         <div class="detail-card">
           <div class="detail-header">
-            ${layerIcon(m.layer)} <span class="detail-layer">${esc(m.layer?.toUpperCase() || '')} MEMORY</span>
+            ${layerIcon(m.layer)} <span class="detail-layer">${m.layer?.toUpperCase()} MEMORY</span>
             ${strengthBar(m.strength || 0)}
-            <span class="faint ml-auto">${esc(m.id)}</span>
+            <span class="faint ml-auto">${m.id}</span>
           </div>
           <div class="detail-content">${esc(m.content || '')}</div>
           <div class="detail-meta">
@@ -496,9 +962,22 @@ route('/memories/:id', async (id) => {
             <div class="meta-row"><span class="faint">Created</span> ${m.created_at ? new Date(m.created_at).toLocaleString() : '?'} · ${ago(m.created_at)}</div>
             <div class="meta-row"><span class="faint">Last retrieved</span> ${m.last_retrieved ? ago(m.last_retrieved) : 'never'}</div>
             <div class="meta-row"><span class="faint">Retrievals</span> ${m.retrieval_count || 0}</div>
-            <div class="meta-row"><span class="faint">Source</span> ${sourceIcon(m.source)} ${esc(m.source || '?')}</div>
-            <div class="meta-row"><span class="faint">Project</span> ${esc(m.project || '—')}</div>
+            <div class="meta-row"><span class="faint">Source</span> ${sourceIcon(m.source)} ${m.source || '?'}</div>
+            <div class="meta-row"><span class="faint">Project</span> ${m.project || '—'}</div>
             <div class="meta-row">${tagList(m.tags)}</div>
+          </div>
+        </div>
+        <div class="panel notes-panel" style="margin-top:1rem;">
+          <div class="panel-header notes-header" id="notes-toggle">
+            <span>Notes (<span id="notes-count">…</span>)</span>
+            <span class="chev" id="notes-chev">▾</span>
+          </div>
+          <div id="notes-body" class="notes-body">
+            <div id="notes-list" class="notes-list"><div class="loading-sm">Loading notes…</div></div>
+            <div class="note-form">
+              <textarea id="note-input" rows="2" placeholder="Add a note…"></textarea>
+              <button id="note-save" class="btn btn-primary btn-sm">Save note</button>
+            </div>
           </div>
         </div>
         ${linksHtml}
@@ -511,23 +990,74 @@ route('/memories/:id', async (id) => {
 
     if (m.imagined && !m.grounded) {
       document.getElementById('btn-ground').onclick = async () => {
-        try {
-          await api.memories.ground(id);
-          toast('Memory grounded', 'ok');
-          render();
-        } catch (e) { toast(e.message || 'Ground failed', 'error'); }
+        await api.memories.ground(id);
+        toast('Memory grounded', 'ok');
+        render();
       };
     }
     document.getElementById('btn-delete').onclick = async () => {
       if (confirm('Delete this memory permanently?')) {
-        try {
-          const r = await api.memories.delete(id);
-          if (!r.ok) { const err = await r.json().catch(() => ({})); toast(err.error || 'Delete failed', 'error'); return; }
-          toast('Deleted', 'warn');
-          navigate('#/memories');
-        } catch (e) { toast(e.message || 'Delete failed', 'error'); }
+        await api.memories.delete(id);
+        toast('Deleted', 'warn');
+        navigate('#/memories');
       }
     };
+
+    // ── Notes (annotations) ───────────────────────────────────────────────
+    const notesBody = document.getElementById('notes-body');
+    document.getElementById('notes-toggle').onclick = () => {
+      const collapsed = notesBody.classList.toggle('collapsed');
+      document.getElementById('notes-chev').textContent = collapsed ? '▸' : '▾';
+    };
+
+    async function loadNotes() {
+      const listEl = document.getElementById('notes-list');
+      const countEl = document.getElementById('notes-count');
+      try {
+        const r = await api.memories.annotations(id);
+        const notes = Array.isArray(r) ? r : (r.annotations || r.results || []);
+        countEl.textContent = notes.length;
+        if (!notes.length) {
+          listEl.innerHTML = '<div class="faint" style="padding:0.5rem 0;">No notes yet.</div>';
+          return;
+        }
+        listEl.innerHTML = notes.map(n => `
+          <div class="note-item" data-id="${esc(n.id)}">
+            <div class="note-content">${esc(n.content || '')}</div>
+            <div class="note-meta">
+              <span class="faint">${ago(n.created_at)}</span>
+              <button class="note-del" data-id="${esc(n.id)}" title="Delete note">×</button>
+            </div>
+          </div>`).join('');
+      } catch (e) {
+        countEl.textContent = '0';
+        listEl.innerHTML = '<div class="faint" style="padding:0.5rem 0;">Notes unavailable.</div>';
+      }
+    }
+
+    document.getElementById('note-save').onclick = async () => {
+      const ta = document.getElementById('note-input');
+      const content = ta.value.trim();
+      if (!content) return;
+      try {
+        await api.memories.annotate(id, content);
+        ta.value = '';
+        toast('Note saved', 'ok');
+        loadNotes();
+      } catch (e) {
+        toast('Save failed: ' + e.message, 'error');
+      }
+    };
+
+    document.getElementById('notes-list').addEventListener('click', async (e) => {
+      const btn = e.target.closest('.note-del');
+      if (!btn) return;
+      await api.annotations.delete(btn.dataset.id);
+      toast('Note deleted', 'warn');
+      loadNotes();
+    });
+
+    loadNotes();
   } catch (e) {
     app.innerHTML = `<div class="error-panel"><h2>Not found</h2><p>Memory ${esc(id)} not found.</p><a href="#/memories">← Back</a></div>`;
   }
@@ -542,177 +1072,175 @@ route('/graph', async () => {
     <div class="page graph-page">
       <div class="graph-filters">
         <select id="gf-layer" class="filter-select"><option value="">All layers</option><option value="episodic">Episodic</option><option value="semantic">Semantic</option><option value="imagined">Imagined</option></select>
-        <input type="text" id="gf-search" class="search-input" placeholder="Focus on a memory ID…" style="width:260px;">
+        <input type="text" id="gf-search" class="search-input" placeholder="Focus on a memory ID…" style="width:220px;">
         <button class="btn btn-sm" id="gf-search-btn">Focus</button>
-        <button class="btn btn-sm" id="gf-reset">Reset</button>
+        <button class="btn btn-sm" id="gf-reset">Reset view</button>
+        <div class="pill-row graph-pills">
+          <button class="pill active pill-episodic" data-layer="episodic">Episodic</button>
+          <button class="pill active pill-semantic" data-layer="semantic">Semantic</button>
+          <button class="pill active pill-imagined" data-layer="imagined">Imagined</button>
+        </div>
       </div>
-      <div id="graph-canvas" class="graph-canvas">
-        <div class="faint" style="padding:3rem;text-align:center;">Loading graph data…</div>
+      <div id="graph-canvas" class="graph-canvas"></div>
+      <div id="graph-scrubber" class="graph-scrubber hidden">
+        <span class="scrub-date" id="scrub-min-label"></span>
+        <input type="range" id="scrub-min" min="0" max="1000" value="0">
+        <input type="range" id="scrub-max" min="0" max="1000" value="1000">
+        <span class="scrub-date" id="scrub-max-label"></span>
       </div>
-      <div id="graph-legend" class="graph-legend">
-        <span>${layerIcon('episodic')} Episodic</span>
-        <span>${layerIcon('semantic')} Semantic</span>
-        <span>${layerIcon('imagined')} Imagined</span>
-        <span class="faint">|</span>
-        <span style="border-bottom:2px dotted var(--text-faint);">Assoc</span>
-        <span style="border-bottom:2px solid var(--accent);">Causal</span>
-        <span style="border-bottom:2px dashed var(--text-faint);">Analog</span>
-        <span style="border-bottom:2px dotted var(--episodic);">Temp</span>
+      <div class="graph-legend">
+        <span class="lg-item"><span class="lg-dot" style="background:#f0a040"></span> Episodic</span>
+        <span class="lg-item"><span class="lg-dot" style="background:#48c0e0"></span> Semantic</span>
+        <span class="lg-item"><span class="lg-dot" style="background:#b080e0"></span> Imagined</span>
+        <span class="lg-sep">·</span>
+        <span class="lg-item"><span class="lg-edge assoc"></span> Assoc</span>
+        <span class="lg-item"><span class="lg-edge causal"></span> Causal</span>
+        <span class="lg-item"><span class="lg-edge analog"></span> Analog</span>
+        <span class="lg-item"><span class="lg-edge temp"></span> Temp</span>
+        <span class="lg-sep">·</span>
+        <span class="lg-hint">🖱 drag · scroll zoom · click expand · dblclick reset</span>
       </div>
     </div>
   `;
 
-  async function loadGraph(filterLayer, focusId) {
-    const canvas = document.getElementById('graph-canvas');
-    try {
-      // NB: never send an empty query string — the server rejects it (content_empty)
-      const r = await api.memories.search({
-        layer: filterLayer || null,
-        sort_by: 'strength',
-        limit: 50,
-        min_strength: 0.2
-      });
-      if (!r.results || !r.results.length) {
-        canvas.innerHTML = '<div class="faint" style="padding:3rem;text-align:center;">No memories to graph.</div>';
-        return;
-      }
+  const container = document.getElementById('graph-canvas');
+  const graph = new MemoryGraph(container);
 
-      const nodes = r.results.map(m => ({
+  // Listen for node expansion requests from the graph engine
+  container.addEventListener('mg-node-expand', async (e) => {
+    const { id } = e.detail;
+    try {
+      let relatedResp = await api.memories.related(id);
+      // Handle both array and {results:[...]} response formats
+      const list = Array.isArray(relatedResp) ? relatedResp : (relatedResp.results || []);
+      const newNodes = list.map(m => ({
         id: m.id,
         label: (m.content || m.id).slice(0, 60),
         layer: m.layer,
         strength: m.strength || 0.5,
         valence: m.valence || 0,
+        tags: m.tags || [],
+        created: m.created_at,
       }));
+      const newEdges = [];
+      for (const n of newNodes) {
+        try {
+          const l = await api.memories.links(n.id);
+          const outgoing = Array.isArray(l) ? l : (l.outgoing || []);
+          for (const ln of outgoing) {
+            if (ln.target_id === id || newNodes.find(x => x.id === ln.target_id)) {
+              newEdges.push({ source: n.id, target: ln.target_id, type: ln.link_type, weight: ln.weight });
+            }
+          }
+        } catch (_) { /* skip */ }
+      }
+      graph.expand(id, newNodes, newEdges);
+    } catch (err) {
+      toast('Expand failed: ' + esc(err.message), 'error');
+    }
+  });
 
-      // Fetch links for first 10 nodes (avoid N+1 storm)
+  async function loadGraph(filterLayer, focusId) {
+    try {
+      const r = await api.memories.search({
+        query: '',
+        layer: filterLayer || null,
+        limit: 50,
+      });
+      const searchResults = Array.isArray(r) ? r : (r.results || []);
+      if (!searchResults.length) {
+        container.innerHTML = '<div class="faint" style="padding:3rem;text-align:center;">No memories to graph.</div>';
+        return;
+      }
+      const nodes = searchResults.map(m => ({
+        id: m.id,
+        label: (m.content || m.id).slice(0, 60),
+        layer: m.layer,
+        strength: m.strength || 0.5,
+        valence: m.valence || 0,
+        tags: m.tags || [],
+        created: m.created_at,
+      }));
       const edges = [];
       for (const n of nodes.slice(0, 10)) {
         try {
           const l = await api.memories.links(n.id);
-          if (l.outgoing) {
-            for (const ln of l.outgoing) {
+          const outgoing = Array.isArray(l) ? l : (l.outgoing || []);
+          if (outgoing && outgoing.length) {
+            for (const ln of outgoing) {
               if (nodes.find(x => x.id === ln.target_id)) {
                 edges.push({ source: n.id, target: ln.target_id, type: ln.link_type, weight: ln.weight });
               }
             }
           }
-        } catch (e) { /* skip */ }
+        } catch (_) { /* skip */ }
       }
-
-      renderGraph(canvas, nodes, edges, focusId);
+      graph.load({ nodes, edges }, focusId || null);
     } catch (e) {
-      canvas.innerHTML = `<div class="error">${esc(e.message)}</div>`;
+      container.innerHTML = `<div class="error">${esc(e.message)}</div>`;
     }
   }
 
   document.getElementById('gf-search-btn').onclick = () => {
     const id = document.getElementById('gf-search').value.trim();
-    loadGraph(document.getElementById('gf-layer').value, id || null);
+    if (id) graph.focus(id);
   };
-  document.getElementById('gf-reset').onclick = () => {
-    document.getElementById('gf-search').value = '';
-    loadGraph('', null);
-  };
-  document.getElementById('gf-layer').onchange = () => {
-    loadGraph(document.getElementById('gf-layer').value, document.getElementById('gf-search').value.trim() || null);
+  document.getElementById('gf-reset').onclick = () => graph.resetView();
+  document.getElementById('gf-layer').onchange = async () => {
+    await loadGraph(document.getElementById('gf-layer').value, null);
+    setupScrubber();
   };
 
-  await loadGraph('', null);
-  updateStatus();
-});
-
-function renderGraph(container, nodes, edges, focusId) {
-  const w = container.clientWidth || 800;
-  const h = 500;
-  const cx = w / 2, cy = h / 2;
-
-  // Place nodes in a circle initially
-  const angle = (2 * Math.PI) / nodes.length;
-  nodes.forEach((n, i) => {
-    const r = Math.min(w, h) * 0.35;
-    n.x = cx + r * Math.cos(angle * i);
-    n.y = cy + r * Math.sin(angle * i);
-    n.vx = 0; n.vy = 0;
+  // ── Layer toggle pills ──────────────────────────────────────────────────
+  document.querySelectorAll('.graph-pills .pill').forEach(p => {
+    p.onclick = () => {
+      const active = p.classList.toggle('active');
+      graph.setLayerVisible(p.dataset.layer, active);
+    };
   });
 
-  // Simple force layout (50 iterations)
-  for (let iter = 0; iter < 50; iter++) {
-    // Repulsion between all pairs
-    for (let i = 0; i < nodes.length; i++) {
-      for (let j = i + 1; j < nodes.length; j++) {
-        const dx = nodes[j].x - nodes[i].x;
-        const dy = nodes[j].y - nodes[i].y;
-        const d = Math.max(1, Math.sqrt(dx * dx + dy * dy));
-        const f = 2000 / (d * d);
-        const fx = (dx / d) * f;
-        const fy = (dy / d) * f;
-        nodes[i].vx -= fx; nodes[i].vy -= fy;
-        nodes[j].vx += fx; nodes[j].vy += fy;
-      }
+  // ── Temporal scrubber ───────────────────────────────────────────────────
+  function setupScrubber() {
+    const wrap = document.getElementById('graph-scrubber');
+    const times = graph.nodes
+      .map(n => n.created ? new Date(n.created).getTime() : NaN)
+      .filter(t => !isNaN(t));
+    const minT = Math.min(...times), maxT = Math.max(...times);
+    const DAY = 86400000;
+    // Hide when everything was captured on the same day
+    if (times.length < 2 || Math.floor(minT / DAY) === Math.floor(maxT / DAY)) {
+      wrap.classList.add('hidden');
+      graph.setTimeRange(null, null);
+      return;
     }
-    // Attraction along edges
-    for (const e of edges) {
-      const s = nodes.find(n => n.id === e.source);
-      const t = nodes.find(n => n.id === e.target);
-      if (!s || !t) continue;
-      const dx = t.x - s.x;
-      const dy = t.y - s.y;
-      const d = Math.max(1, Math.sqrt(dx * dx + dy * dy));
-      const f = d * 0.01 * e.weight;
-      s.vx += (dx / d) * f; s.vy += (dy / d) * f;
-      t.vx -= (dx / d) * f; t.vy -= (dy / d) * f;
+    wrap.classList.remove('hidden');
+    const span = maxT - minT;
+    const minIn = document.getElementById('scrub-min');
+    const maxIn = document.getElementById('scrub-max');
+    const minLabel = document.getElementById('scrub-min-label');
+    const maxLabel = document.getElementById('scrub-max-label');
+    const fmt = (t) => new Date(t).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+    minIn.value = 0;
+    maxIn.value = 1000;
+    function apply() {
+      let lo = +minIn.value, hi = +maxIn.value;
+      if (lo > hi) [lo, hi] = [hi, lo];
+      const t0 = minT + (lo / 1000) * span;
+      const t1 = minT + (hi / 1000) * span;
+      minLabel.textContent = fmt(t0);
+      maxLabel.textContent = fmt(t1);
+      graph.setTimeRange(t0, t1);
     }
-    // Center gravity
-    for (const n of nodes) {
-      n.vx += (cx - n.x) * 0.001;
-      n.vy += (cy - n.y) * 0.001;
-    }
-    // Apply velocity with damping
-    for (const n of nodes) {
-      n.x += n.vx * 0.5;
-      n.y += n.vy * 0.5;
-      n.vx *= 0.9;
-      n.vy *= 0.9;
-      n.x = Math.max(40, Math.min(w - 40, n.x));
-      n.y = Math.max(20, Math.min(h - 20, n.y));
-    }
+    minIn.oninput = apply;
+    maxIn.oninput = apply;
+    apply();
   }
 
-  const layerColors = { episodic: 'var(--episodic)', semantic: 'var(--semantic)', imagined: 'var(--imagined)' };
-  const edgeStyles = { associative: '2,4', causal: '', analogical: '6,3', temporal: '2,4' };
-  const edgeColors = { associative: 'var(--text-faint)', causal: 'var(--accent)', analogical: 'var(--text-faint)', temporal: 'var(--episodic)' };
-
-  const edgeSvg = edges.map(e => {
-    const s = nodes.find(n => n.id === e.source);
-    const t = nodes.find(n => n.id === e.target);
-    if (!s || !t) return '';
-    const dash = edgeStyles[e.type] || '';
-    return `<line x1="${s.x}" y1="${s.y}" x2="${t.x}" y2="${t.y}" stroke="${edgeColors[e.type]}" stroke-width="${1 + e.weight}" stroke-dasharray="${dash}" opacity="0.5"/>`;
-  }).join('');
-
-  const nodeSvg = nodes.map(n => {
-    const r = 3 + (n.strength || 0.5) * 6;
-    const color = layerColors[n.layer] || 'var(--text)';
-    const glow = n.id === focusId ? `filter="url(#glow)"` : '';
-    return `<g>
-      <circle cx="${n.x}" cy="${n.y}" r="${r}" fill="${color}" opacity="0.9" ${glow}>
-        <title>${esc(n.label)} (${n.layer})</title>
-      </circle>
-      <text x="${n.x + r + 4}" y="${n.y + 3}" font-size="10" fill="var(--text-muted)" font-family="var(--mono)">${esc(n.label.slice(0, 30))}</text>
-    </g>`;
-  }).join('');
-
-  container.innerHTML = `
-    <svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" style="display:block;">
-      <defs>
-        <filter id="glow"><feGaussianBlur stdDeviation="3" result="g"/><feMerge><feMergeNode in="g"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
-      </defs>
-      <rect width="${w}" height="${h}" fill="var(--bg)"/>
-      ${edgeSvg}
-      ${nodeSvg}
-    </svg>`;
-}
+  await loadGraph('', null);
+  setupScrubber();
+  updateStatus();
+  return () => graph.destroy();
+});
 
 // ── Context ────────────────────────────────────────────────────────────────
 
@@ -760,7 +1288,7 @@ route('/context', async () => {
         <div id="cfg-preview" class="preview-box"></div>
       </div>
 
-      <button id="cfg-save" class="btn btn-primary mutation" style="margin-top:1rem;">Save config</button>
+      <button id="cfg-save" class="btn btn-primary" style="margin-top:1rem;">Save config</button>
     </div>
   `;
 
@@ -779,7 +1307,7 @@ route('/context', async () => {
     try {
       const r = await api.context.assemble({ query: q, token_budget: budget });
       prev.innerHTML = `
-        <div class="faint" style="margin-bottom:0.5rem;">${r.metadata?.total_tokens || 0} / ${r.metadata?.budget || budget} tokens · ${r.metadata?.engrams_retrieved || 0} engrams · ${r.metadata?.retrieval_took_ms || 0}ms</div>
+        <div class="faint" style="margin-bottom:0.5rem;">${r.token_count || 0} / ${budget} tokens · ${r.engrams_retrieved || 0} engrams · ${r.took_ms || 0}ms</div>
         <div class="messages-preview">${(r.messages || []).map(m =>
           `<div class="msg-row"><span class="msg-role">[${m.role}]</span> ${esc((m.content || '').slice(0, 300))}${(m.content || '').length > 300 ? '…' : ''}</div>`
         ).join('')}</div>`;
@@ -789,18 +1317,15 @@ route('/context', async () => {
   };
 
   document.getElementById('cfg-save').onclick = async () => {
-    try {
-      const r = await api.config.update({
-        context: {
-          default_budget: parseInt(document.getElementById('cfg-budget').value),
-          high_priority_reserve: parseInt(document.getElementById('cfg-reserve').value) / 100,
-          max_recent_turns: parseInt(document.getElementById('cfg-turns').value),
-          max_engrams: parseInt(document.getElementById('cfg-max-engrams').value),
-        }
-      });
-      if (!r.ok) { const err = await r.json().catch(() => ({})); toast(err.error || 'Save failed', 'error'); return; }
-      toast('Config saved', 'ok');
-    } catch (e) { toast(e.message || 'Save failed', 'error'); }
+    await api.config.update({
+      context: {
+        default_budget: parseInt(document.getElementById('cfg-budget').value),
+        high_priority_reserve: parseInt(document.getElementById('cfg-reserve').value) / 100,
+        max_recent_turns: parseInt(document.getElementById('cfg-turns').value),
+        max_engrams: parseInt(document.getElementById('cfg-max-engrams').value),
+      }
+    });
+    toast('Config saved', 'ok');
   };
 
   updateStatus();
@@ -811,7 +1336,7 @@ route('/context', async () => {
 route('/consolidation', async () => {
   const app = document.getElementById('app');
   let history, patterns, stats;
-  try { history = await api.consolidate.history(); } catch (e) { history = { runs: [] }; }
+  try { history = await api.consolidate.history(); } catch (e) { history = []; }
   try { stats = await api.stats(); } catch (e) { stats = null; }
   try { patterns = await api.patterns({ query: '', min_engrams: 3 }); } catch (e) { patterns = null; }
 
@@ -821,7 +1346,7 @@ route('/consolidation', async () => {
 
       <div class="panel" style="margin-bottom:1rem;">
         <div class="panel-header">Run History</div>
-        ${(history.runs || []).length ? history.runs.map(r => `
+        ${(Array.isArray(history) ? history : []).length ? history.map(r => `
           <div class="feed-item">
             <span class="faint">${r.run_at || '?'}</span>
             <span class="badge badge-semantic">${r.type || '?'}</span>
@@ -854,7 +1379,7 @@ route('/consolidation', async () => {
         </div>
       </div>
 
-      <div class="mutation" style="margin-top:1rem;display:flex;gap:0.5rem;">
+      <div style="margin-top:1rem;display:flex;gap:0.5rem;">
         <button class="btn" id="btn-decay">Run decay now</button>
         <button class="btn" id="btn-consolidate">Run consolidation now</button>
       </div>
@@ -862,18 +1387,14 @@ route('/consolidation', async () => {
   `;
 
   document.getElementById('btn-decay').onclick = async () => {
-    try {
-      const r = await api.consolidate.decay();
-      toast(`Decayed: ${r.decayed || 0}, Strengthened: ${r.strengthened || 0}, Pruned: ${r.pruned || 0}`, 'ok');
-      render();
-    } catch (e) { toast(e.message || 'Decay failed', 'error'); }
+    const r = await api.consolidate.decay();
+    toast(`Decayed: ${r.decayed || 0}, Strengthened: ${r.strengthened || 0}, Pruned: ${r.pruned || 0}`, 'ok');
+    render();
   };
   document.getElementById('btn-consolidate').onclick = async () => {
-    try {
-      const r = await api.consolidate.weekly();
-      toast(`Promoted: ${r.promoted_to_semantic || 0}, Pruned imagined: ${r.pruned_imagined || 0}`, 'ok');
-      render();
-    } catch (e) { toast(e.message || 'Consolidation failed', 'error'); }
+    const r = await api.consolidate.weekly();
+    toast(`Promoted: ${r.promoted_to_semantic || 0}, Pruned imagined: ${r.pruned_imagined || 0}`, 'ok');
+    render();
   };
 
   updateStatus();
@@ -1027,6 +1548,22 @@ route('/settings', async () => {
           <button class="btn" id="import-btn" style="display:none;">Upload & Import</button>
         </div>
       </div>
+
+      <div class="panel" style="margin-bottom:1rem;">
+        <div class="panel-header">Saved Searches <button class="btn btn-sm" id="ss-check-all">Check all now</button></div>
+        <div class="ss-form">
+          <input type="text" id="ss-query" class="search-input" placeholder="Watch query… e.g. debugging">
+          <select id="ss-layer" class="filter-select">
+            <option value="">Any layer</option>
+            <option value="episodic">Episodic</option>
+            <option value="semantic">Semantic</option>
+            <option value="imagined">Imagined</option>
+          </select>
+          <label class="ss-notify"><input type="checkbox" id="ss-notify"> Notify on new matches</label>
+          <button id="ss-add" class="btn btn-primary btn-sm">Save</button>
+        </div>
+        <div id="ss-list" class="ss-list"><div class="loading-sm">Loading…</div></div>
+      
 
       <div class="panel">
         <div class="panel-header">Onboarding &amp; Demo Data</div>
@@ -1203,6 +1740,44 @@ route('/settings', async () => {
     localStorage.removeItem('engram_onboarded');
     showOnboarding();
   };
+
+  // ── Saved searches (watchlist) ──────────────────────────────────────────
+
+  function ssRow(s) {
+    return `
+      <div class="ss-row" data-id="${esc(s.id)}">
+        <span class="ss-query">${esc(s.query || '')}</span>
+        ${s.layer ? layerBadge(s.layer) : '<span class="faint">any layer</span>'}
+        ${s.notify ? '<span class="badge ok" title="Notify on new matches">🔔</span>' : ''}
+        <span class="ss-count faint" data-count>${s.last_match_count ?? '—'} matches</span>
+        <button class="note-del ss-del" data-id="${esc(s.id)}" title="Delete saved search">×</button>
+      </div>`;
+  }
+
+  async function loadSavedSearches() {
+    const listEl = document.getElementById('ss-list');
+    try {
+      const r = await api.savedSearches.list();
+      const list = Array.isArray(r) ? r : (r.results || r.searches || []);
+      listEl.innerHTML = list.length
+        ? list.map(ssRow).join('')
+        : '<div class="faint" style="padding:0.75rem 1rem;">No saved searches yet.</div>';
+    } catch (e) {
+      listEl.innerHTML = '<div class="faint" style="padding:0.75rem 1rem;">Saved searches unavailable.</div>';
+    }
+  }
+
+  document.getElementById('ss-add').onclick = async () => {
+    const query = document.getElementById('ss-query').value.trim();
+    if (!query) return;
+    const layer = document.getElementById('ss-layer').value || null;
+    const notify = document.getElementById('ss-notify').checked;
+    try {
+      await api.savedSearches.create({ query, layer, notify });
+      document.getElementById('ss-query').value = '';
+      document.getElementById('ss-notify').checked = false;
+      toast('Search saved', 'ok');
+      loadSavedSearches();
 
   updateStatus();
 });

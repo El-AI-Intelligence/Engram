@@ -22,6 +22,7 @@ from urllib.parse import urlparse, parse_qs
 
 PORT = 8787
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+LANDING_DIR = os.path.join(os.path.dirname(BASE_DIR), "landing")
 START_TIME = time.time()
 NOW = datetime.now(timezone.utc)
 
@@ -1139,11 +1140,19 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
     def _static(self, path):
-        if path in ("/", ""):
-            path = "/landing.html"
-        rel = os.path.normpath(path).lstrip("/")
-        full = os.path.join(BASE_DIR, rel)
-        if not full.startswith(BASE_DIR) or not os.path.isfile(full):
+        # Landing page (and its assets) live in the sibling ui/landing/ dir;
+        # the vault UI is at /app (mirrors the live Caddy setup).
+        if path in ("/", "") or path.startswith("/js/landing"):
+            base = LANDING_DIR
+            rel = os.path.normpath(path).lstrip("/") or "index.html"
+        elif path == "/app":
+            base = BASE_DIR
+            rel = "index.html"
+        else:
+            base = BASE_DIR
+            rel = os.path.normpath(path).lstrip("/")
+        full = os.path.join(base, rel)
+        if not full.startswith(base) or not os.path.isfile(full):
             # SPA-ish fallback: unknown non-API paths get index.html
             full = os.path.join(BASE_DIR, "index.html")
         ctype = mimetypes.guess_type(full)[0] or "application/octet-stream"

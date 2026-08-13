@@ -1,133 +1,551 @@
 <!DOCTYPE html>
-<html lang="en" data-theme="dark">
+<html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Engram — Your AI deserves a memory</title>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<meta name="theme-color" content="#0b0f14">
+<meta name="description" content="Engram — local-first memory vault for AI agents. Your AI deserves a memory.">
+<title>Engram — Memory for AI</title>
 <style>
-:root {
-  --bg: #0a0a0f;
-  --surface: #13131a;
-  --border: #1e1e2e;
-  --text: #cdd6f4;
-  --text-muted: #6c7086;
-  --accent: #cba6f7;
-  --accent2: #89b4fa;
-  --green: #a6e3a1;
-  --code-bg: #11111b;
-}
-* { box-sizing: border-box; margin: 0; padding: 0; }
-body {
-  font-family: system-ui, -apple-system, sans-serif;
-  background: var(--bg);
-  color: var(--text);
-  line-height: 1.6;
-  min-height: 100vh;
-}
-.container { max-width: 720px; margin: 0 auto; padding: 2rem 1.5rem; }
-.hero { text-align: center; padding: 5rem 0 3rem; }
-.hero h1 { font-size: 3rem; font-weight: 800; letter-spacing: -0.02em; }
-.hero h1 span { color: var(--accent); }
-.hero p { color: var(--text-muted); font-size: 1.2rem; margin-top: 0.75rem; max-width: 480px; margin-left: auto; margin-right: auto; }
-.install-box {
-  background: var(--code-bg);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 1rem 1.25rem;
-  margin: 2rem auto;
-  max-width: 440px;
-  display: flex;
-  align-items: center;
-  gap: 0.75rem;
-}
-.install-box code {
-  flex: 1;
-  font-size: 0.9rem;
-  color: var(--green);
-  overflow-x: auto;
-  white-space: nowrap;
-}
-.copy-btn {
-  background: var(--accent);
-  color: #111;
-  border: none;
-  padding: 0.4rem 1rem;
-  border-radius: 6px;
-  font-weight: 600;
-  cursor: pointer;
-  font-size: 0.85rem;
-  white-space: nowrap;
-}
-.copy-btn:hover { opacity: 0.85; }
-.features {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-  gap: 1.25rem;
-  margin: 3rem 0;
-}
-.feature {
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 1.5rem;
-}
-.feature h3 { font-size: 1.05rem; margin-bottom: 0.5rem; }
-.feature h3 span { margin-right: 0.5rem; }
-.feature p { color: var(--text-muted); font-size: 0.9rem; }
-.nav { display: flex; justify-content: center; gap: 1.5rem; margin-top: 2rem; }
-.nav a { color: var(--accent2); text-decoration: none; font-weight: 500; }
-.nav a:hover { text-decoration: underline; }
-.footer { text-align: center; color: var(--text-muted); font-size: 0.8rem; margin-top: 4rem; padding: 2rem 0; border-top: 1px solid var(--border); }
+  /* ── Reset & tokens ─────────────────────────────────────────────── */
+  :root {
+    --bg: #0b0f14;
+    --bg2: #141a22;
+    --bg3: #1c2430;
+    --fg: #e2e8f0;
+    --fg2: #94a3b8;
+    --fg3: #64748b;
+    --accent: #6c5ce7;
+    --accent2: #a29bfe;
+    --green: #00cec9;
+    --border: #2d3548;
+    --radius: 12px;
+    --font: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --mono: "JetBrains Mono", "Fira Code", "Cascadia Code", monospace;
+  }
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) {
+      --bg: #f8fafc;
+      --bg2: #f1f5f9;
+      --bg3: #e2e8f0;
+      --fg: #0f172a;
+      --fg2: #475569;
+      --fg3: #94a3b8;
+      --accent: #5b4cc4;
+      --accent2: #7c6ff7;
+      --border: #cbd5e1;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0b0f14;
+    --bg2: #141a22;
+    --bg3: #1c2430;
+    --fg: #e2e8f0;
+    --fg2: #94a3b8;
+    --fg3: #64748b;
+    --accent: #6c5ce7;
+    --accent2: #a29bfe;
+    --green: #00cec9;
+    --border: #2d3548;
+  }
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  html { scroll-behavior: smooth; }
+  body {
+    font-family: var(--font);
+    background: var(--bg);
+    color: var(--fg);
+    line-height: 1.6;
+    overflow-x: hidden;
+  }
+  a { color: var(--accent2); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  /* ── Nav ───────────────────────────────────────────────────────── */
+  .nav {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 16px 24px; max-width: 1200px; margin: 0 auto;
+    border-bottom: 1px solid var(--border);
+  }
+  .nav-brand {
+    font-weight: 700; font-size: 1.25rem; color: var(--fg);
+    display: flex; align-items: center; gap: 8px;
+  }
+  .nav-brand .gem { font-size: 1.4rem; color: var(--accent2); }
+  .nav-links { display: flex; gap: 24px; align-items: center; }
+  .nav-links a { color: var(--fg2); font-weight: 500; font-size: 0.95rem; }
+  .nav-links a:hover { color: var(--fg); text-decoration: none; }
+  .btn {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 10px 20px; border-radius: 8px; font-weight: 600;
+    font-size: 0.95rem; cursor: pointer; transition: all 0.2s;
+    border: none; text-decoration: none;
+  }
+  .btn-primary { background: var(--accent); color: #fff; }
+  .btn-primary:hover { background: var(--accent2); text-decoration: none; transform: translateY(-1px); }
+  .btn-outline { background: transparent; color: var(--fg2); border: 1px solid var(--border); }
+  .btn-outline:hover { border-color: var(--accent2); color: var(--fg); text-decoration: none; }
+  .btn-lg { padding: 14px 32px; font-size: 1.1rem; border-radius: 10px; }
+
+  /* ── Sections ──────────────────────────────────────────────────── */
+  section { padding: 80px 24px; }
+  .container { max-width: 1100px; margin: 0 auto; }
+
+  /* ── Hero ──────────────────────────────────────────────────────── */
+  .hero {
+    text-align: center; padding: 100px 24px 80px;
+    background: radial-gradient(ellipse at 50% 0%, rgba(108,92,231,0.15) 0%, transparent 60%);
+  }
+  .hero h1 {
+    font-size: clamp(2.5rem, 6vw, 4.5rem); font-weight: 800;
+    letter-spacing: -0.03em; line-height: 1.1; margin-bottom: 20px;
+  }
+  .hero h1 span { color: var(--accent2); }
+  .hero p {
+    font-size: 1.25rem; color: var(--fg2); max-width: 600px;
+    margin: 0 auto 36px; line-height: 1.6;
+  }
+  .hero-buttons { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
+  .hero-code {
+    margin-top: 48px; display: inline-block;
+    background: var(--bg3); border: 1px solid var(--border);
+    border-radius: 8px; padding: 14px 24px;
+    font-family: var(--mono); font-size: 0.95rem;
+    color: var(--green); white-space: nowrap;
+    overflow-x: auto; max-width: 100%;
+  }
+  .hero-code .prompt { color: var(--accent2); }
+  .hero-code .cmd { color: var(--green); }
+
+  /* ── Section titles ────────────────────────────────────────────── */
+  .section-label {
+    font-size: 0.85rem; font-weight: 600; text-transform: uppercase;
+    letter-spacing: 0.08em; color: var(--accent2); margin-bottom: 8px;
+  }
+  .section-title {
+    font-size: clamp(1.8rem, 3.5vw, 2.5rem); font-weight: 700;
+    letter-spacing: -0.02em; margin-bottom: 16px;
+  }
+  .section-sub {
+    font-size: 1.1rem; color: var(--fg2); max-width: 600px; margin-bottom: 40px;
+  }
+
+  /* ── How it works ──────────────────────────────────────────────── */
+  .steps {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 24px; margin-top: 32px;
+  }
+  .step {
+    background: var(--bg2); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 28px; transition: border-color 0.2s;
+  }
+  .step:hover { border-color: var(--accent2); }
+  .step-num {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 36px; height: 36px; border-radius: 50%;
+    background: var(--accent); color: #fff; font-weight: 700;
+    font-size: 0.9rem; margin-bottom: 16px;
+  }
+  .step h3 { font-size: 1.15rem; margin-bottom: 8px; }
+  .step p { color: var(--fg2); font-size: 0.95rem; }
+  .step code {
+    background: var(--bg3); padding: 2px 6px; border-radius: 4px;
+    font-family: var(--mono); font-size: 0.85rem; color: var(--green);
+  }
+
+  /* ── Ebbinghaus viz ────────────────────────────────────────────── */
+  .ebbinghaus {
+    background: var(--bg2); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 40px; overflow: hidden;
+    position: relative;
+  }
+  .ebbinghaus h3 { margin-bottom: 24px; }
+  .curve-container { position: relative; height: 200px; overflow: visible; }
+  .curve-container svg { width: 100%; height: 100%; }
+  .curve-label {
+    fill: var(--fg2); font-size: 11px; font-family: var(--font);
+  }
+  .legend {
+    display: flex; gap: 20px; margin-top: 16px; font-size: 0.9rem; color: var(--fg2);
+    flex-wrap: wrap;
+  }
+  .legend span { display: flex; align-items: center; gap: 6px; }
+  .legend .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+
+  /* ── Comparison table ──────────────────────────────────────────── */
+  .compare {
+    width: 100%; border-collapse: collapse; margin-top: 24px;
+    font-size: 0.95rem;
+  }
+  .compare th {
+    text-align: left; padding: 12px 16px; font-weight: 600;
+    color: var(--fg2); border-bottom: 2px solid var(--border);
+    font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.05em;
+  }
+  .compare td {
+    padding: 14px 16px; border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  .compare tr:hover td { background: rgba(108,92,231,0.05); }
+  .check { color: var(--green); font-weight: 700; }
+  .cross { color: var(--fg3); }
+
+  /* ── Carbon calculator ─────────────────────────────────────────── */
+  .calc {
+    background: var(--bg2); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 36px;
+  }
+  .calc-row { display: flex; align-items: center; gap: 16px; margin-bottom: 20px; flex-wrap: wrap; }
+  .calc-row label { font-weight: 600; min-width: 200px; }
+  .calc-row input[type="range"] { flex: 1; min-width: 200px; accent-color: var(--accent); }
+  .calc-row output { font-weight: 700; font-size: 1.2rem; color: var(--accent2); min-width: 80px; }
+  .calc-result {
+    margin-top: 24px; padding: 20px; background: var(--bg3);
+    border-radius: 8px; text-align: center;
+  }
+  .calc-result .big { font-size: 2rem; font-weight: 800; color: var(--green); }
+  .calc-result .unit { font-size: 1rem; color: var(--fg2); }
+
+  /* ── Footer ────────────────────────────────────────────────────── */
+  footer {
+    border-top: 1px solid var(--border); padding: 40px 24px;
+    text-align: center; color: var(--fg3); font-size: 0.9rem;
+  }
+  footer .links { display: flex; gap: 24px; justify-content: center; margin-bottom: 16px; }
+  footer .links a { color: var(--fg2); }
+
+  /* ── Responsive ────────────────────────────────────────────────── */
+  @media (max-width: 768px) {
+    .hero { padding: 60px 16px 40px; }
+    section { padding: 48px 16px; }
+    .nav { padding: 12px 16px; }
+    .nav-links { gap: 12px; }
+    .nav-links a.hide-sm { display: none; }
+    .compare { font-size: 0.8rem; }
+    .compare th, .compare td { padding: 8px 10px; }
+  }
+
+  /* ── Graph animation (pure CSS) ────────────────────────────────── */
+  .hero-graph {
+    position: relative; width: 320px; height: 240px; margin: 0 auto 32px;
+  }
+  .node {
+    position: absolute; width: 8px; height: 8px; border-radius: 50%;
+    background: var(--accent2); animation: pulse 2s ease-in-out infinite;
+  }
+  .node:nth-child(1) { left: 45%; top: 20%; animation-delay: 0s; }
+  .node:nth-child(2) { left: 25%; top: 50%; animation-delay: 0.3s; width: 6px; height: 6px; }
+  .node:nth-child(3) { left: 65%; top: 45%; animation-delay: 0.6s; }
+  .node:nth-child(4) { left: 35%; top: 75%; animation-delay: 0.9s; width: 10px; height: 10px; }
+  .node:nth-child(5) { left: 55%; top: 70%; animation-delay: 1.2s; width: 6px; height: 6px; }
+  .node:nth-child(6) { left: 50%; top: 35%; animation-delay: 1.5s; }
+  .node:nth-child(7) { left: 70%; top: 25%; animation-delay: 0.15s; width: 5px; height: 5px; }
+  .node:nth-child(8) { left: 30%; top: 30%; animation-delay: 0.45s; width: 7px; height: 7px; }
+  .node:nth-child(9) { left: 60%; top: 60%; animation-delay: 0.75s; }
+  .node:nth-child(10){ left: 40%; top: 55%; animation-delay: 1.05s; width: 6px; height: 6px; }
+  .edge {
+    position: absolute; height: 1px;
+    background: rgba(162,155,254,0.25); transform-origin: left center;
+  }
+  @keyframes pulse {
+    0%, 100% { opacity: 0.4; transform: scale(1); }
+    50% { opacity: 1; transform: scale(1.8); }
+  }
 </style>
 </head>
 <body>
-<div class="container">
-  <div class="hero">
-    <h1><span>Engram</span> — Your AI deserves a memory.</h1>
-    <p>A local-first, encrypted memory vault that gives AI agents persistent recall across sessions.</p>
-    <div class="install-box">
-      <code>curl -fsSL https://engram.ellmstack.dev/install.sh | bash</code>
-      <button class="copy-btn" onclick="copy()">Copy</button>
-    </div>
-  </div>
 
-  <div class="features">
-    <div class="feature">
-      <h3><span>&#x1F512;</span> Zero-Knowledge Encryption</h3>
-      <p>SQLCipher AES-256. Your memories never leave your machine in plaintext. Even the sync server can't read them.</p>
-    </div>
-    <div class="feature">
-      <h3><span>&#x1F9E0;</span> Semantic Search</h3>
-      <p>Auto-downloads an ONNX embedding model (23MB). Find memories by meaning, not just keywords. Zero config.</p>
-    </div>
-    <div class="feature">
-      <h3><span>&#x1F4BB;</span> AI-Native API</h3>
-      <p>REST + WebSocket + MCP server. Claude Code, Cursor, Windsurf — one command to connect your AI tools.</p>
-    </div>
-    <div class="feature">
-      <h3><span>&#x2696;&#xFE0F;</span> Memory Hygiene</h3>
-      <p>Automatic decay, strengthening, and consolidation. Important memories get stronger; noise fades away.</p>
-    </div>
-    <div class="feature">
-      <h3><span>&#x1F504;</span> Cross-Device Sync</h3>
-      <p>E2E encrypted sync with AES-256-GCM + HMAC. Vector-clock conflict resolution. Self-hostable sync server.</p>
-    </div>
-    <div class="feature">
-      <h3><span>&#x1F6E1;&#xFE0F;</span> Privacy Controls</h3>
-      <p>Full audit trail, purge by criteria, retention policies. You control what's stored and for how long.</p>
-    </div>
+<!-- ── Navigation ──────────────────────────────────────────────────── -->
+<nav class="nav">
+  <a class="nav-brand" href="#"><span class="gem">◆</span> Engram</a>
+  <div class="nav-links">
+    <a href="#how" class="hide-sm">How it works</a>
+    <a href="#science" class="hide-sm">Science</a>
+    <a href="#compare" class="hide-sm">Compare</a>
+    <a href="https://github.com/El-AI-Intelligence/engram" target="_blank" rel="noopener">GitHub</a>
+    <a href="/app" class="btn btn-outline">Open Vault</a>
   </div>
+</nav>
 
-  <div class="nav">
-    <a href="/app/">Open Dashboard</a>
-    <a href="https://github.com/El-AI-Intelligence/engram">GitHub</a>
-    <a href="https://docs.ellmstack.dev">Docs</a>
-  </div>
+<!-- ── Hero ────────────────────────────────────────────────────────── -->
+<section class="hero">
+  <div class="container">
+    <div class="hero-graph">
+      <!-- CSS-only graph nodes -->
+      <div class="node" style="left:45%;top:20%"></div>
+      <div class="node" style="left:25%;top:50%"></div>
+      <div class="node" style="left:65%;top:45%"></div>
+      <div class="node" style="left:35%;top:75%"></div>
+      <div class="node" style="left:55%;top:70%"></div>
+      <div class="node" style="left:50%;top:35%"></div>
+      <div class="node" style="left:70%;top:25%"></div>
+      <div class="node" style="left:30%;top:30%"></div>
+      <div class="node" style="left:60%;top:60%"></div>
+      <div class="node" style="left:40%;top:55%"></div>
+    </div>
 
-  <div class="footer">
-    Engram is built on the <strong>Axiom-OS</strong> kernel. Open source. MIT licensed.
+    <h1>Your AI deserves <span>a memory</span>.</h1>
+    <p>
+      Engram is a local-first memory vault for AI agents.
+      Capture once, recall forever — with Ebbinghaus decay,
+      holographic caching, and zero-trust E2E sync.
+    </p>
+    <div class="hero-buttons">
+      <a href="https://github.com/El-AI-Intelligence/engram#readme" class="btn btn-primary btn-lg" target="_blank" rel="noopener">
+        ⬇ Install
+      </a>
+      <a href="/app" class="btn btn-outline btn-lg">Open Vault →</a>
+    </div>
+    <div class="hero-code">
+      <span class="prompt">$</span> <span class="cmd">curl -fsSL https://engram.ellmstack.dev/install.sh | bash</span>
+    </div>
   </div>
-</div>
+</section>
+
+<!-- ── How it works ────────────────────────────────────────────────── -->
+<section id="how">
+  <div class="container">
+    <div class="section-label">How it works</div>
+    <div class="section-title">Three steps to never forgetting again.</div>
+    <div class="section-sub">
+      Engram runs as a background daemon on your machine. Your AI tools talk to it
+      via a local HTTP API, MCP server, or our Python/JS SDKs.
+    </div>
+
+    <div class="steps">
+      <div class="step">
+        <div class="step-num">1</div>
+        <h3>Install</h3>
+        <p>
+          One command: <code>cargo install engramd</code>.
+          Or use <code>brew install engramd</code>, <code>pip install engramd</code>,
+          or <code>npm install engramd</code>. Starts in seconds.
+        </p>
+      </div>
+      <div class="step">
+        <div class="step-num">2</div>
+        <h3>Capture</h3>
+        <p>
+          Your AI agent captures facts, decisions, and observations as discrete
+          memories. MCP auto-capture does it passively — memory "just happens."
+        </p>
+      </div>
+      <div class="step">
+        <div class="step-num">3</div>
+        <h3>Retrieve</h3>
+        <p>
+          Engram assembles relevant context for every query, reducing your LLM's
+          token consumption by 40-70%. Forgetting is efficient — and green.
+        </p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── The science ─────────────────────────────────────────────────── -->
+<section id="science" style="background: var(--bg2);">
+  <div class="container">
+    <div class="section-label">The science</div>
+    <div class="section-title">Memories that learn to forget.</div>
+    <div class="section-sub">
+      Engram models human memory: Ebbinghaus decay curves, holographic XOR
+      codes for O(1) associative recall, and nightly consolidation that
+      merges episodes into semantic knowledge.
+    </div>
+
+    <div class="ebbinghaus">
+      <h3>Ebbinghaus Forgetting Curve</h3>
+      <div class="curve-container">
+        <svg viewBox="0 0 600 200" preserveAspectRatio="xMidYMid meet">
+          <!-- Without retrieval (fast decay) -->
+          <polyline fill="none" stroke="#e17055" stroke-width="2.5"
+            points="0,20 60,80 120,120 180,145 240,160 300,168 360,174 420,178 480,180 540,182 600,184"
+            stroke-dasharray="6,3"/>
+          <!-- With spaced retrieval (slow decay) -->
+          <polyline fill="none" stroke="#00cec9" stroke-width="2.5"
+            points="0,20 20,45 40,44 60,60 80,58 100,72 120,70 140,80 160,78 180,86 200,84 220,88 240,86 260,90 280,92 300,90 320,94 340,93 360,96 380,95 400,97 420,96 440,98 460,97 480,98 500,99 520,98 540,99 560,100 580,99 600,100"/>
+          <!-- X-axis -->
+          <line x1="0" y1="192" x2="600" y2="192" stroke="var(--border)" stroke-width="1"/>
+          <!-- Y-axis -->
+          <line x1="0" y1="0" x2="0" y2="192" stroke="var(--border)" stroke-width="1"/>
+          <!-- Labels -->
+          <text x="0" y="12" class="curve-label">100%</text>
+          <text x="0" y="192" class="curve-label">0%</text>
+          <text x="580" y="192" class="curve-label" text-anchor="end">30d</text>
+          <text x="300" y="192" class="curve-label" text-anchor="middle">Time</text>
+          <text x="15" y="100" class="curve-label" transform="rotate(-90,15,100)">Strength</text>
+        </svg>
+      </div>
+      <div class="legend">
+        <span><span class="dot" style="background:#e17055;"></span> Without retrieval</span>
+        <span><span class="dot" style="background:#00cec9;"></span> With spaced retrieval</span>
+      </div>
+      <p style="margin-top:16px;color:var(--fg2);font-size:0.9rem;">
+        Memories you revisit get stronger. Memories you ignore fade away.
+        Engram's decay model mirrors how your own brain decides what to keep.
+      </p>
+    </div>
+  </div>
+</section>
+
+<!-- ── Environmental impact ────────────────────────────────────────── -->
+<section id="eco">
+  <div class="container">
+    <div class="section-label">Environmental impact</div>
+    <div class="section-title">Forgetting is green.</div>
+    <div class="section-sub">
+      Every memory retrieved is a thousand tokens <em>not</em> re-generated.
+      Move the slider to estimate your CO₂ savings.
+    </div>
+
+    <div class="calc" id="carbon-calc">
+      <div class="calc-row">
+        <label for="hours">Hours/day using AI agents:</label>
+        <input type="range" id="hours" min="1" max="12" value="4" step="1">
+        <output id="hours-out">4h</output>
+      </div>
+      <div class="calc-row">
+        <label for="tokens">Avg tokens per interaction:</label>
+        <input type="range" id="tokens" min="1000" max="50000" value="20000" step="1000">
+        <output id="tokens-out">20,000</output>
+      </div>
+      <div class="calc-row">
+        <label for="savings">Context reduction with Engram:</label>
+        <input type="range" id="savings" min="20" max="70" value="50" step="5">
+        <output id="savings-out">50%</output>
+      </div>
+      <div class="calc-result">
+        <div style="font-size:0.9rem;color:var(--fg2);margin-bottom:4px;">Estimated annual CO₂ savings</div>
+        <div class="big" id="co2-result">—</div>
+        <div class="unit">kg CO₂e per year</div>
+        <div style="font-size:0.8rem;color:var(--fg3);margin-top:8px;">
+          Based on 0.4 g CO₂e per 1K tokens (public estimate). Actual savings shown in your vault dashboard.
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── Comparison ──────────────────────────────────────────────────── -->
+<section id="compare" style="background: var(--bg2);">
+  <div class="container">
+    <div class="section-label">Compare</div>
+    <div class="section-title">Why Engram?</div>
+    <div class="section-sub">
+      Most memory solutions are vector databases with a search bar.
+      Engram is a memory system — with forgetting, consolidation, and MCP auto-capture.
+    </div>
+
+    <div style="overflow-x:auto;">
+    <table class="compare">
+      <thead>
+        <tr>
+          <th>Feature</th>
+          <th><strong>Engram</strong></th>
+          <th>Mem0</th>
+          <th>ChromaDB</th>
+          <th>Letta</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Local-first</td>
+          <td class="check">✓ SQLCipher</td>
+          <td class="cross">✗ Cloud-only</td>
+          <td class="check">✓ Embedded</td>
+          <td class="cross">✗ Server req.</td>
+        </tr>
+        <tr>
+          <td>Ebbinghaus decay</td>
+          <td class="check">✓ Built-in</td>
+          <td class="cross">✗</td>
+          <td class="cross">✗</td>
+          <td class="cross">✗</td>
+        </tr>
+        <tr>
+          <td>Holographic cache</td>
+          <td class="check">✓ QEM L1</td>
+          <td class="cross">✗</td>
+          <td class="cross">✗</td>
+          <td class="cross">✗</td>
+        </tr>
+        <tr>
+          <td>Nightly consolidation</td>
+          <td class="check">✓ Episodic→Semantic</td>
+          <td class="cross">✗</td>
+          <td class="cross">✗</td>
+          <td class="check">✓ Agent memory</td>
+        </tr>
+        <tr>
+          <td>MCP auto-capture</td>
+          <td class="check">✓ Passive observe</td>
+          <td class="cross">✗</td>
+          <td class="cross">✗</td>
+          <td class="cross">✗</td>
+        </tr>
+        <tr>
+          <td>E2E encrypted sync</td>
+          <td class="check">✓ Zero-trust</td>
+          <td class="cross">✗</td>
+          <td class="cross">✗</td>
+          <td class="cross">✗</td>
+        </tr>
+        <tr>
+          <td>CO₂ tracking</td>
+          <td class="check">✓ Instrumented</td>
+          <td class="cross">✗</td>
+          <td class="cross">✗</td>
+          <td class="cross">✗</td>
+        </tr>
+        <tr>
+          <td>SDKs</td>
+          <td>Python, JS, MCP</td>
+          <td>Python</td>
+          <td>Python, JS</td>
+          <td>Python, REST</td>
+        </tr>
+        <tr>
+          <td>License</td>
+          <td>MIT</td>
+          <td>Apache 2.0</td>
+          <td>Apache 2.0</td>
+          <td>Apache 2.0</td>
+        </tr>
+      </tbody>
+    </table>
+    </div>
+  </div>
+</section>
+
+<!-- ── Built with Rust ─────────────────────────────────────────────── -->
+<section>
+  <div class="container" style="text-align:center;">
+    <p style="font-size:1.2rem;font-weight:600;margin-bottom:8px;">
+      Built with Rust. Runs on your machine. Your memories, your key.
+    </p>
+    <p style="color:var(--fg2);">
+      Zero telemetry. No cloud required. The sync server never sees plaintext.
+    </p>
+    <div style="margin-top:24px;display:flex;gap:12px;justify-content:center;flex-wrap:wrap;">
+      <a href="https://github.com/El-AI-Intelligence/engram" class="btn btn-outline" target="_blank" rel="noopener">GitHub</a>
+      <a href="https://github.com/El-AI-Intelligence/engram/tree/main/docs/engram-product" class="btn btn-outline" target="_blank" rel="noopener">Docs</a>
+      <a href="/app" class="btn btn-primary">Open Vault →</a>
+    </div>
+  </div>
+</section>
+
+<!-- ── Footer ──────────────────────────────────────────────────────── -->
+<footer>
+  <div class="links">
+    <a href="https://github.com/El-AI-Intelligence/engram" target="_blank" rel="noopener">GitHub</a>
+    <a href="https://github.com/El-AI-Intelligence/engram/tree/main/docs/engram-product" target="_blank" rel="noopener">Docs</a>
+    <a href="https://discord.gg/ellm" target="_blank" rel="noopener">Discord</a>
+  </div>
+  <p>Engram — part of the <a href="https://github.com/El-AI-Intelligence/engram">Axiom OS</a> ecosystem. MIT Licensed.</p>
+  <p style="font-size:0.8rem;">"Forgetting is green. Remembering everything forever is computationally wasteful."</p>
+</footer>
+
 <script src="js/landing.js"></script>
+
 </body>
 </html>
