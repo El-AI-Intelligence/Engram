@@ -399,12 +399,14 @@ function formatBytes(b) {
 
 function showModal(title, bodyHtml) {
   const root = document.getElementById('modal-root');
+  // CSP note: no inline event handlers — closing is handled by the delegated
+  // click listener on #modal-root registered at init.
   root.innerHTML = `
-    <div class="modal-overlay" onclick="this.closest('#modal-root').innerHTML=''">
-      <div class="modal" onclick="event.stopPropagation()">
+    <div class="modal-overlay">
+      <div class="modal">
         <div class="modal-header">
           <h2>${title}</h2>
-          <button class="modal-close" onclick="this.closest('#modal-root').innerHTML=''">&times;</button>
+          <button class="modal-close">&times;</button>
         </div>
         <div class="modal-body">${bodyHtml}</div>
       </div>
@@ -1543,7 +1545,7 @@ route('/settings', async () => {
           <button class="btn" id="btn-export">Export (JSONL)</button>
           <label class="btn" style="cursor:pointer;">
             Import
-            <input type="file" id="import-file" accept=".jsonl,.json" style="display:none;" onchange="document.getElementById('import-btn').style.display='inline-block';">
+            <input type="file" id="import-file" accept=".jsonl,.json" style="display:none;">
           </label>
           <button class="btn" id="import-btn" style="display:none;">Upload & Import</button>
         </div>
@@ -2222,6 +2224,22 @@ setInterval(updateStatus, 30000);
 
 // Tour & demo: accessible at any time from the topbar
 document.getElementById('tour-btn').addEventListener('click', () => navigate('#/tour'));
+
+// Modal close — delegated listener (CSP blocks inline event-handler attributes,
+// so closing happens here instead of onclick="" in showModal)
+document.getElementById('modal-root').addEventListener('click', (e) => {
+  if (e.target.classList.contains('modal-overlay') || e.target.classList.contains('modal-close')) {
+    document.getElementById('modal-root').innerHTML = '';
+  }
+});
+
+// Import file picker — delegated change listener (CSP-safe replacement for the
+// former inline onchange; change events bubble)
+document.addEventListener('change', (e) => {
+  if (e.target && e.target.id === 'import-file') {
+    document.getElementById('import-btn').style.display = 'inline-block';
+  }
+});
 
 // Mobile read-only flag (K3: mobile is browse-only)
 const mobileMq = window.matchMedia('(max-width: 767px)');

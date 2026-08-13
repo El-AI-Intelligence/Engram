@@ -1,7 +1,7 @@
 use crate::errors::{self, code};
 use crate::routes::err_json;
 use crate::{AppState, LiveEvent};
-use axiom_engram::{Engram, EngramLayer, EngramSource, EngramLink};
+use axiom_engram::{Engram, EngramLayer, EngramSource, EngramLink, WriteOutcome};
 use axum::{
     extract::{Path, Query, State},
     routing::{get, post},
@@ -19,6 +19,7 @@ pub fn router() -> Router<AppState> {
         .route("/memories/{id}/links", get(get_links))
         .route("/memories/{id}/related", get(get_related))
         .route("/memories/{id}/ground", post(ground))
+        .route("/memories/{id}/mark-noise", post(mark_noise))
 }
 
 // ── DTOs ────────────────────────────────────────────────────────────────────
@@ -78,6 +79,10 @@ struct SearchQuery {
     /// - hybrid: merge both, weighted 0.6 vector + 0.4 FTS5
     #[serde(default = "default_search_mode")]
     search_mode: String,
+    /// B7: filter to quarantined memories (imagined && !grounded) when Some(true),
+    /// exclude them when Some(false), no filter when None.
+    #[serde(default)]
+    quarantined: Option<bool>,
 }
 
 fn default_search_mode() -> String { "fts5".to_string() }
@@ -158,6 +163,11 @@ struct MemoryResponse {
     content_type: String,
     occurred_at: Option<String>,
     evidence: Vec<EvidenceResponse>,
+    /// True when this capture was filtered (noise) or merged (duplicate)
+    /// instead of being written.
+    skipped: bool,
+    skip_reason: Option<String>,
+    matched_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -198,6 +208,9 @@ impl From<Engram> for MemoryResponse {
             content_type: e.content_type,
             occurred_at: e.occurred_at.map(|d| d.to_rfc3339()),
             evidence: Vec::new(),
+            skipped: false,
+            skip_reason: None,
+            matched_id: None,
         }
     }
 }
@@ -244,6 +257,9 @@ impl From<axiom_engram::MemoryEntry> for MemoryResponse {
                 memory_id: e.memory_id.to_string(),
                 relationship: e.relationship,
             }).collect(),
+            skipped: false,
+            skip_reason: None,
+            matched_id: None,
         }
     }
 }
@@ -287,24 +303,37 @@ async fn capture(
             .map(|d| d.with_timezone(&chrono::Utc)).ok();
     }
 
-    vault.write(&engram).await.map_err(|e| errors::db_error(e))?;
+    // B1/B2: noise captures and duplicates don't produce a new row — report
+    // the outcome instead of pretending the memory was stored.
+    let outcome = vault.write(&engram).await.map_err(|e| errors::db_error(e))?;
+    match outcome {
+        WriteOutcome::NoiseSkipped { reason } => {
+            return Ok(Json(MemoryResponse {
+                skipped: true,
+                skip_reason: Some(reason),
+                matched_id: None,
+                ..engram.into()
+            }));
+        }
+        WriteOutcome::Duplicate { matched_id } => {
+            let matched = vault.get(&matched_id).await.map_err(|e| errors::db_error(e))?;
+            return Ok(Json(MemoryResponse {
+                skipped: true,
+                skip_reason: Some(format!("duplicate of {matched_id}")),
+                matched_id: Some(matched_id),
+                ..matched.into()
+            }));
+        }
+        WriteOutcome::Inserted => {}
+    }
     let saved = vault.get(&engram.id).await.map_err(|e| errors::db_error(e))?;
     // Write-through to QEM L1 cache
     let entry: axiom_engram::MemoryEntry = saved.clone().into();
     state.qem.populate_l1(&entry);
-    // Broadcast capture event to WebSocket clients
-    let snippet = if saved.content.len() > 120 {
-        // Use char-based truncation to avoid panicking on multi-byte UTF-8
-        format!("{}…", saved.content.chars().take(120).collect::<String>())
-    } else {
-        saved.content.clone()
-    };
+    // Broadcast capture event to WebSocket clients (full memory payload —
+    // the UI's live feed renders `msg.memory` directly)
     let _ = state.events_tx.send(LiveEvent::Capture {
-        memory_id: saved.id.clone(),
-        content_snippet: snippet,
-        layer: saved.layer.as_str().to_string(),
-        source: saved.source.as_str().to_string(),
-        tags: saved.tags.clone(),
+        memory: serde_json::to_value(&saved).unwrap_or_default(),
         timestamp: saved.created_at.to_rfc3339(),
     });
     Ok(Json(saved.into()))
@@ -502,6 +531,11 @@ async fn search(
         memory_results.retain(|m| m.strength >= min_s);
     }
 
+    // B7: quarantine filter — lets users review/restore noise-marked memories
+    if let Some(q) = query.quarantined {
+        memory_results.retain(|m| (m.imagined && !m.grounded) == q);
+    }
+
     // Apply sort if requested (default is relevance/recency from the query)
     if let Some(ref sort) = query.sort_by {
         match sort.as_str() {
@@ -572,6 +606,28 @@ async fn ground(
     let vault = state.vault.lock().await;
     let mut engram = vault.get(&id).await.map_err(|e| err_json(404, e.to_string()))?;
     engram.grounded = true;
+    vault.write(&engram).await.map_err(|e| err_json(500, e.to_string()))?;
+    let updated = vault.get(&id).await.map_err(|e| err_json(500, e.to_string()))?;
+    // Update QEM L1 cache
+    let entry: axiom_engram::MemoryEntry = updated.clone().into();
+    state.qem.populate_l1(&entry);
+    Ok(Json(updated.into()))
+}
+
+/// B7: mark a memory as noise — moves it to the imagined layer, clears
+/// grounded, and tags it "noise". Restore via the existing ground flow.
+async fn mark_noise(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<MemoryResponse>, (axum::http::StatusCode, Json<serde_json::Value>)> {
+    let vault = state.vault.lock().await;
+    let mut engram = vault.get(&id).await.map_err(|e| err_json(404, e.to_string()))?;
+    engram.imagined = true;
+    engram.grounded = false;
+    engram.layer = EngramLayer::Imagined;
+    if !engram.tags.iter().any(|t| t == "noise") {
+        engram.tags.push("noise".to_string());
+    }
     vault.write(&engram).await.map_err(|e| err_json(500, e.to_string()))?;
     let updated = vault.get(&id).await.map_err(|e| err_json(500, e.to_string()))?;
     // Update QEM L1 cache

@@ -411,9 +411,18 @@ pub async fn handle_capture(
         engram.project = Some(p);
     }
 
-    store.write(&engram).await?;
-    println!("✅ Memory captured: {}", engram.id);
-    println!("   {}", &engram.content.chars().take(80).collect::<String>());
+    match store.write(&engram).await? {
+        axiom_engram::WriteOutcome::Inserted => {
+            println!("✅ Memory captured: {}", engram.id);
+            println!("   {}", &engram.content.chars().take(80).collect::<String>());
+        }
+        axiom_engram::WriteOutcome::Duplicate { matched_id } => {
+            println!("♻ Duplicate of {matched_id} — strengthened instead");
+        }
+        axiom_engram::WriteOutcome::NoiseSkipped { reason } => {
+            println!("⏭ Skipped (noise: {reason})");
+        }
+    }
     Ok(())
 }
 

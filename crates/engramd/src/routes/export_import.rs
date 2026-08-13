@@ -174,7 +174,12 @@ async fn import_memories(
         engram.grounded = m.grounded;
 
         match vault.write(&engram).await {
-            Ok(_) => {
+            // Noise doesn't count as imported — the memory was not stored.
+            Ok(axiom_engram::WriteOutcome::NoiseSkipped { .. }) => skipped += 1,
+            // A duplicate means the content is already in the vault, so the
+            // import goal is met — but skip the QEM populate (the id wasn't written).
+            Ok(axiom_engram::WriteOutcome::Duplicate { .. }) => imported += 1,
+            Ok(axiom_engram::WriteOutcome::Inserted) => {
                 imported += 1;
                 // Populate QEM L1 cache
                 let entry: axiom_engram::MemoryEntry = engram.clone().into();

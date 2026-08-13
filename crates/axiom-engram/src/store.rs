@@ -24,10 +24,25 @@ use crate::schema::create_tables;
 use crate::{EngramError, Result};
 use chrono::{Datelike, Timelike, Utc};
 use rusqlite::params;
+use rusqlite::OptionalExtension;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+
+// ── Capture write outcome (B1/B2) ────────────────────────────────────────────
+
+/// Outcome of a capture write through the noise filter and dedupe.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WriteOutcome {
+    /// New row inserted (or an upsert of an existing id happened).
+    Inserted,
+    /// Content matched an existing memory by normalized hash; that memory
+    /// was strengthened instead of creating a new row.
+    Duplicate { matched_id: String },
+    /// Filtered as noise; nothing was written.
+    NoiseSkipped { reason: String },
+}
 
 // ── Vault key derivation ──────────────────────────────────────────────────────
 
@@ -56,7 +71,7 @@ fn derive_vault_key() -> String {
     let machine_id = read_machine_id();
     let input = format!("{}:{}", machine_id, APP_SALT);
     let hash = Sha256::digest(input.as_bytes());
-    hex::encode(hash)
+    crate::hex::encode(hash)
 }
 
 /// Legacy key derivation using DefaultHasher (SipHash-1-3).
@@ -151,10 +166,10 @@ fn derive_passphrase_key(passphrase: &str, salt_path: Option<&std::path::Path>) 
     // Extract the raw 32-byte hash for use as SQLCipher key
     hash.hash
         .as_ref()
-        .map(|h| hex::encode(h.as_bytes()))
+        .map(|h| crate::hex::encode(h.as_bytes()))
         .unwrap_or_else(|| {
             // Fallback: use the full hash string (should never happen)
-            hex::encode(hash.to_string().as_bytes())
+            crate::hex::encode(hash.to_string().as_bytes())
         })
 }
 
@@ -179,14 +194,7 @@ fn derive_passphrase_key_sha256(passphrase: &str) -> String {
     use sha2::{Digest, Sha256};
     let input = format!("{}:{}", passphrase, APP_SALT);
     let hash = Sha256::digest(input.as_bytes());
-    hex::encode(hash)
-}
-
-/// Converts bytes to hex string. Avoids pulling in the `hex` crate.
-mod hex {
-    pub fn encode(bytes: impl AsRef<[u8]>) -> String {
-        bytes.as_ref().iter().map(|b| format!("{:02x}", b)).collect()
-    }
+    crate::hex::encode(hash)
 }
 
 /// Read the platform hardware identifier used in key derivation.
@@ -431,59 +439,112 @@ impl EngramStore {
     /// Write engram (insert or update).  FTS index is kept in sync
     /// manually because the FTS 'delete' INSERT command is incompatible
     /// with SQLCipher's virtual-table handling.
-    pub async fn write(&self, engram: &Engram) -> Result<()> {
+    ///
+    /// Capture pipeline: noise filter (B1) → dedupe (B2) → auto-fill (B5) →
+    /// insert + FTS + embedding + links (B6). See [`WriteOutcome`] for the
+    /// three possible results.
+    pub async fn write(&self, engram: &Engram) -> Result<WriteOutcome> {
         self.write_inner(engram, None).await
     }
 
     /// Write an engram with an optional embedding vector.
     /// When `embedding` is provided (non-empty), it is stored in the
     /// `engram_embeddings` table for later vector search.
-    pub async fn write_with_embedding(&self, engram: &Engram, embedding: Option<&[f64]>) -> Result<()> {
+    pub async fn write_with_embedding(&self, engram: &Engram, embedding: Option<&[f64]>) -> Result<WriteOutcome> {
         self.write_inner(engram, embedding).await
     }
 
     /// Internal write implementation shared by `write` and `write_with_embedding`.
-    async fn write_inner(&self, engram: &Engram, embedding: Option<&[f64]>) -> Result<()> {
+    ///
+    /// Uses the raw connection handle only — the tokio Mutex is
+    /// non-reentrant, so calling typed `self.*` methods from here would
+    /// deadlock on the first capture.
+    async fn write_inner(&self, engram: &Engram, embedding: Option<&[f64]>) -> Result<WriteOutcome> {
         let conn = self.conn.lock().await;
-        let tags_json = serde_json::to_string(&engram.tags)?;
+
+        // B1: noise filter — only raw episodic capture streams are filtered;
+        // curated sources (consolidation, imagined, user notes, …) are exempt
+        // inside is_noise itself.
+        if engram.layer == EngramLayer::Episodic {
+            if let Some(reason) = crate::noise::is_noise(&engram.content, engram.source) {
+                Self::bump_metric(&conn, "noise_skips")?;
+                return Ok(WriteOutcome::NoiseSkipped { reason });
+            }
+        }
+
+        let hash = crate::noise::normalized_hash(&engram.content);
+
+        // B2: dedupe by normalized content hash. Self-exclusion is mandatory —
+        // ground/patch rewrites pass the same id and must not dedupe against
+        // themselves.
+        let duplicate: Option<String> = conn
+            .query_row(
+                "SELECT id FROM engrams WHERE content_hash = ?1 AND id != ?2 LIMIT 1",
+                params![hash, engram.id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(existing_id) = duplicate {
+            let now = Utc::now().to_rfc3339();
+            conn.execute(
+                "UPDATE engrams SET strength = MIN(2.0, strength + 0.1), last_retrieved = ?1 WHERE id = ?2",
+                params![now, existing_id],
+            )?;
+            Self::bump_metric(&conn, "dedup_saves")?;
+            return Ok(WriteOutcome::Duplicate { matched_id: existing_id });
+        }
+
+        // B5: auto-project + auto-tags on a local clone (never mutates the
+        // caller's engram; caller-supplied values win).
+        let mut filled = engram.clone();
+        if filled.project.is_none() {
+            filled.project = Self::extract_project(&filled.context);
+        }
+        if filled.tags.is_empty() {
+            filled.tags = Self::auto_tags(filled.source);
+        }
+        let tags_json = serde_json::to_string(&filled.tags)?;
 
         // Remove old FTS entry (regular DELETE works on normal FTS5 content tables)
         conn.execute(
             "DELETE FROM engrams_fts WHERE id = ?1",
-            rusqlite::params![engram.id],
+            rusqlite::params![filled.id],
         ).ok();
 
+        let tx = conn.unchecked_transaction()?;
+
         // Write engram row
-        conn.execute(
+        tx.execute(
             r#"INSERT INTO engrams
                (id, layer, source, privacy_level, content, context, strength, valence, retrievals,
                 imagined, grounded, created_at, last_retrieved, project, tags,
-                scope, content_type, occurred_at)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+                scope, content_type, occurred_at, content_hash)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
                ON CONFLICT(id) DO UPDATE SET
                 layer = ?2, source = ?3, privacy_level = ?4, content = ?5,
                 context = ?6, strength = ?7, valence = ?8, retrievals = ?9,
                 imagined = ?10, grounded = ?11, created_at = ?12,
                 last_retrieved = COALESCE(?13, engrams.last_retrieved),
                 project = ?14, tags = ?15, scope = ?16, content_type = ?17,
-                occurred_at = COALESCE(?18, engrams.occurred_at)"#,
+                occurred_at = COALESCE(?18, engrams.occurred_at),
+                content_hash = ?19"#,
             params![
-                engram.id, engram.layer.as_str(), engram.source.as_str(),
-                engram.privacy_level.as_str(),
-                engram.content, engram.context.to_string(), engram.strength,
-                engram.valence, engram.retrievals, engram.imagined as i32,
-                engram.grounded as i32, engram.created_at.to_rfc3339(),
-                engram.last_retrieved.map(|d| d.to_rfc3339()), engram.project, tags_json,
-                engram.scope, engram.content_type,
-                engram.occurred_at.map(|d| d.to_rfc3339()),
+                filled.id, filled.layer.as_str(), filled.source.as_str(),
+                filled.privacy_level.as_str(),
+                filled.content, filled.context.to_string(), filled.strength,
+                filled.valence, filled.retrievals, filled.imagined as i32,
+                filled.grounded as i32, filled.created_at.to_rfc3339(),
+                filled.last_retrieved.map(|d| d.to_rfc3339()), filled.project, tags_json,
+                filled.scope, filled.content_type,
+                filled.occurred_at.map(|d| d.to_rfc3339()), hash,
             ],
         )?;
 
         // Insert new FTS entry (using engrams row's rowid for alignment)
-        conn.execute(
+        tx.execute(
             "INSERT INTO engrams_fts(rowid, id, content) \
              SELECT e.rowid, e.id, e.content FROM engrams e WHERE e.id = ?1",
-            rusqlite::params![engram.id],
+            rusqlite::params![filled.id],
         )?;
 
         // Store embedding if provided (non-empty)
@@ -492,11 +553,138 @@ impl EngramStore {
                 let blob = embedding_to_blob(emb);
                 let dims = emb.len() as i64;
                 let now = Utc::now().to_rfc3339();
-                conn.execute(
+                tx.execute(
                     "INSERT OR REPLACE INTO engram_embeddings (engram_id, embedding, dimensions, created_at) VALUES (?1, ?2, ?3, ?4)",
-                    params![engram.id, blob, dims, now],
+                    params![filled.id, blob, dims, now],
                 )?;
             }
+        }
+
+        // B6: link generation (insert path only)
+        Self::generate_links(&tx, &filled)?;
+
+        tx.commit()?;
+
+        Ok(WriteOutcome::Inserted)
+    }
+
+    /// Increment an app-level counter (dedup saves, noise skips) in the
+    /// app_metrics table. Takes a raw connection handle — see write_inner.
+    fn bump_metric(conn: &rusqlite::Connection, key: &str) -> Result<()> {
+        conn.execute(
+            "INSERT INTO app_metrics (key, value) VALUES (?1, 1) \
+             ON CONFLICT(key) DO UPDATE SET value = value + 1",
+            params![key],
+        )?;
+        Ok(())
+    }
+
+    /// B5: derive a project name from capture context. Priority: last path
+    /// segment of `context.cwd`, then `context.repo`, then `context.project`.
+    fn extract_project(context: &serde_json::Value) -> Option<String> {
+        if let Some(cwd) = context.get("cwd").and_then(|v| v.as_str()) {
+            let last = cwd.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+            if !last.is_empty() && last != "." {
+                return Some(last.to_string());
+            }
+        }
+        for key in ["repo", "project"] {
+            if let Some(v) = context.get(key).and_then(|v| v.as_str()) {
+                let v = v.trim();
+                if !v.is_empty() {
+                    return Some(v.to_string());
+                }
+            }
+        }
+        None
+    }
+
+    /// B5: source-derived default tags applied when a capture arrives
+    /// untagged. Caller-supplied tags always win (checked in write_inner).
+    fn auto_tags(source: EngramSource) -> Vec<String> {
+        match source {
+            EngramSource::Window => vec!["terminal".into(), "window".into()],
+            EngramSource::Observation => vec!["auto".into()],
+            EngramSource::Chat => vec!["chat".into()],
+            EngramSource::Mic => vec!["voice".into()],
+            EngramSource::Agent => vec!["agent".into()],
+            EngramSource::AiSession => vec!["session".into()],
+            _ => Vec::new(),
+        }
+    }
+
+    /// B6: link a newly captured memory to its temporal predecessor (most
+    /// recent same-source memory, preferring the same session) and its best
+    /// associative neighbor (highest tag overlap among recent same-source
+    /// memories). Called on the insert path only, inside the write
+    /// transaction. Takes a raw connection handle — never routes through
+    /// `self.*` (see write_inner).
+    fn generate_links(conn: &rusqlite::Connection, engram: &Engram) -> Result<()> {
+        // Temporal: most recent same-source memory, preferring one from the
+        // same session (context.session_id) when present.
+        let temporal_prev: Option<String> = match engram.context.get("session_id").and_then(|v| v.as_str()) {
+            Some(sid) => {
+                let id_pattern = format!("%\"{}\"%", sid.replace('%', "").replace('_', ""));
+                conn.query_row(
+                    "SELECT id FROM engrams WHERE source = ?1 AND id != ?2 \
+                     AND context LIKE ?3 AND context LIKE ?4 \
+                     ORDER BY created_at DESC LIMIT 1",
+                    params![
+                        engram.source.as_str(), engram.id,
+                        "%\"session_id\"%", id_pattern,
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()?
+            }
+            None => conn
+                .query_row(
+                    "SELECT id FROM engrams WHERE source = ?1 AND id != ?2 ORDER BY created_at DESC LIMIT 1",
+                    params![engram.source.as_str(), engram.id],
+                    |row| row.get(0),
+                )
+                .optional()?,
+        };
+
+        if let Some(prev_id) = temporal_prev {
+            conn.execute(
+                "INSERT OR REPLACE INTO engram_links (source_id, target_id, weight, link_type) \
+                 VALUES (?1, ?2, 0.6, 'temporal')",
+                params![engram.id, prev_id],
+            )?;
+        }
+
+        // Associative: among the 20 most recent same-source memories, link
+        // the one with the highest tag overlap (weight = overlap ratio, min 0.4).
+        let candidates: Vec<(String, String)> = {
+            let mut stmt = conn.prepare(
+                "SELECT id, tags FROM engrams WHERE source = ?1 AND id != ?2 \
+                 ORDER BY created_at DESC LIMIT 20",
+            )?;
+            let rows = stmt.query_map(params![engram.source.as_str(), engram.id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            rows.filter_map(|r| r.ok()).collect()
+        };
+
+        let mut best: Option<(String, f64)> = None;
+        for (id, tags_json) in candidates {
+            let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
+            if tags.is_empty() || engram.tags.is_empty() {
+                continue;
+            }
+            let overlap = engram.tags.iter().filter(|t| tags.contains(t)).count() as f64;
+            let ratio = overlap / engram.tags.len() as f64;
+            if ratio >= 0.4 && best.as_ref().map(|(_, w)| ratio > *w).unwrap_or(true) {
+                best = Some((id, ratio));
+            }
+        }
+        if let Some((target, weight)) = best {
+            conn.execute(
+                "INSERT OR REPLACE INTO engram_links (source_id, target_id, weight, link_type) \
+                 VALUES (?1, ?2, ?3, 'associative')",
+                params![engram.id, target, weight],
+            )?;
         }
 
         Ok(())
@@ -1874,8 +2062,8 @@ mod tests {
     #[tokio::test]
     async fn test_count_and_list() {
         let (store, _dir) = test_store().await;
-        store.write(&make_engram("one")).await.unwrap();
-        store.write(&make_engram("two")).await.unwrap();
+        store.write(&make_engram("first memory")).await.unwrap();
+        store.write(&make_engram("second memory")).await.unwrap();
         assert_eq!(store.count().await.unwrap(), 2);
         let list = store.list(10, 0).await.unwrap();
         assert_eq!(list.len(), 2);
@@ -1894,8 +2082,8 @@ mod tests {
     #[tokio::test]
     async fn test_link_and_get_links() {
         let (store, _dir) = test_store().await;
-        let a = make_engram("alpha");
-        let b = make_engram("beta");
+        let a = make_engram("alpha memory");
+        let b = make_engram("beta memory");
         let aid = a.id.clone();
         let bid = b.id.clone();
         store.write(&a).await.unwrap();
@@ -1911,9 +2099,9 @@ mod tests {
     #[tokio::test]
     async fn test_search_related() {
         let (store, _dir) = test_store().await;
-        let a = make_engram("source");
-        let b = make_engram("related");
-        let c = make_engram("unrelated");
+        let a = make_engram("source memory");
+        let b = make_engram("related memory");
+        let c = make_engram("unrelated memory");
         let aid = a.id.clone();
         let bid = b.id.clone();
         store.write(&a).await.unwrap();
@@ -1922,16 +2110,16 @@ mod tests {
         store.link(&aid, &bid, 0.9, LinkType::Causal).await.unwrap();
         let related = store.search_related(&aid, 10).await.unwrap();
         assert_eq!(related.len(), 1);
-        assert_eq!(related[0].content, "related");
+        assert_eq!(related[0].content, "related memory");
     }
 
     #[tokio::test]
     async fn test_link_types() {
         let (store, _dir) = test_store().await;
-        let a = make_engram("a");
-        let b = make_engram("b");
-        let c = make_engram("c");
-        let d = make_engram("d");
+        let a = make_engram("memory a");
+        let b = make_engram("memory b");
+        let c = make_engram("memory c");
+        let d = make_engram("memory d");
         let (aid, bid, cid, did) = (a.id.clone(), b.id.clone(), c.id.clone(), d.id.clone());
         for e in [&a, &b, &c, &d] { store.write(e).await.unwrap(); }
         store.link(&aid, &bid, 0.5, LinkType::Associative).await.unwrap();
@@ -2024,5 +2212,158 @@ mod tests {
         assert_eq!(fetched.links[0].target_id, bid);
         assert!((fetched.links[0].weight - 0.75).abs() < 1e-9);
         assert_eq!(fetched.links[0].link_type, LinkType::Causal);
+    }
+
+    // ── B1/B2/B5/B6: noise filter, dedupe, auto-fill, link generation ─────────
+
+    #[tokio::test]
+    async fn test_noise_capture_is_skipped() {
+        let (store, _dir) = test_store().await;
+        let outcome = store.write(&make_engram("ls")).await.unwrap();
+        assert!(matches!(outcome, WriteOutcome::NoiseSkipped { .. }));
+        assert_eq!(store.count().await.unwrap(), 0, "noise must not be stored");
+    }
+
+    #[tokio::test]
+    async fn test_curated_sources_bypass_noise_filter() {
+        let (store, _dir) = test_store().await;
+        // Episodic layer + a curated source: the filter is consulted but
+        // exempts the source, so the write proceeds.
+        let mut e = make_engram("ls");
+        e.source = EngramSource::Consolidation;
+        assert_eq!(store.write(&e).await.unwrap(), WriteOutcome::Inserted);
+    }
+
+    #[tokio::test]
+    async fn test_duplicate_capture_strengthens_existing() {
+        let (store, _dir) = test_store().await;
+        let a = make_engram("dedupe target content here");
+        let b = make_engram("dedupe target content here");
+        let aid = a.id.clone();
+        assert_eq!(store.write(&a).await.unwrap(), WriteOutcome::Inserted);
+        assert_eq!(
+            store.write(&b).await.unwrap(),
+            WriteOutcome::Duplicate { matched_id: aid.clone() }
+        );
+        assert_eq!(store.count().await.unwrap(), 1, "no new row for duplicate");
+        let strengthened = store.get(&aid).await.unwrap();
+        assert!(strengthened.strength > 1.0, "duplicate should strengthen, got {}", strengthened.strength);
+    }
+
+    #[tokio::test]
+    async fn test_duplicate_normalizes_whitespace_and_prefixes() {
+        let (store, _dir) = test_store().await;
+        let a = make_engram("[12] [10:00:00] [/x] cargo check passed");
+        let b = make_engram("  [99] [/y] Cargo   Check Passed ");
+        let aid = a.id.clone();
+        store.write(&a).await.unwrap();
+        assert!(matches!(
+            store.write(&b).await.unwrap(),
+            WriteOutcome::Duplicate { matched_id } if matched_id == aid
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_same_id_is_not_duplicate() {
+        let (store, _dir) = test_store().await;
+        let mut e = make_engram("rewrite me once");
+        let id = e.id.clone();
+        assert_eq!(store.write(&e).await.unwrap(), WriteOutcome::Inserted);
+        e.strength = 0.5;
+        // Same id + same content → upsert, not dedupe (self-exclusion)
+        assert_eq!(store.write(&e).await.unwrap(), WriteOutcome::Inserted);
+        assert_eq!(store.get(&id).await.unwrap().strength, 0.5);
+    }
+
+    #[tokio::test]
+    async fn test_auto_tags_and_project_from_context() {
+        let (store, _dir) = test_store().await;
+        let e = Engram::new_episodic(
+            "worked on the engram deploy".to_string(),
+            EngramSource::Window,
+            serde_json::json!({"cwd": "/home/e/engram"}),
+        );
+        let id = e.id.clone();
+        store.write(&e).await.unwrap();
+        let got = store.get(&id).await.unwrap();
+        assert_eq!(got.project.as_deref(), Some("engram"));
+        assert!(got.tags.iter().any(|t| t == "terminal"), "got tags {:?}", got.tags);
+    }
+
+    #[tokio::test]
+    async fn test_caller_tags_and_project_win() {
+        let (store, _dir) = test_store().await;
+        let mut e = Engram::new_episodic(
+            "deployed the site".to_string(),
+            EngramSource::Window,
+            serde_json::json!({"cwd": "/home/e/other"}),
+        );
+        e.project = Some("engram".into());
+        e.tags = vec!["deploy".into()];
+        let id = e.id.clone();
+        store.write(&e).await.unwrap();
+        let got = store.get(&id).await.unwrap();
+        assert_eq!(got.project.as_deref(), Some("engram"));
+        assert_eq!(got.tags, vec!["deploy"]);
+    }
+
+    #[tokio::test]
+    async fn test_write_generates_temporal_link() {
+        let (store, _dir) = test_store().await;
+        let a = make_engram("first capture in this series");
+        let b = make_engram("second capture in this series");
+        let aid = a.id.clone();
+        let bid = b.id.clone();
+        store.write(&a).await.unwrap();
+        store.write(&b).await.unwrap();
+        let links = store.get_links(&bid).await.unwrap();
+        assert_eq!(links.len(), 1, "temporal link to predecessor expected");
+        assert_eq!(links[0].target_id, aid);
+        assert_eq!(links[0].link_type, LinkType::Temporal);
+    }
+
+    #[tokio::test]
+    async fn test_write_generates_associative_link() {
+        let (store, _dir) = test_store().await;
+        let mut a = Engram::new_episodic(
+            "worked on the dashboard deploy".to_string(),
+            EngramSource::Window,
+            serde_json::json!({}),
+        );
+        a.tags = vec!["deploy".into(), "dashboard".into()];
+        let mut b = Engram::new_episodic(
+            "fixed the dashboard styling".to_string(),
+            EngramSource::Window,
+            serde_json::json!({}),
+        );
+        b.tags = vec!["dashboard".into(), "ui".into()];
+        let aid = a.id.clone();
+        let bid = b.id.clone();
+        store.write(&a).await.unwrap();
+        store.write(&b).await.unwrap();
+        // b has overlap 1/2 = 0.5 ≥ 0.4 with a → associative link (b→a)
+        let links = store.get_links(&bid).await.unwrap();
+        let assoc = links.iter().find(|l| l.link_type == LinkType::Associative);
+        assert!(assoc.is_some(), "expected associative link, got {:?}", links);
+        assert_eq!(assoc.unwrap().target_id, aid);
+    }
+
+    #[tokio::test]
+    async fn test_app_metrics_counters() {
+        let (store, _dir) = test_store().await;
+        store.write(&make_engram("ls")).await.unwrap();
+        let dup = make_engram("unique content here");
+        store.write(&dup).await.unwrap();
+        store.write(&make_engram("unique content here")).await.unwrap();
+
+        let conn = store.conn().await;
+        let noise: i64 = conn
+            .query_row("SELECT value FROM app_metrics WHERE key = 'noise_skips'", [], |r| r.get(0))
+            .unwrap();
+        let dedup: i64 = conn
+            .query_row("SELECT value FROM app_metrics WHERE key = 'dedup_saves'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(noise, 1);
+        assert_eq!(dedup, 1);
     }
 }

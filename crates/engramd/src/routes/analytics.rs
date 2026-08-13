@@ -184,7 +184,23 @@ async fn co2(
     // Count retrievals (each retrieval saves ~context_window tokens)
     let total_retrievals: i64 = conn
         .query_row(
-            "SELECT COALESCE(SUM(retrieval_count), 0) FROM engrams",
+            "SELECT COALESCE(SUM(retrievals), 0) FROM engrams",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+
+    // Capture-pipeline counters (schema v4 app_metrics table)
+    let deduped_saves: i64 = conn
+        .query_row(
+            "SELECT COALESCE(SUM(value), 0) FROM app_metrics WHERE key = 'dedup_saves'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let noise_skips: i64 = conn
+        .query_row(
+            "SELECT COALESCE(SUM(value), 0) FROM app_metrics WHERE key = 'noise_skips'",
             [],
             |r| r.get(0),
         )
@@ -199,6 +215,8 @@ async fn co2(
     Ok(Json(serde_json::json!({
         "total_captures": total_captures,
         "total_retrievals": total_retrievals,
+        "deduped_saves": deduped_saves,
+        "noise_skips": noise_skips,
         "estimated_tokens_saved": estimated_tokens_saved,
         "estimated_co2_grams": estimated_co2_grams,
         "co2_constant_g_per_1k_tokens": 0.4,

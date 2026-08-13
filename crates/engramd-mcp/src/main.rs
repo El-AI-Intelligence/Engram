@@ -385,7 +385,7 @@ impl McpServer {
     async fn decay(&self) -> Result<Value, String> {
         let resp = self
             .http
-            .post(format!("{}/consolidation/run", self.engramd_url))
+            .post(format!("{}/consolidate/decay", self.engramd_url))
             .json(&json!({"mode": "decay_only"}))
             .send()
             .await

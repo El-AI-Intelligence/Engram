@@ -22,7 +22,8 @@ pub fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
             created_at      TEXT NOT NULL,
             last_retrieved  TEXT,
             project         TEXT,
-            tags            TEXT
+            tags            TEXT,
+            content_hash    TEXT
         );
 
         CREATE TABLE IF NOT EXISTS engram_links (
@@ -66,8 +67,15 @@ pub fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_engrams_source ON engrams(source);
         CREATE INDEX IF NOT EXISTS idx_engrams_created_at ON engrams(created_at);
         CREATE INDEX IF NOT EXISTS idx_engrams_imagined ON engrams(imagined);
+        CREATE INDEX IF NOT EXISTS idx_engrams_content_hash ON engrams(content_hash);
         CREATE INDEX IF NOT EXISTS idx_engram_links_source ON engram_links(source_id);
         CREATE INDEX IF NOT EXISTS idx_engram_links_target ON engram_links(target_id);
+
+        -- App-level counters (dedupe saves, noise skips) — schema v4
+        CREATE TABLE IF NOT EXISTS app_metrics (
+            key     TEXT PRIMARY KEY,
+            value   INTEGER NOT NULL
+        );
 
         -- Semantic embeddings for vector search
         CREATE TABLE IF NOT EXISTS engram_embeddings (
@@ -129,7 +137,7 @@ pub fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
 /// Apply schema migrations for columns added after the initial release.
 ///
 /// Current schema version. Increment this when adding new migrations below.
-const CURRENT_SCHEMA_VERSION: i32 = 3;
+const CURRENT_SCHEMA_VERSION: i32 = 4;
 
 /// Versioned schema migrations using SQLite's `PRAGMA user_version`.
 ///
@@ -146,6 +154,7 @@ const CURRENT_SCHEMA_VERSION: i32 = 3;
 ///   v0 → v1: Added scope, content_type, occurred_at columns (2026-08-09)
 ///   v1 → v2: Fixed FTS5 content_rowid mismatch — engrams uses TEXT PK, not INTEGER PK (2026-08-11)
 ///   v2 → v3: Added ai-session, ai-tool to source CHECK constraint (2026-08-11)
+///   v3 → v4: Added content_hash for capture dedupe + app_metrics counters (2026-08-13)
 #[allow(clippy::needless_return)]
 pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     let version: i32 = conn.query_row(
@@ -278,15 +287,23 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
                     last_retrieved  TEXT,
                     project         TEXT,
                     tags            TEXT,
+                    content_hash    TEXT,
                     scope           TEXT NOT NULL DEFAULT 'moment',
                     content_type    TEXT NOT NULL DEFAULT 'text',
                     occurred_at     TEXT
                 );"
             )?;
 
-            // 2. Copy data from old table
+            // 2. Copy data from old table (explicit columns — the new table
+            // has content_hash, which is backfilled by the v4 migration)
             conn.execute_batch(
-                "INSERT INTO engrams_v3 SELECT * FROM engrams;"
+                "INSERT INTO engrams_v3 \
+                 (id, layer, source, privacy_level, content, context, strength, \
+                  valence, retrievals, imagined, grounded, created_at, last_retrieved, \
+                  project, tags, scope, content_type, occurred_at) \
+                 SELECT id, layer, source, privacy_level, content, context, strength, \
+                  valence, retrievals, imagined, grounded, created_at, last_retrieved, \
+                  project, tags, scope, content_type, occurred_at FROM engrams;"
             )?;
 
             // 3. Drop old table (FKs disabled so no cascade) and rename
@@ -323,6 +340,66 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
 
         // Propagate any error from the migration
         result?;
+    }
+
+    // v4: content_hash for capture dedupe + app_metrics counters.
+    //
+    // Deliberately NOT gated on `version < 4`: the v1/v2/v3 blocks above all
+    // stamp `user_version = CURRENT_SCHEMA_VERSION` (now 4), so an older
+    // vault that crashed mid-migration would look like it completed v4 while
+    // lacking content_hash. Instead this block is an idempotent "ensure"
+    // (has_column guard + IF NOT EXISTS + NULL-only backfill) that is safe
+    // to run on every open.
+    {
+        conn.execute_batch("BEGIN")?;
+
+        let has_column = |name: &str| -> rusqlite::Result<bool> {
+            let mut stmt = conn.prepare("PRAGMA table_info('engrams')")?;
+            let exists = stmt
+                .query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .any(|col| col == name);
+            Ok(exists)
+        };
+
+        if !has_column("content_hash")? {
+            conn.execute(
+                "ALTER TABLE engrams ADD COLUMN content_hash TEXT",
+                [],
+            )?;
+        }
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_engrams_content_hash ON engrams(content_hash);"
+        )?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS app_metrics (key TEXT PRIMARY KEY, value INTEGER NOT NULL);"
+        )?;
+
+        // Backfill hashes for rows that predate v4 so dedupe works
+        // retroactively. MUST match the runtime normalization
+        // (crate::noise::normalized_hash) or post-migration dedupe misses.
+        let pending: Vec<(String, String)> = {
+            let mut stmt = conn
+                .prepare("SELECT id, content FROM engrams WHERE content_hash IS NULL")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            rows.filter_map(|r| r.ok()).collect()
+        };
+        for (id, content) in pending {
+            let hash = crate::noise::normalized_hash(&content);
+            conn.execute(
+                "UPDATE engrams SET content_hash = ?1 WHERE id = ?2",
+                rusqlite::params![hash, id],
+            )?;
+        }
+
+        conn.execute(
+            &format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"),
+            [],
+        )?;
+        conn.execute_batch("COMMIT")?;
     }
 
     Ok(())

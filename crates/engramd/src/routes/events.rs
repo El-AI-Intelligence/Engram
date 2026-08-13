@@ -57,12 +57,14 @@ async fn handle_socket(socket: WebSocket, state: AppState, filter: EventsFilter)
         while let Ok(event) = rx.recv().await {
             // Apply filters
             match &event {
-                LiveEvent::Capture { layer, source, .. } => {
+                LiveEvent::Capture { memory, .. } => {
+                    let layer = memory.get("layer").and_then(|v| v.as_str());
+                    let source = memory.get("source").and_then(|v| v.as_str());
                     if let Some(ref fl) = filter.layer {
-                        if layer != fl { continue; }
+                        if layer != Some(fl.as_str()) { continue; }
                     }
                     if let Some(ref fs) = filter.source {
-                        if source != fs { continue; }
+                        if source != Some(fs.as_str()) { continue; }
                     }
                 }
                 // Decay/consolidation always pass through (no layer/source to filter)

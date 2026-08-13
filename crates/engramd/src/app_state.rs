@@ -13,11 +13,10 @@ use axiom_engram::embed::Embedder;
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum LiveEvent {
     Capture {
-        memory_id: String,
-        content_snippet: String,
-        layer: String,
-        source: String,
-        tags: Vec<String>,
+        /// The full serialized memory (an Engram as JSON), so clients can
+        /// render the event without a follow-up fetch. The UI's WS handler
+        /// keys on `msg.memory`.
+        memory: serde_json::Value,
         timestamp: String,
     },
     Decay {

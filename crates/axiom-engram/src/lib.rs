@@ -25,10 +25,12 @@ pub mod entry;
 pub mod r#trait;
 pub mod qem;
 pub mod embed;
+pub mod noise;
 
 pub use engram::{Engram, EngramLayer, EngramSource, EngramLink, PrivacyLevel, CoherenceState, CharacterTopology, Goal, GoalStatus, ConsolidationRun, LinkType};
 pub use store::EngramStore;
 pub use store::TemporalPattern;
+pub use store::WriteOutcome;
 pub use schema::create_tables;
 pub use schema::migrate;
 pub use entry::{MemoryEntry, MemoryId, MemoryLayer, MemoryScope, ContentType, MemorySource, MemoryLink, EvidenceRef};
@@ -39,6 +41,13 @@ pub use embed::{Embedder, NoopEmbedder, should_embed, generate_embeddings_batch}
 #[cfg(feature = "onnx-embed")]
 pub use embed::OnnxEmbedder;
 pub use thiserror::Error;
+
+/// Local hex encoding — deliberately avoids pulling in the `hex` crate.
+pub(crate) mod hex {
+    pub fn encode(bytes: impl AsRef<[u8]>) -> String {
+        bytes.as_ref().iter().map(|b| format!("{:02x}", b)).collect()
+    }
+}
 
 #[derive(Error, Debug)]
 pub enum EngramError {
