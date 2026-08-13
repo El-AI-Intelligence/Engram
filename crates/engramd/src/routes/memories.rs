@@ -438,10 +438,14 @@ async fn search(
             .ok_or_else(|| errors::bad_request(code::INVALID_LAYER, format!("Unknown memory layer: {layer_str}. Valid layers: episodic, semantic, imagined")))?;
         vault.search_by_layer_filtered(layer, limit, quarantine_filter).await.map_err(|e| errors::db_error(e))?
     } else if let Some(ref content_query) = query.query {
-        if content_query.trim().is_empty() && !use_vector {
-            return Err(errors::bad_request(code::CONTENT_EMPTY, "Search query cannot be empty"));
-        }
-        if use_fts5 && !content_query.trim().is_empty() {
+        // An empty query string means "browse": the UI sends query:'' for
+        // unfiltered views (Explorer's initial state, Graph's loadGraph).
+        // Fall through to the list path instead of erroring or returning
+        // zero results.
+        if content_query.trim().is_empty() {
+            search_type = "list".into();
+            vault.list_filtered(limit, offset, quarantine_filter).await.map_err(|e| errors::db_error(e))?
+        } else if use_fts5 {
             search_type = "fts5".into();
             vault.search_by_content_filtered(content_query, limit, quarantine_filter).await.map_err(|e| errors::db_error(e))?
         } else {
