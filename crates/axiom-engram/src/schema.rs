@@ -84,8 +84,8 @@ pub fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
         CREATE TABLE IF NOT EXISTS engram_embeddings (
             engram_id    TEXT PRIMARY KEY REFERENCES engrams(id) ON DELETE CASCADE,
             embedding    BLOB NOT NULL,  -- serialized f64 vector
-            model        TEXT NOT NULL DEFAULT 'text-embedding-3-small',
-            dimensions   INTEGER NOT NULL DEFAULT 1536,
+            model        TEXT NOT NULL DEFAULT 'all-MiniLM-L6-v2',
+            dimensions   INTEGER NOT NULL DEFAULT 384,
             created_at  TEXT NOT NULL
         );
 

@@ -478,14 +478,20 @@ impl EngramStore {
     /// insert + FTS + embedding + links (B6). See [`WriteOutcome`] for the
     /// three possible results.
     pub async fn write(&self, engram: &Engram) -> Result<WriteOutcome> {
-        self.write_inner(engram, None, true).await
+        self.write_inner(engram, None, None, true).await
     }
 
     /// Write an engram with an optional embedding vector.
     /// When `embedding` is provided (non-empty), it is stored in the
-    /// `engram_embeddings` table for later vector search.
-    pub async fn write_with_embedding(&self, engram: &Engram, embedding: Option<&[f64]>) -> Result<WriteOutcome> {
-        self.write_inner(engram, embedding, true).await
+    /// `engram_embeddings` table for later vector search. `model` names the
+    /// embedder that produced the vector (stored for provenance).
+    pub async fn write_with_embedding(
+        &self,
+        engram: &Engram,
+        embedding: Option<&[f64]>,
+        model: Option<&str>,
+    ) -> Result<WriteOutcome> {
+        self.write_inner(engram, embedding, model, true).await
     }
 
     /// Write an already-stored memory verbatim, bypassing the capture-pipeline
@@ -497,7 +503,7 @@ impl EngramStore {
     /// gate returns `Duplicate` and skips the write). Callers are route
     /// handlers acting on an id the user already reviewed.
     pub async fn write_curated(&self, engram: &Engram) -> Result<WriteOutcome> {
-        self.write_inner(engram, None, false).await
+        self.write_inner(engram, None, None, false).await
     }
 
     /// Internal write implementation shared by `write` and `write_with_embedding`.
@@ -505,7 +511,13 @@ impl EngramStore {
     /// Uses the raw connection handle only — the tokio Mutex is
     /// non-reentrant, so calling typed `self.*` methods from here would
     /// deadlock on the first capture.
-    async fn write_inner(&self, engram: &Engram, embedding: Option<&[f64]>, gates: bool) -> Result<WriteOutcome> {
+    async fn write_inner(
+        &self,
+        engram: &Engram,
+        embedding: Option<&[f64]>,
+        model: Option<&str>,
+        gates: bool,
+    ) -> Result<WriteOutcome> {
         let conn = self.conn.lock().await;
 
         // B1: noise filter — only raw episodic capture streams are filtered;
@@ -603,9 +615,10 @@ impl EngramStore {
                 let blob = embedding_to_blob(emb);
                 let dims = emb.len() as i64;
                 let now = Utc::now().to_rfc3339();
+                let model_name = model.unwrap_or("unknown");
                 tx.execute(
-                    "INSERT OR REPLACE INTO engram_embeddings (engram_id, embedding, dimensions, created_at) VALUES (?1, ?2, ?3, ?4)",
-                    params![filled.id, blob, dims, now],
+                    "INSERT OR REPLACE INTO engram_embeddings (engram_id, embedding, model, dimensions, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![filled.id, blob, model_name, dims, now],
                 )?;
             }
         }

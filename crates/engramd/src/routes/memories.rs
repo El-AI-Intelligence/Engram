@@ -1,7 +1,7 @@
 use crate::errors::{self, code};
 use crate::routes::err_json;
 use crate::{AppState, LiveEvent};
-use axiom_engram::{Engram, EngramLayer, EngramSource, EngramLink, WriteOutcome, QuarantineFilter};
+use axiom_engram::{Engram, EngramLayer, EngramSource, EngramLink, WriteOutcome, QuarantineFilter, should_embed};
 use axum::{
     extract::{Path, Query, State},
     routing::{get, post},
@@ -73,19 +73,19 @@ struct SearchQuery {
     /// When provided and an embedder is configured, performs semantic search.
     #[serde(default)]
     vector_query: Option<String>,
-    /// Search mode: "fts5" (default), "vector", or "hybrid".
+    /// Search mode: "fts5", "vector", "hybrid", or "auto" (default).
     /// - fts5: keyword-based full-text search only
     /// - vector: semantic similarity search only
     /// - hybrid: merge both, weighted 0.6 vector + 0.4 FTS5
-    #[serde(default = "default_search_mode")]
-    search_mode: String,
+    /// - auto: hybrid when an embedder is active, else fts5 — the UI sends no
+    ///   search_mode, so auto makes semantic recall work out of the box.
+    #[serde(default)]
+    search_mode: Option<String>,
     /// B7: filter to quarantined memories (imagined && !grounded) when Some(true),
     /// exclude them when Some(false), no filter when None.
     #[serde(default)]
     quarantined: Option<bool>,
 }
-
-fn default_search_mode() -> String { "fts5".to_string() }
 
 fn default_limit() -> usize { 20 }
 
@@ -317,9 +317,34 @@ async fn capture(
         }));
     }
 
+    // Semantic recall: embed semantic-layer memories with substantial content
+    // at capture time so vector/hybrid search has something to rank against.
+    // Computed before the write — `write_inner` never mutates content, and
+    // the embedding lands in the same transaction as the row.
+    let embedder_dims = state.embedder.as_ref().map(|e| e.dimensions()).unwrap_or(0);
+    let mut embedding: Option<Vec<f64>> = None;
+    if should_embed(layer.as_str(), &engram.content, embedder_dims) {
+        if let Some(ref embedder) = state.embedder {
+            match embedder.embed(&engram.content).await {
+                Ok(emb) if !emb.is_empty() => embedding = Some(emb),
+                Ok(_) => {}
+                Err(e) => tracing::warn!("Embedding generation failed for capture: {e}"),
+            }
+        }
+    }
+
     // B1/B2: noise captures and duplicates don't produce a new row — report
     // the outcome instead of pretending the memory was stored.
-    let outcome = vault.write(&engram).await.map_err(|e| errors::db_error(e))?;
+    let outcome = match &embedding {
+        Some(emb) => {
+            let model = state.embedder.as_ref()
+                .map(|e| e.model_name().to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            vault.write_with_embedding(&engram, Some(emb), Some(&model))
+                .await.map_err(|e| errors::db_error(e))?
+        }
+        None => vault.write(&engram).await.map_err(|e| errors::db_error(e))?,
+    };
     match outcome {
         WriteOutcome::NoiseSkipped { reason } => {
             return Ok(Json(MemoryResponse {
@@ -381,8 +406,17 @@ async fn search(
     let _is_layer_search = query.layer.is_some();
     let _is_content_search = query.query.as_ref().map(|q| !q.trim().is_empty()).unwrap_or(false);
     let _is_tag_search = query.tags.as_ref().map(|t| !t.is_empty()).unwrap_or(false);
-    let use_vector = query.search_mode == "vector" || query.search_mode == "hybrid";
-    let use_fts5 = query.search_mode == "fts5" || query.search_mode == "hybrid";
+    // Effective mode: "auto" resolves to hybrid when an embedder is active
+    // (the UI sends no search_mode — semantic recall works out of the box
+    // once the model loads), otherwise fts5. Explicit modes pass through.
+    let embedder_active = state.embedder.as_ref().map(|e| e.dimensions() > 0).unwrap_or(false);
+    let effective_mode = match query.search_mode.as_deref().unwrap_or("auto") {
+        "auto" if embedder_active => "hybrid",
+        "auto" => "fts5",
+        m => m,
+    };
+    let use_vector = effective_mode == "vector" || effective_mode == "hybrid";
+    let use_fts5 = effective_mode == "fts5" || effective_mode == "hybrid";
 
     let mut search_type = String::from("list");
     let mut scored: std::collections::HashMap<String, (Engram, f64)> = std::collections::HashMap::new();
@@ -439,13 +473,13 @@ async fn search(
                     Ok(embedding) if !embedding.is_empty() => {
                         match vault.vector_search(&embedding, limit).await {
                             Ok(vector_results) => {
-                                if search_type == "list" || search_type == "fts5" && query.search_mode == "vector" {
+                                if search_type == "list" || search_type == "fts5" && effective_mode == "vector" {
                                     search_type = "vector".into();
-                                } else if query.search_mode == "hybrid" {
+                                } else if effective_mode == "hybrid" {
                                     search_type = "hybrid".into();
                                 }
-                                let vector_weight: f64 = if query.search_mode == "hybrid" { 0.6 } else { 1.0 };
-                                let fts5_weight: f64 = if query.search_mode == "hybrid" { 0.4 } else { 0.0 };
+                                let vector_weight: f64 = if effective_mode == "hybrid" { 0.6 } else { 1.0 };
+                                let fts5_weight: f64 = if effective_mode == "hybrid" { 0.4 } else { 0.0 };
 
                                 for (e, sim) in vector_results {
                                     let score = sim as f64 * vector_weight;
@@ -460,7 +494,7 @@ async fn search(
                                 }
 
                                 // Re-weight existing FTS5 results for hybrid mode
-                                if query.search_mode == "hybrid" {
+                                if effective_mode == "hybrid" {
                                     for (_, (_, s)) in scored.iter_mut() {
                                         *s *= fts5_weight;
                                     }

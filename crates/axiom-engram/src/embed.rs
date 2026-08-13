@@ -75,12 +75,12 @@ pub struct OnnxEmbedder {
     model_name: String,
     /// The loaded BERT model + tokenizer, wrapped in a Mutex for lazy init.
     inner: std::sync::Mutex<Option<CandleBert>>,
-    /// Whether initialization was attempted (to avoid retry spam).
-    init_attempted: std::sync::atomic::AtomicBool,
+    /// Time of the last failed init attempt (for retry backoff).
+    last_failure: std::sync::Mutex<Option<std::time::Instant>>,
 }
 
 // SAFETY: dimensions is only written once (during lazy init, protected by Mutex)
-// and reads are always after the Mutex acquisition or after checking init_attempted.
+// and reads are always after the Mutex acquisition or after checking last_failure.
 #[cfg(feature = "onnx-embed")]
 unsafe impl Send for OnnxEmbedder {}
 #[cfg(feature = "onnx-embed")]
@@ -111,7 +111,7 @@ impl OnnxEmbedder {
             dimensions: std::cell::UnsafeCell::new(0),
             model_name: Self::MODEL_ID.to_string(),
             inner: std::sync::Mutex::new(None),
-            init_attempted: std::sync::atomic::AtomicBool::new(false),
+            last_failure: std::sync::Mutex::new(None),
         }
     }
 
@@ -122,11 +122,29 @@ impl OnnxEmbedder {
             return Ok(());
         }
 
-        // If we already tried and failed, don't retry
-        if self.init_attempted.swap(true, std::sync::atomic::Ordering::SeqCst) {
-            return Err("Embedder initialization already failed; not retrying".to_string());
+        // Retry backoff: a transient failure (no network, OOM) shouldn't
+        // permanently disable embeddings for the process lifetime. Quiet
+        // between attempts, warn once per attempt.
+        const RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
+        if let Some(last) = *self.last_failure.lock().unwrap() {
+            if last.elapsed() < RETRY_BACKOFF {
+                return Err("embedder unavailable (retry pending)".to_string());
+            }
         }
 
+        match self.load_model() {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                tracing::warn!(error = %e, "Embedder init failed; retrying in 60s");
+                *self.last_failure.lock().unwrap() = Some(std::time::Instant::now());
+                Err(e)
+            }
+        }
+    }
+
+    /// Download (if needed) and load the model. Returns Err on any failure;
+    /// the caller applies the retry backoff.
+    fn load_model(&self) -> Result<(), String> {
         let model_dir = Self::model_dir()?;
         let config_path = model_dir.join("config.json");
         let tokenizer_path = model_dir.join("tokenizer.json");
