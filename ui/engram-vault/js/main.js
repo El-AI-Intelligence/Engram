@@ -440,7 +440,7 @@ route('/', async () => {
   if (!stats) {
     app.innerHTML = `<div class="error-panel">
       <h2>Cannot reach engramd</h2>
-      <p>Make sure <code>python3 server.py</code> is running on port 8787.</p>
+      <p>Make sure <code>engramd</code> is running on port 8787.</p>
     </div>`;
     return;
   }
@@ -461,13 +461,13 @@ route('/', async () => {
   const total = stats.total ?? stats.total_memories ?? 0;
   const layerPct = (n) => total ? ((n / total) * 100).toFixed(1) : 0;
 
-  const days = activity?.days || [];
-  const tokensToday = days.length
-    ? (days[days.length - 1].tokens_saved || 0)
-    : (co2?.daily?.length ? co2.daily[co2.daily.length - 1].tokens_saved || 0 : 0);
-  const tokensSpark = days.map(d => d.tokens_saved || 0);
-  const co2TotalG = co2?.co2_grams_total ?? activity?.totals?.co2_grams ?? 0;
-  const co2Spark = days.map(d => d.co2_grams || 0);
+  // /analytics/activity returns { activity: [{day, count}], days: N } —
+  // per-day tokens/CO2 are not tracked, so the sparks show capture counts.
+  const days = Array.isArray(activity?.activity) ? activity.activity : [];
+  const tokensSaved = co2?.estimated_tokens_saved || 0;
+  const tokensSpark = days.map(d => d.count || 0);
+  const co2TotalG = co2?.estimated_co2_grams || 0;
+  const co2Spark = []; // no per-day CO2 metric — card shows dedupe savings instead
 
   const atRisk = sample.filter(m => (m.strength ?? 1) < 0.3).length;
 
@@ -490,14 +490,14 @@ route('/', async () => {
           <div class="stat-sub">${qemStatus(health)} · ${formatBytes(health?.db_size_bytes || stats.db_size_bytes || 0)}</div>
         </div>
         <div class="stat-card">
-          <div class="stat-num">${tokensToday.toLocaleString()}</div>
-          <div class="stat-label">Tokens saved today</div>
+          <div class="stat-num">${tokensSaved.toLocaleString()}</div>
+          <div class="stat-label">Tokens saved (est.)</div>
           ${sparkline(tokensSpark)}
         </div>
         <div class="stat-card">
           <div class="stat-num">${(co2TotalG / 1000).toFixed(1)}<span class="stat-unit">kg</span></div>
           <div class="stat-label">CO₂ avoided (cumulative)</div>
-          ${sparkline(co2Spark)}
+          <div class="stat-sub">${(co2?.deduped_saves || 0).toLocaleString()} duplicate saves · ${(co2?.noise_skips || 0).toLocaleString()} noise skips</div>
         </div>
         <div class="stat-card">
           <div class="stat-num">${atRisk}</div>
@@ -635,23 +635,20 @@ route('/stats', async () => {
   try { activity = await api.analytics.activity(30); } catch (e) { activity = null; }
   try { stats = await api.stats(); } catch (e) { stats = null; }
 
-  const days = activity?.days || [];
-  const totals = activity?.totals || {};
-  const co2G = co2?.co2_grams_total ?? totals.co2_grams ?? 0;
-  const tokensTotal = co2?.tokens_saved_total ?? totals.tokens_saved ?? 0;
+  // /analytics/activity returns { activity: [{day, count}], days: N } — count
+  // is captures; per-day tokens/CO2/retrievals are not tracked by the API.
+  const days = (Array.isArray(activity?.activity) ? activity.activity : [])
+    .map(d => ({ day: d.day, captures: d.count || 0, retrievals: 0 }));
+  const co2G = co2?.estimated_co2_grams || 0;
+  const tokensTotal = co2?.estimated_tokens_saved || 0;
   const co2Kg = co2G / 1000;
   const miles = co2G / 404; // 404 g CO₂ per driving mile
-  const co2Spark = days.map(d => d.co2_grams || 0);
-
-  // Token savings: 30-day average from the activity window, projected to a year
-  const windowTokens = totals.tokens_saved ?? (co2?.daily || []).reduce((s, d) => s + (d.tokens_saved || 0), 0);
-  const dailyAvg = days.length ? windowTokens / days.length : 0;
-  const projectedAnnual = dailyAvg * 365;
+  const co2Spark = []; // no per-day CO2 metric
 
   // Dedup impact: duplicates prevented × avg tokens saved per capture
   const deduped = co2?.deduped_saves || 0;
-  const captures = totals.captures || 0;
-  const perCapture = captures ? (totals.tokens_saved || 0) / captures : 0;
+  const captures = co2?.total_captures || 0;
+  const perCapture = captures ? tokensTotal / captures : 0;
   const dedupTokens = Math.round(deduped * perCapture);
 
   app.innerHTML = `
@@ -676,12 +673,14 @@ route('/stats', async () => {
           <div class="stat-label">Tokens saved (cumulative)</div>
         </div>
         <div class="stat-card">
-          <div class="stat-num">${Math.round(dailyAvg).toLocaleString()}</div>
-          <div class="stat-label">Daily average (30d)</div>
+          <div class="stat-num">${captures.toLocaleString()}</div>
+          <div class="stat-label">Captures</div>
+          <div class="stat-sub">${(co2?.total_retrievals || 0).toLocaleString()} retrievals</div>
         </div>
         <div class="stat-card">
-          <div class="stat-num">${Math.round(projectedAnnual).toLocaleString()}</div>
-          <div class="stat-label">Projected annual savings</div>
+          <div class="stat-num">${stats?.qem_hit_rate ? (stats.qem_hit_rate * 100).toFixed(1) + '%' : '—'}</div>
+          <div class="stat-label">QEM hit rate</div>
+          <div class="stat-sub">holographic L1 cache</div>
         </div>
       </div>
 
@@ -691,7 +690,6 @@ route('/stats', async () => {
           ${activityChart(days)}
           <div class="chart-legend">
             <span><span class="lg-dot" style="background:var(--episodic)"></span> Captures</span>
-            <span><span class="lg-dot" style="background:var(--semantic)"></span> Retrievals</span>
           </div>
         </div>
       </div>
@@ -1819,6 +1817,10 @@ route('/settings', async () => {
       document.getElementById('ss-notify').checked = false;
       toast('Search saved', 'ok');
       loadSavedSearches();
+    } catch (e) {
+      toast('Could not save search', 'err');
+    }
+  };
 
   updateStatus();
 });
