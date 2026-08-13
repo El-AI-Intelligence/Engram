@@ -72,6 +72,10 @@
     display: flex; align-items: center; gap: 8px;
   }
   .nav-brand .gem { font-size: 1.4rem; color: var(--accent2); }
+  .nav-brand .by {
+    font-size: 0.8rem; font-weight: 500; color: var(--fg3);
+    margin-left: 6px; padding-left: 10px; border-left: 1px solid var(--border);
+  }
   .nav-links { display: flex; gap: 24px; align-items: center; }
   .nav-links a { color: var(--fg2); font-weight: 500; font-size: 0.95rem; }
   .nav-links a:hover { color: var(--fg); text-decoration: none; }
@@ -257,7 +261,7 @@
 
 <!-- ── Navigation ──────────────────────────────────────────────────── -->
 <nav class="nav">
-  <a class="nav-brand" href="#"><span class="gem">◆</span> Engram</a>
+  <a class="nav-brand" href="#"><span class="gem">◆</span> Engram <span class="by">by <a href="https://elai-intelligence.com" target="_blank" rel="noopener">El AI Intelligence</a></span></a>
   <div class="nav-links">
     <a href="#how" class="hide-sm">How it works</a>
     <a href="#science" class="hide-sm">Science</a>
@@ -289,8 +293,8 @@
       Engram is a local-first memory vault, built for AI agents today.
       But the problem it solves — what to keep, what to strengthen, and
       what to forget — is far older than AI.
-      Capture once, recall forever — with Ebbinghaus decay,
-      holographic caching, and zero-trust E2E sync.
+      Capture once, recall forever — with Ebbinghaus decay and
+      holographic caching.
     </p>
     <div class="hero-buttons">
       <a href="https://github.com/El-AI-Intelligence/engram#readme" class="btn btn-primary btn-lg" target="_blank" rel="noopener">
@@ -503,7 +507,7 @@
         </tr>
         <tr>
           <td>E2E encrypted sync</td>
-          <td class="check">✓ Zero-trust</td>
+          <td class="cross">🔜 Roadmap</td>
           <td class="cross">✗</td>
           <td class="cross">✗</td>
           <td class="cross">✗</td>
@@ -542,7 +546,7 @@
       Built with Rust. Runs on your machine. Your memories, your key.
     </p>
     <p style="color:var(--fg2);">
-      Zero telemetry. No cloud required. The sync server never sees plaintext.
+      Zero telemetry. No cloud required. When sync ships, the relay never sees plaintext.
     </p>
     <div style="margin-top:24px;display:flex;gap:12px;justify-content:center;flex-wrap:wrap;">
       <a href="https://github.com/El-AI-Intelligence/engram" class="btn btn-outline" target="_blank" rel="noopener">GitHub</a>
@@ -557,9 +561,9 @@
   <div class="links">
     <a href="https://github.com/El-AI-Intelligence/engram" target="_blank" rel="noopener">GitHub</a>
     <a href="https://github.com/El-AI-Intelligence/engram/tree/main/docs/engram-product" target="_blank" rel="noopener">Docs</a>
-    <a href="https://discord.gg/ellm" target="_blank" rel="noopener">Discord</a>
+    <a href="mailto:Elai-intelligence@pm.me">Contact</a>
   </div>
-  <p>Engram — part of the <a href="https://github.com/El-AI-Intelligence/engram">Axiom OS</a> ecosystem. MIT Licensed.</p>
+  <p>Engram — built by <a href="https://elai-intelligence.com">El AI Intelligence</a> on the ELLM stack. MIT Licensed.</p>
   <p style="font-size:0.8rem;">"Forgetting is green. Remembering everything forever is computationally wasteful."</p>
 </footer>
 
