@@ -1064,12 +1064,15 @@ impl EngramStore {
             }
             // Tokenized AND query — natural-language questions must not be
             // treated as one exact phrase ("what did we decide about pricing"
-            // as a phrase matches nothing, ever). Each token is stripped to
-            // alphanumerics so shell/URL fragments can't break FTS5 syntax.
+            // as a phrase matches nothing, ever). Split on non-alphanumeric
+            // BOUNDARIES (not strip-then-concatenate): "SYNC-MARKER-1" must
+            // become [SYNC, MARKER, 1] to match FTS5's unicode61 tokenizer,
+            // which also splits on hyphens. Concatenating ("SYNCMARKER1")
+            // matches nothing in the index, ever.
             let tokens: Vec<String> = sanitized
-                .split_whitespace()
-                .map(|t| t.chars().filter(|c| c.is_alphanumeric()).collect::<String>())
+                .split(|c: char| !c.is_alphanumeric())
                 .filter(|t| !t.is_empty())
+                .map(String::from)
                 .collect();
             if tokens.is_empty() {
                 return Ok(Vec::new());
