@@ -359,19 +359,11 @@ async fn run_daemon(
     let (events_tx, _) = broadcast::channel::<LiveEvent>(256);
 
     // ── Embedding provider (zero-config ONNX, auto-downloads model) ──────
-    let embedder: Option<Arc<dyn Embedder>> = match axiom_engram::OnnxEmbedder::new() {
-        embedder if embedder.dimensions() > 0 => {
-            info!(model = embedder.model_name(), dims = embedder.dimensions(), "ONNX embedder ready");
-            Some(Arc::new(embedder))
-        }
-        embedder => {
-            // dimensions() == 0 means ONNX Runtime or model not available yet.
-            // Lazy init will try again on first embed() call. Keep the embedder
-            // in state so it can self-initialize later.
-            info!("ONNX embedder enqueued for lazy initialization (model will download on first use)");
-            Some(Arc::new(embedder))
-        }
-    };
+    // dimensions() reports the configured size (384) even before the model
+    // loads, so capture/search attempt embed() immediately; embed() lazy-loads
+    // the model on first use and applies retry backoff on failure.
+    let embedder: Option<Arc<dyn Embedder>> = Some(Arc::new(axiom_engram::OnnxEmbedder::new()));
+    info!("ONNX embedder enabled (MiniLM model loads lazily on first embed)");
 
     let state = AppState {
         vault: vault.clone(),

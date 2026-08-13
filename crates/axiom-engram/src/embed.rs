@@ -70,21 +70,12 @@ impl Embedder for NoopEmbedder {
 /// to returning empty vectors — the system operates in FTS5-only mode.
 #[cfg(feature = "onnx-embed")]
 pub struct OnnxEmbedder {
-    /// 0 = not loaded, MODEL_DIMENSIONS = loaded successfully.
-    dimensions: std::cell::UnsafeCell<usize>,
     model_name: String,
     /// The loaded BERT model + tokenizer, wrapped in a Mutex for lazy init.
     inner: std::sync::Mutex<Option<CandleBert>>,
     /// Time of the last failed init attempt (for retry backoff).
     last_failure: std::sync::Mutex<Option<std::time::Instant>>,
 }
-
-// SAFETY: dimensions is only written once (during lazy init, protected by Mutex)
-// and reads are always after the Mutex acquisition or after checking last_failure.
-#[cfg(feature = "onnx-embed")]
-unsafe impl Send for OnnxEmbedder {}
-#[cfg(feature = "onnx-embed")]
-unsafe impl Sync for OnnxEmbedder {}
 
 #[cfg(feature = "onnx-embed")]
 struct CandleBert {
@@ -108,7 +99,6 @@ impl OnnxEmbedder {
     /// `embed()` call — construction never blocks.
     pub fn new() -> Self {
         Self {
-            dimensions: std::cell::UnsafeCell::new(0),
             model_name: Self::MODEL_ID.to_string(),
             inner: std::sync::Mutex::new(None),
             last_failure: std::sync::Mutex::new(None),
@@ -117,8 +107,8 @@ impl OnnxEmbedder {
 
     /// Ensure the model and tokenizer are downloaded and loaded.
     fn ensure_loaded(&self) -> Result<(), String> {
-        // Fast path: already loaded (safe because reads are only false→true once)
-        if unsafe { *self.dimensions.get() } > 0 {
+        // Fast path: model already loaded
+        if self.inner.lock().unwrap().is_some() {
             return Ok(());
         }
 
@@ -204,11 +194,6 @@ impl OnnxEmbedder {
             tokenizer,
             device,
         });
-
-        // Mark as loaded (exclusive write, protected by the Mutex acquisition above)
-        unsafe {
-            *self.dimensions.get() = Self::MODEL_DIMENSIONS;
-        }
 
         Ok(())
     }
@@ -330,7 +315,11 @@ impl Embedder for OnnxEmbedder {
     }
 
     fn dimensions(&self) -> usize {
-        unsafe { *self.dimensions.get() }
+        // The embedder is always configured — the target dimensionality is
+        // known even before the model lazy-loads. Callers use dimensions() > 0
+        // to decide whether to attempt embed(); embed() itself loads the model
+        // on first use and returns Err (with retry backoff) if loading fails.
+        Self::MODEL_DIMENSIONS
     }
 
     fn model_name(&self) -> &str {
