@@ -118,6 +118,8 @@ async fn stats(
         "last_consolidation": last_consolidation,
         "last_decay": last_decay,
         "qem_hit_rate": state.qem.hit_rate(),
+        "qem_hits": state.qem.hits(),
+        "qem_misses": state.qem.misses(),
         "qem_cache_entries": state.qem.cache_size(),
         "db_size_bytes": state.vault_path.join("engrams.db")
             .metadata()

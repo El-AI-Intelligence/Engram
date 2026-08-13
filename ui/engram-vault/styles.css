@@ -760,6 +760,24 @@ select, .filter-select {
 
 .input-sm { width: 84px; }
 
+/* Toggle pill (explorer quarantine filter) */
+.pill-toggle {
+  padding: 6px 12px;
+  font-size: 13px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-panel);
+  color: var(--text);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.pill-toggle:hover { border-color: var(--quarantined); }
+.pill-toggle.active {
+  background: rgba(139, 92, 246, 0.14);
+  border-color: var(--quarantined);
+  color: var(--quarantined);
+}
+
 input[type="range"] {
   -webkit-appearance: none;
   appearance: none;

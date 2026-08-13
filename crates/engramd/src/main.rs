@@ -28,6 +28,7 @@ use tracing_subscriber::EnvFilter;
 
 use axiom_engram::{EngramStore, EngramStoreAdapter, QemCache, QemConfig};
 use axiom_engram::embed::Embedder;
+use axiom_inference::InferenceProvider;
 
 // ── Top-level CLI ──────────────────────────────────────────────────────────
 
@@ -175,6 +176,81 @@ fn load_schedule_interval(vault_path: &std::path::Path) -> u64 {
     86400 // default: 24 hours
 }
 
+/// Read `qem.warm_strength_min` from config.json, falling back to the
+/// in-code default (0.3) if the config is missing or unparseable.
+fn load_qem_config(vault_path: &std::path::Path) -> QemConfig {
+    let mut config = QemConfig::default();
+    let config_path = vault_path.join("config.json");
+    if let Ok(data) = std::fs::read_to_string(&config_path) {
+        if let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&data) {
+            if let Some(min) = cfg
+                .get("qem")
+                .and_then(|q| q.get("warm_strength_min"))
+                .and_then(|v| v.as_f64())
+            {
+                config.warm_strength_min = min.clamp(0.0, 1.0);
+            }
+        }
+    }
+    config
+}
+
+/// Build the optional local LLM provider for narrative consolidation.
+///
+/// Only the `ollama:<model>` form of `summarization.llm` is accepted, and the
+/// base URL is always hardcoded to localhost — local-first is a hard
+/// constraint, so cloud URLs and env-var configs are rejected with a warning.
+/// `None` → the narratives endpoint uses the deterministic heuristic
+/// summarizer instead.
+fn load_inference_provider(vault_path: &std::path::Path) -> Option<Arc<dyn InferenceProvider>> {
+    let config_path = vault_path.join("config.json");
+    let data = std::fs::read_to_string(&config_path).ok()?;
+    let cfg: serde_json::Value = serde_json::from_str(&data).ok()?;
+    let llm = cfg.get("summarization")?.get("llm")?.as_str()?;
+
+    let Some(model) = llm.strip_prefix("ollama:") else {
+        tracing::warn!(%llm, "summarization.llm rejected — only local `ollama:<model>` is supported; narratives will use the heuristic summarizer");
+        return None;
+    };
+    if model.trim().is_empty() {
+        tracing::warn!("summarization.llm has an empty model name — narratives will use the heuristic summarizer");
+        return None;
+    }
+
+    let config = axiom_inference::InferenceConfig {
+        base_url: "http://localhost:11434/v1".into(),
+        api_key: String::new(),
+        model: model.to_string(),
+        ..Default::default()
+    };
+    info!(model, "Local Ollama inference enabled for narrative consolidation");
+    Some(config.build())
+}
+
+/// Read the consolidation schedule + auto-consolidation gate from config.json.
+/// Returns (interval_secs, auto_consolidation). Interval is clamped to
+/// 1 hour – 7 days; defaults to 24h / enabled.
+fn load_consolidation_schedule(vault_path: &std::path::Path) -> (u64, bool) {
+    let config_path = vault_path.join("config.json");
+    if let Ok(data) = std::fs::read_to_string(&config_path) {
+        if let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&data) {
+            let auto = cfg
+                .get("schedule")
+                .and_then(|s| s.get("auto_consolidation"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let hours = cfg
+                .get("schedule")
+                .and_then(|s| s.get("consolidation_interval_hours"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(24);
+            let secs = (hours * 3600).clamp(3600, 604_800);
+            return (secs, auto);
+        }
+    }
+    (86400, true)
+}
+
 // ── CORS ────────────────────────────────────────────────────────────────────
 
 /// Build a CORS layer that allows localhost origins (the daemon binds loopback,
@@ -240,7 +316,7 @@ async fn run_daemon(
 
     // ── Warm QEM L1 cache from L2 ──────────────────────────────────────────
     let adapter = EngramStoreAdapter::new(vault.clone());
-    let qem = QemCache::new(adapter, QemConfig::default());
+    let qem = QemCache::new(adapter, load_qem_config(&vault_path));
     info!("Warming QEM L1 cache from vault...");
     if let Err(e) = qem.warm().await {
         tracing::warn!(error = %e, "QEM warm failed (non-fatal, cache starts cold)");
@@ -278,11 +354,18 @@ async fn run_daemon(
         events_tx,
         device_id: device_id.clone(),
         embedder,
+        inference: load_inference_provider(&vault_path),
     };
 
     // ── Background scheduler ──────────────────────────────────────────────
     let bg_state = state.clone();
     tokio::spawn(async move { background_scheduler(bg_state).await });
+
+    // ── Background consolidator ───────────────────────────────────────────
+    // Weekly consolidation on its own schedule. LLM narratives are NEVER
+    // triggered from here — narrative synthesis stays manual-only.
+    let bg_state = state.clone();
+    tokio::spawn(async move { background_consolidator(bg_state).await });
 
     // ── Sync loop (if enabled via config) ──────────────────────────────────
     let sync_config_path = vault_path.join("config.json");
@@ -475,6 +558,54 @@ async fn background_scheduler(state: AppState) {
             let _ = state.events_tx.send(LiveEvent::Decay {
                 strengthened: daily_strengthened as usize,
                 decayed: daily_decayed as usize,
+                timestamp: chrono::Utc::now().to_rfc3339(),
+            });
+        }
+    }
+}
+
+/// Background task: runs weekly consolidation on a configurable schedule.
+///
+/// Reads `schedule.consolidation_interval_hours` and the
+/// `schedule.auto_consolidation` gate from config.json. When the gate is off
+/// the task exits without doing anything. LLM narratives are never triggered
+/// from here — they stay manual (POST /consolidate/narratives).
+async fn background_consolidator(state: AppState) {
+    let (interval_secs, auto) = load_consolidation_schedule(&state.vault_path);
+    if !auto {
+        info!("Auto-consolidation disabled by config — background consolidator not running");
+        return;
+    }
+
+    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(interval_secs));
+    // Suppress the immediate first tick — consolidating on startup is
+    // aggressive and can conflict with vault warm-up.
+    interval.tick().await;
+    loop {
+        interval.tick().await;
+        let vault = state.vault.lock().await;
+        let (promoted, pruned) = match vault.apply_weekly_consolidation().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(error = %e, "Background consolidation failed — engrams not consolidated");
+                continue;
+            }
+        };
+        // Record the run so /analytics/stats and /consolidate/history reflect it
+        let run = axiom_engram::ConsolidationRun {
+            id: format!("weekly_{}", chrono::Utc::now().timestamp_millis()),
+            run_at: chrono::Utc::now(),
+            episodes_processed: Some((promoted + pruned) as i32),
+            semantics_created: Some(promoted),
+            engrams_decayed: None,
+            notes: Some(format!("Weekly consolidation (scheduled): promoted {}, pruned {}", promoted, pruned)),
+        };
+        let _ = vault.record_consolidation_run(&run).await;
+        if promoted + pruned > 0 {
+            info!(promoted, pruned, "Weekly consolidation (scheduled)");
+            let _ = state.events_tx.send(LiveEvent::Consolidation {
+                promoted: promoted as usize,
+                pruned: pruned as usize,
                 timestamp: chrono::Utc::now().to_rfc3339(),
             });
         }

@@ -490,7 +490,12 @@ async fn search(
                 }
             }
 
-            if !assoc_memory_ids.is_empty() {
+            // Account the L1 probes we just made. The REST route reads the
+            // vault directly (not through QemCache::search), so without this
+            // the hit counters stay structurally 0. Captured before the
+            // consuming loop below moves the Vec.
+            let qem_hit = !assoc_memory_ids.is_empty();
+            if qem_hit {
                 // Fetch the full engrams for QEM hits
                 for mid in assoc_memory_ids {
                     if let Ok(engram) = vault.get(&mid).await {
@@ -511,6 +516,8 @@ async fn search(
                     format!("{}+qem_associative", search_type)
                 };
             }
+
+            state.qem.record_lookup(qem_hit);
         }
     }
 

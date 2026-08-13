@@ -57,6 +57,7 @@ const api = {
     links: (id) => get('/memories/' + id + '/links'),
     related: (id, limit = 10) => get('/memories/' + id + '/related?limit=' + limit),
     ground: (id) => post('/memories/' + id + '/ground'),
+    markNoise: (id) => post('/memories/' + id + '/mark-noise'),
     delete: (id) => fetch(API + '/memories/' + id, { method: 'DELETE' }),
     annotations: (id) => get('/memories/' + id + '/annotations'),
     annotate: (id, content) => post('/memories/' + id + '/annotations', { content }),
@@ -380,7 +381,7 @@ async function updateStatus() {
     el.innerHTML = `
       <span class="status-item ok">● Connected</span>
       <span class="status-item">${h.memories_total || 0} memories</span>
-      <span class="status-item">QEM ${Math.round((h.qem_hit_rate || 0) * 100)}%</span>
+      <span class="status-item">${qemStatus(h)}</span>
       <span class="status-item">${formatBytes(h.db_size_bytes || 0)}</span>
       <span class="status-item ok">Encrypted ✓</span>`;
   } catch (e) {
@@ -393,6 +394,17 @@ function formatBytes(b) {
   if (b < 1024) return b + ' B';
   if (b < 1024 * 1024) return (b / 1024).toFixed(1) + ' KB';
   return (b / (1024 * 1024)).toFixed(1) + ' MB';
+}
+
+// QEM L1 status label: real hit rate only once lookups have happened;
+// otherwise "warm" (cache populated, no traffic yet) or "cold".
+function qemStatus(h) {
+  const hits = h?.qem_hits || 0;
+  const misses = h?.qem_misses || 0;
+  const total = hits + misses;
+  if (total > 0) return `QEM ${Math.round((hits / total) * 100)}%`;
+  if ((h?.qem_cache_entries || 0) > 0) return 'QEM warm';
+  return 'QEM cold';
 }
 
 // ── Modal ─────────────────────────────────────────────────────────────────
@@ -475,7 +487,7 @@ route('/', async () => {
         <div class="stat-card">
           <div class="stat-num">${total.toLocaleString()}</div>
           <div class="stat-label">Total memories</div>
-          <div class="stat-sub">QEM ${Math.round((health?.qem_hit_rate || 0) * 100)}% · ${formatBytes(health?.db_size_bytes || stats.db_size_bytes || 0)}</div>
+          <div class="stat-sub">${qemStatus(health)} · ${formatBytes(health?.db_size_bytes || stats.db_size_bytes || 0)}</div>
         </div>
         <div class="stat-card">
           <div class="stat-num">${tokensToday.toLocaleString()}</div>
@@ -871,6 +883,7 @@ route('/memories', async () => {
           <option value="recency">Recency</option>
           <option value="valence">Valence</option>
         </select>
+        <button id="filter-quarantined" class="pill-toggle" title="Show only quarantined memories (imagined, not yet grounded)">⚠ Quarantined</button>
         <span class="faint" style="margin-left:auto;" id="result-count"></span>
       </div>
       <div id="explorer-results" class="explorer-results"></div>
@@ -881,9 +894,10 @@ route('/memories', async () => {
     const q = document.getElementById('search-input').value;
     const layer = document.getElementById('filter-layer').value;
     const sort = document.getElementById('filter-sort').value;
+    const qonly = document.getElementById('filter-quarantined').classList.contains('active');
     const results = document.getElementById('explorer-results');
     results.innerHTML = '<div class="loading-sm">Searching…</div>';
-    api.memories.search({ query: q, layer: layer || null, limit: 20 }).then(r => {
+    api.memories.search({ query: q, layer: layer || null, quarantined: qonly ? true : null, limit: 20 }).then(r => {
       const list = Array.isArray(r) ? r : (r.results || []);
       document.getElementById('result-count').textContent = `${list.length} results`;
       if (!list.length) {
@@ -904,6 +918,7 @@ route('/memories', async () => {
             ${m.links && m.links.length ? `<span class="faint">→ ${m.links.length} links</span>` : ''}
             ${notesBadge(m)}
             ${m.imagined && !m.grounded ? '<span class="badge badge-quarantined">⚠ quarantined</span>' : ''}
+            ${!m.imagined || m.grounded ? `<button class="btn btn-sm" data-action="mark-noise" data-id="${m.id}">Mark noise</button>` : ''}
           </div>
         </a>
       `).join('');
@@ -916,6 +931,22 @@ route('/memories', async () => {
   document.getElementById('search-input').onkeydown = (e) => { if (e.key === 'Enter') doSearch(); };
   document.getElementById('filter-layer').onchange = doSearch;
   document.getElementById('filter-sort').onchange = doSearch;
+  document.getElementById('filter-quarantined').onclick = () => {
+    document.getElementById('filter-quarantined').classList.toggle('active');
+    doSearch();
+  };
+
+  // CSP note: no inline handlers — mark-noise clicks are delegated here so
+  // the card anchor navigation doesn't fire.
+  document.getElementById('explorer-results').addEventListener('click', async (e) => {
+    const btn = e.target.closest('[data-action="mark-noise"]');
+    if (!btn) return;
+    e.preventDefault();
+    e.stopPropagation();
+    await api.memories.markNoise(btn.getAttribute('data-id'));
+    toast('Marked as noise — moved to quarantine', 'ok');
+    doSearch();
+  });
 
   doSearch();
   updateStatus();
@@ -984,7 +1015,9 @@ route('/memories/:id', async (id) => {
         </div>
         ${linksHtml}
         <div class="detail-actions">
-          ${m.imagined && !m.grounded ? '<button class="btn" id="btn-ground">Ground memory</button>' : ''}
+          ${m.imagined && !m.grounded
+            ? '<button class="btn" id="btn-ground">Ground memory</button>'
+            : '<button class="btn" id="btn-noise">Mark as noise</button>'}
           <button class="btn btn-danger" id="btn-delete">Delete</button>
         </div>
       </div>
@@ -994,6 +1027,12 @@ route('/memories/:id', async (id) => {
       document.getElementById('btn-ground').onclick = async () => {
         await api.memories.ground(id);
         toast('Memory grounded', 'ok');
+        render();
+      };
+    } else {
+      document.getElementById('btn-noise').onclick = async () => {
+        await api.memories.markNoise(id);
+        toast('Marked as noise — moved to quarantine', 'ok');
         render();
       };
     }

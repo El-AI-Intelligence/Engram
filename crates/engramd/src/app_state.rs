@@ -7,6 +7,7 @@ use tokio::sync::{broadcast, Mutex};
 
 use axiom_engram::{EngramStore, EngramStoreAdapter, QemCache};
 use axiom_engram::embed::Embedder;
+use axiom_inference::InferenceProvider;
 
 /// A live event broadcast to connected WebSocket clients.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -48,4 +49,9 @@ pub struct AppState {
     pub device_id: String,
     /// Optional embedding provider for vector search.
     pub embedder: Option<Arc<dyn Embedder>>,
+    /// Optional local-first LLM for narrative consolidation.
+    /// Only ever built from `summarization.llm = "ollama:<model>"` (localhost
+    /// Ollama); never from env vars or cloud config. `None` → the narratives
+    /// endpoint falls back to the deterministic heuristic summarizer.
+    pub inference: Option<Arc<dyn InferenceProvider>>,
 }

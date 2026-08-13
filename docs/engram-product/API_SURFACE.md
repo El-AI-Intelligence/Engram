@@ -16,7 +16,11 @@
 
 ---
 
-## 2. Authentication & Multi-tenancy
+## 2. Authentication
+
+Engram is a **single-user, single-vault** daemon. There is no user system, no
+JWT issuance, no `/auth/token` endpoint, and no admin API. Auth is exactly
+one mechanism, implemented in `crates/engramd/src/auth.rs`:
 
 ### 2.1 Local mode (default)
 
@@ -26,43 +30,32 @@ No auth. Listens on loopback only. Single-user vault.
 engramd                    # starts on 127.0.0.1:8787, no auth
 ```
 
-### 2.2 API key mode
+### 2.2 Bearer-token mode
 
-For remote access or multi-user deployments:
-
-```
-engramd --auth api-key --api-key-seed "abc123..."
-```
+When the `ENGRAMD_API_KEY` environment variable is set, **every route except
+`/health`** requires the header:
 
 ```
-POST /auth/token
-Authorization: Bearer engram_api_key_xxx
-
-→ { "token": "eyJ...", "expires_at": "..." }
+Authorization: Bearer <ENGRAMD_API_KEY>
 ```
 
-All subsequent requests: `Authorization: Bearer eyJ...`
+There is no token minting — the key is the one you set. Requests without the
+header (or with the wrong key) get `401 Unauthorized`. If the daemon binds to
+a non-loopback address without `ENGRAMD_API_KEY` set, startup is refused.
 
-### 2.3 Multi-tenancy
+### 2.3 Production deployment (engram.ellmstack.dev)
 
-Each API key maps to a vault namespace. Vaults are isolated SQLite databases:
+The daemon still binds loopback. A Caddy reverse proxy terminates TLS and
+enforces **HTTP Basic auth** on `/app` and the API. Caddy injects
+`Authorization: Bearer <ENGRAMD_API_KEY>` on upstream requests from the
+daemon's env file, so browsers authenticate once via Basic auth and the
+daemon sees its own Bearer key. Clients should never send the API key
+themselves.
 
-```
-~/.engram/vaults/
-  default/engrams.db
-  org_acme/engrams.db
-  user_alice/engrams.db
-```
+### 2.4 Multi-tenancy
 
-The vault is selected by API key at auth time. Admin keys can create/manage vaults:
-
-```
-POST /admin/vaults               # create vault
-GET  /admin/vaults               # list vaults
-DELETE /admin/vaults/:name       # delete vault
-POST /admin/vaults/:name/export  # export vault
-POST /admin/vaults/:name/rekey   # rotate encryption key
-```
+Not supported. One vault per daemon process; run multiple instances with
+different `ENGRAM_VAULT` paths if you need isolated vaults.
 
 ---
 

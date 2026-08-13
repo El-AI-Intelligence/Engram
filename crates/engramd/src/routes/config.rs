@@ -24,6 +24,8 @@ struct PersistedConfig {
     sync: SyncConfig,
     #[serde(default)]
     summarization: SummarizationConfig,
+    #[serde(default)]
+    qem: QemConfigSection,
 }
 
 impl Default for PersistedConfig {
@@ -34,7 +36,26 @@ impl Default for PersistedConfig {
             embedding: EmbeddingConfig::default(),
             sync: SyncConfig::default(),
             summarization: SummarizationConfig::default(),
+            qem: QemConfigSection::default(),
         }
+    }
+}
+
+/// L1 holographic cache tuning. Only `warm_strength_min` is exposed for now —
+/// the rest of the QemConfig fields keep their in-code defaults.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct QemConfigSection {
+    /// Minimum strength for entries loaded into L1 during startup warm.
+    /// Lower = warmer cache, higher = only strong memories cached.
+    #[serde(default = "default_qem_warm_strength_min")]
+    warm_strength_min: f64,
+}
+
+fn default_qem_warm_strength_min() -> f64 { 0.3 }
+
+impl Default for QemConfigSection {
+    fn default() -> Self {
+        Self { warm_strength_min: 0.3 }
     }
 }
 
@@ -172,6 +193,7 @@ struct PatchConfigBody {
     embedding: Option<EmbeddingConfig>,
     sync: Option<SyncConfig>,
     summarization: Option<SummarizationConfig>,
+    qem: Option<QemConfigSection>,
 }
 
 fn config_path(vault_path: &std::path::Path) -> std::path::PathBuf {
@@ -206,6 +228,7 @@ struct ConfigResponse {
     embedding: EmbeddingConfig,
     sync: SyncConfig,
     summarization: SummarizationConfig,
+    qem: QemConfigSection,
 }
 
 impl From<PersistedConfig> for ConfigResponse {
@@ -219,6 +242,7 @@ impl From<PersistedConfig> for ConfigResponse {
             embedding: c.embedding,
             sync: c.sync,
             summarization: c.summarization,
+            qem: c.qem,
         }
     }
 }
@@ -264,6 +288,9 @@ async fn patch_config(
     }
     if let Some(summarization) = body.summarization {
         config.summarization = summarization;
+    }
+    if let Some(qem) = body.qem {
+        config.qem = qem;
     }
     save_config(&state.vault_path, &config)
         .map_err(|e| {

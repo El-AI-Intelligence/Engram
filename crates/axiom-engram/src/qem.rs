@@ -307,6 +307,27 @@ impl<B: MemoryBackend> QemCache<B> {
         }
     }
 
+    /// Record a lookup result from a caller that does its own L1 probing
+    /// (e.g. the REST search route's `qem:` tag path) so hit/miss accounting
+    /// reflects reality instead of the structurally-0.0 it used to be.
+    pub fn record_lookup(&self, hit: bool) {
+        if hit {
+            *self.hits.write() += 1;
+        } else {
+            *self.misses.write() += 1;
+        }
+    }
+
+    /// Total L1 hits recorded.
+    pub fn hits(&self) -> u64 {
+        *self.hits.read()
+    }
+
+    /// Total L1 misses recorded.
+    pub fn misses(&self) -> u64 {
+        *self.misses.read()
+    }
+
     /// Number of entries currently in the L1 cache.
     pub fn cache_size(&self) -> usize {
         self.by_code.read().len()
@@ -695,6 +716,24 @@ mod tests {
         // Retrieve non-existent — miss
         let _ = cache.retrieve(&MemoryId::from_string("nonexistent")).await;
         assert!(cache.hit_rate() <= 1.0);
+    }
+
+    #[test]
+    fn test_record_lookup_counters() {
+        let backend = TestBackend::new();
+        let cache = QemCache::new(backend, QemConfig::default());
+
+        assert_eq!(cache.hits(), 0);
+        assert_eq!(cache.misses(), 0);
+        assert_eq!(cache.hit_rate(), 0.0);
+
+        cache.record_lookup(true);
+        cache.record_lookup(true);
+        cache.record_lookup(false);
+
+        assert_eq!(cache.hits(), 2);
+        assert_eq!(cache.misses(), 1);
+        assert!((cache.hit_rate() - 2.0 / 3.0).abs() < 1e-9);
     }
 
     #[tokio::test]

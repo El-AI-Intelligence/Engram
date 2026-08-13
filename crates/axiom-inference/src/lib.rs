@@ -1299,7 +1299,7 @@ mod tests {
     fn inference_config_default_uses_ollama() {
         let cfg = InferenceConfig::default();
         assert!(cfg.base_url.contains("11434"));
-        assert_eq!(cfg.model, "llama3.1:8b");
+        assert_eq!(cfg.model, "qwen2.5:14b");
     }
 
     #[test]

@@ -23,6 +23,8 @@ async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
         "uptime_secs": uptime,
         "memories_total": count,
         "qem_hit_rate": qem_hit_rate,
+        "qem_hits": state.qem.hits(),
+        "qem_misses": state.qem.misses(),
         "qem_cache_entries": qem_entries,
         "db_size_bytes": db_size,
     }))
