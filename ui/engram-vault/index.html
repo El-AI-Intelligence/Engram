@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<meta name="theme-color" content="#0b0f14">
+<meta name="description" content="ELLM Engram Memory Vault — browse, search and inspect agent memories.">
+<title>ELLM Engram Vault</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='13' font-size='13'>◆</text></svg>">
+</head>
+<body>
+<div id="api-banner" class="api-banner hidden">
+  ⚠ Cannot reach engramd at <code id="api-banner-url"></code> — showing cached shell. Retrying…
+</div>
+
+<header class="topbar">
+  <div class="topbar-row">
+    <a class="brand" href="#/"><span class="brand-gem">◆</span> ELLM <span class="brand-name">Engram Vault</span></a>
+    <div class="topbar-right">
+      <div class="vault-selector" title="Vault selector (decorative)">
+        <span class="vault-dot"></span> default <span class="chev">▾</span>
+      </div>
+      <button id="tour-btn" class="theme-toggle" title="Tour &amp; demo — how Engram works, load demo memories" aria-label="Open tour and demo">?</button>
+      <button id="theme-toggle" class="theme-toggle" title="Toggle light/dark theme" aria-label="Toggle light/dark theme">☀</button>
+      <a class="icon-btn" href="#/settings" title="Settings" aria-label="Settings">⚙</a>
+    </div>
+  </div>
+  <nav class="nav" id="main-nav">
+    <a href="#/" data-route="#/">Dashboard</a>
+    <a href="#/stats" data-route="#/stats">Stats</a>
+    <a href="#/tracker" data-route="#/tracker">Tracker</a>
+    <a href="#/memories" data-route="#/memories">Explorer</a>
+    <a href="#/graph" data-route="#/graph">Graph</a>
+    <a href="#/context" data-route="#/context">Context</a>
+    <a href="#/consolidation" data-route="#/consolidation">Consolidation</a>
+    <a href="#/tour" data-route="#/tour">Tour</a>
+  </nav>
+</header>
+
+<main id="app" class="app"><div class="loading">Loading…</div></main>
+
+<footer class="statusbar" id="statusbar">
+  <span class="status-item muted">connecting…</span>
+</footer>
+
+<div id="toast-root" class="toast-root"></div>
+<div id="modal-root"></div>
+
+<script type="module" src="js/main.js"></script>
+</body>
+</html>

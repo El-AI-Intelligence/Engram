@@ -1,0 +1,394 @@
+//! Embedding generation and storage utilities.
+//!
+//! This module provides the trait and helpers for generating embedding vectors
+//! from text. The actual embedding model (Ollama, OpenAI, llama.cpp) is provided
+//! by `axiom-inference::InferenceProvider`; this module defines the minimal
+//! interface that `EngramStore` needs without depending on the inference crate.
+//!
+//! ## Graceful degradation
+//!
+//! When no embedding provider is configured, `NoopEmbedder` returns empty vectors.
+//! All callers must handle empty embeddings (skip vector search, skip storage).
+
+use async_trait::async_trait;
+use std::path::PathBuf;
+
+/// A minimal trait for generating text embeddings.
+///
+/// Decoupled from `axiom-inference::InferenceProvider` so that `axiom-engram`
+/// does not need to depend on the inference crate. The `engramd` server wires
+/// the real provider at startup.
+#[async_trait]
+pub trait Embedder: Send + Sync {
+    /// Generate an embedding vector for the given text.
+    /// Returns the embedding dimensions and the vector.
+    /// Returns an empty vec if embedding is not available.
+    async fn embed(&self, text: &str) -> Result<Vec<f64>, String>;
+
+    /// The dimensionality of embeddings produced by this embedder.
+    /// Returns 0 if no embedder is configured.
+    fn dimensions(&self) -> usize;
+
+    /// The model name (for metadata stored alongside embeddings).
+    fn model_name(&self) -> &str;
+}
+
+/// An embedder that always returns empty vectors.
+///
+/// Used when no embedding provider is configured — the system operates
+/// in FTS5-only mode with graceful degradation.
+pub struct NoopEmbedder;
+
+#[async_trait]
+impl Embedder for NoopEmbedder {
+    async fn embed(&self, _text: &str) -> Result<Vec<f64>, String> {
+        Ok(Vec::new())
+    }
+
+    fn dimensions(&self) -> usize {
+        0
+    }
+
+    fn model_name(&self) -> &str {
+        "noop"
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Candle Embedder (feature-gated behind `onnx-embed`)
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// A zero-config embedding provider that runs a BERT model locally via `candle`.
+///
+/// Uses the all-MiniLM-L6-v2 model (384-dim, ~23 MB) from HuggingFace.
+/// The model weights and tokenizer are auto-downloaded on first use and cached
+/// in `~/.engram/models/all-MiniLM-L6-v2/`.
+///
+/// Candle is pure Rust — no C++ runtime, no ONNX Runtime shared library.
+/// If the model fails to load (no internet, OOM, etc.), the embedder falls back
+/// to returning empty vectors — the system operates in FTS5-only mode.
+#[cfg(feature = "onnx-embed")]
+pub struct OnnxEmbedder {
+    /// 0 = not loaded, MODEL_DIMENSIONS = loaded successfully.
+    dimensions: std::cell::UnsafeCell<usize>,
+    model_name: String,
+    /// The loaded BERT model + tokenizer, wrapped in a Mutex for lazy init.
+    inner: std::sync::Mutex<Option<CandleBert>>,
+    /// Whether initialization was attempted (to avoid retry spam).
+    init_attempted: std::sync::atomic::AtomicBool,
+}
+
+// SAFETY: dimensions is only written once (during lazy init, protected by Mutex)
+// and reads are always after the Mutex acquisition or after checking init_attempted.
+#[cfg(feature = "onnx-embed")]
+unsafe impl Send for OnnxEmbedder {}
+#[cfg(feature = "onnx-embed")]
+unsafe impl Sync for OnnxEmbedder {}
+
+#[cfg(feature = "onnx-embed")]
+struct CandleBert {
+    model: candle_transformers::models::bert::BertModel,
+    tokenizer: tokenizers::Tokenizer,
+    device: candle_core::Device,
+}
+
+#[cfg(feature = "onnx-embed")]
+impl OnnxEmbedder {
+    /// Model identifier on HuggingFace.
+    const MODEL_ID: &str = "sentence-transformers/all-MiniLM-L6-v2";
+    /// Embedding dimensionality for all-MiniLM-L6-v2.
+    const MODEL_DIMENSIONS: usize = 384;
+    /// Base directory for cached models.
+    const MODELS_DIR: &str = ".engram/models";
+    /// Maximum sequence length for tokenization.
+    const MAX_LENGTH: usize = 256;
+
+    /// Create a new embedder. The model is loaded lazily on the first
+    /// `embed()` call — construction never blocks.
+    pub fn new() -> Self {
+        Self {
+            dimensions: std::cell::UnsafeCell::new(0),
+            model_name: Self::MODEL_ID.to_string(),
+            inner: std::sync::Mutex::new(None),
+            init_attempted: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Ensure the model and tokenizer are downloaded and loaded.
+    fn ensure_loaded(&self) -> Result<(), String> {
+        // Fast path: already loaded (safe because reads are only false→true once)
+        if unsafe { *self.dimensions.get() } > 0 {
+            return Ok(());
+        }
+
+        // If we already tried and failed, don't retry
+        if self.init_attempted.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return Err("Embedder initialization already failed; not retrying".to_string());
+        }
+
+        let model_dir = Self::model_dir()?;
+        let config_path = model_dir.join("config.json");
+        let tokenizer_path = model_dir.join("tokenizer.json");
+        let weights_path = model_dir.join("model.safetensors");
+
+        // Download model files if missing
+        if !config_path.exists() || !tokenizer_path.exists() || !weights_path.exists() {
+            tracing::info!(
+                model_dir = %model_dir.display(),
+                model = Self::MODEL_ID,
+                "Downloading embedding model"
+            );
+            if let Err(e) = Self::download_model(&model_dir) {
+                tracing::warn!(error = %e, "Failed to download model; embeddings disabled");
+                return Err(e);
+            }
+        }
+
+        // Select device (CPU by default)
+        let device = candle_core::Device::Cpu;
+
+        // Load tokenizer
+        let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
+            .map_err(|e| format!("Failed to load tokenizer: {}", e))?;
+
+        // Load BERT model from safetensors
+        let vb = unsafe {
+            candle_nn::VarBuilder::from_mmaped_safetensors(
+                &[&weights_path],
+                candle_core::DType::F32,
+                &device,
+            )
+        }
+        .map_err(|e| format!("Failed to load model weights: {}", e))?;
+
+        let config: candle_transformers::models::bert::Config = {
+            let file = std::fs::File::open(&config_path)
+                .map_err(|e| format!("Failed to open config.json: {}", e))?;
+            serde_json::from_reader(file)
+                .map_err(|e| format!("Failed to parse config.json: {}", e))?
+        };
+
+        let model = candle_transformers::models::bert::BertModel::load(
+            vb,
+            &config,
+        )
+        .map_err(|e| format!("Failed to create BERT model: {}", e))?;
+
+        tracing::info!(
+            model = Self::MODEL_ID,
+            dims = Self::MODEL_DIMENSIONS,
+            "Embedding model loaded"
+        );
+
+        *self.inner.lock().unwrap() = Some(CandleBert {
+            model,
+            tokenizer,
+            device,
+        });
+
+        // Mark as loaded (exclusive write, protected by the Mutex acquisition above)
+        unsafe {
+            *self.dimensions.get() = Self::MODEL_DIMENSIONS;
+        }
+
+        Ok(())
+    }
+
+    /// Compute the model cache directory.
+    fn model_dir() -> Result<PathBuf, String> {
+        let home = dirs_fallback()
+            .ok_or_else(|| "Cannot determine home directory for model cache".to_string())?;
+        Ok(home
+            .join(Self::MODELS_DIR)
+            .join(Self::MODEL_ID.replace('/', "_")))
+    }
+
+    /// Download model files from HuggingFace using hf-hub.
+    fn download_model(model_dir: &PathBuf) -> Result<(), String> {
+        std::fs::create_dir_all(model_dir)
+            .map_err(|e| format!("Failed to create model directory: {}", e))?;
+
+        let api = hf_hub::api::sync::Api::new()
+            .map_err(|e| format!("Failed to create HuggingFace API client: {}", e))?;
+
+        let repo = api.model(Self::MODEL_ID.to_string());
+
+        // Download config.json
+        let config_path = repo.get("config.json")
+            .map_err(|e| format!("Failed to download config.json: {}", e))?;
+        std::fs::copy(&config_path, model_dir.join("config.json"))
+            .map_err(|e| format!("Failed to copy config.json: {}", e))?;
+
+        // Download tokenizer.json
+        let tokenizer_path = repo.get("tokenizer.json")
+            .map_err(|e| format!("Failed to download tokenizer.json: {}", e))?;
+        std::fs::copy(&tokenizer_path, model_dir.join("tokenizer.json"))
+            .map_err(|e| format!("Failed to copy tokenizer.json: {}", e))?;
+
+        // Download model.safetensors
+        let model_path = repo.get("model.safetensors")
+            .map_err(|e| format!("Failed to download model.safetensors: {}", e))?;
+        std::fs::copy(&model_path, model_dir.join("model.safetensors"))
+            .map_err(|e| format!("Failed to copy model.safetensors: {}", e))?;
+
+        tracing::info!(
+            model_dir = %model_dir.display(),
+            "Model files downloaded successfully"
+        );
+        Ok(())
+    }
+}
+
+#[cfg(feature = "onnx-embed")]
+#[async_trait]
+impl Embedder for OnnxEmbedder {
+    async fn embed(&self, text: &str) -> Result<Vec<f64>, String> {
+        // Lazy-init on first call
+        if let Err(e) = self.ensure_loaded() {
+            return Err(e);
+        }
+
+        let guard = self.inner.lock().unwrap();
+        let bert = guard
+            .as_ref()
+            .ok_or_else(|| "Model not initialized".to_string())?;
+
+        // Tokenize
+        let encoding = bert
+            .tokenizer
+            .encode(text, false)
+            .map_err(|e| format!("Tokenization failed: {}", e))?;
+
+        let token_ids: Vec<u32> = encoding.get_ids().to_vec();
+        let attention_mask: Vec<u32> = encoding.get_attention_mask().to_vec();
+        let seq_len = token_ids.len().min(Self::MAX_LENGTH);
+
+        // Create tensors
+        let input_ids = candle_core::Tensor::new(
+            &token_ids[..seq_len],
+            &bert.device,
+        )
+        .map_err(|e| format!("Failed to create input tensor: {}", e))?
+        .unsqueeze(0)
+        .map_err(|e| format!("Failed to unsqueeze: {}", e))?;
+
+        let attention_mask = candle_core::Tensor::new(
+            &attention_mask[..seq_len],
+            &bert.device,
+        )
+        .map_err(|e| format!("Failed to create mask tensor: {}", e))?
+        .unsqueeze(0)
+        .map_err(|e| format!("Failed to unsqueeze mask: {}", e))?;
+
+        // Build token_type_ids (all zeros for single-sentence input)
+        let token_type_ids = candle_core::Tensor::zeros(
+            (1, seq_len),
+            candle_core::DType::U32,
+            &bert.device,
+        )
+        .map_err(|e| format!("Failed to create token_type_ids: {}", e))?;
+
+        // Run BERT inference
+        let output = bert
+            .model
+            .forward(&input_ids, &attention_mask, Some(&token_type_ids))
+            .map_err(|e| format!("BERT inference failed: {}", e))?;
+
+        // Mean pooling over sequence dimension: average all token embeddings
+        // output shape: [1, seq_len, 384]
+        let pooled = output
+            .mean(1) // mean over dim 1 (sequence)
+            .map_err(|e| format!("Mean pooling failed: {}", e))?;
+
+        // Convert to Vec<f64>
+        let flat: Vec<f32> = pooled
+            .flatten_all()
+            .map_err(|e| format!("Flatten failed: {}", e))?
+            .to_vec1()
+            .map_err(|e| format!("to_vec1 failed: {}", e))?;
+
+        Ok(flat.into_iter().map(|v| v as f64).collect())
+    }
+
+    fn dimensions(&self) -> usize {
+        unsafe { *self.dimensions.get() }
+    }
+
+    fn model_name(&self) -> &str {
+        &self.model_name
+    }
+}
+
+/// Fallback home directory resolution without adding a heavyweight dependency.
+#[cfg(feature = "onnx-embed")]
+fn dirs_fallback() -> Option<PathBuf> {
+    if let Ok(home) = std::env::var("HOME") {
+        return Some(PathBuf::from(home));
+    }
+    if let (Ok(drive), Ok(path)) = (
+        std::env::var("HOMEDRIVE"),
+        std::env::var("HOMEPATH"),
+    ) {
+        let p = format!("{}{}", drive, path);
+        if !p.is_empty() {
+            return Some(PathBuf::from(p));
+        }
+    }
+    None
+}
+
+/// Generate embeddings for a batch of texts.
+///
+/// Returns a Vec of (text, embedding) pairs. Texts whose embedding fails
+/// are silently skipped — the caller should handle missing embeddings.
+pub async fn generate_embeddings_batch(
+    embedder: &dyn Embedder,
+    texts: &[&str],
+) -> Vec<(String, Vec<f64>)> {
+    let mut results = Vec::with_capacity(texts.len());
+    for text in texts {
+        match embedder.embed(text).await {
+            Ok(emb) if !emb.is_empty() => {
+                results.push((text.to_string(), emb));
+            }
+            _ => {} // skip failures silently
+        }
+    }
+    results
+}
+
+/// Determine whether an embedding should be generated for a given engram.
+///
+/// Rules:
+/// - Only embed `semantic` layer engrams (skip raw episodic noise)
+/// - Only embed engrams with substantial content (> 100 chars)
+/// - Only embed if the embedder is not a noop
+pub fn should_embed(layer: &str, content: &str, embedder_dims: usize) -> bool {
+    embedder_dims > 0 && layer == "semantic" && content.len() > 100
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn noop_embedder_returns_empty() {
+        let noop = NoopEmbedder;
+        let result = noop.embed("hello world").await.unwrap();
+        assert!(result.is_empty());
+        assert_eq!(noop.dimensions(), 0);
+        assert_eq!(noop.model_name(), "noop");
+    }
+
+    #[tokio::test]
+    async fn should_embed_checks() {
+        // Noop embedder -> never embed
+        assert!(!should_embed("semantic", &"some long content ".repeat(10), 0));
+        // Semantic layer with enough content -> embed
+        assert!(should_embed("semantic", &"x".repeat(101), 768));
+        // Episodic layer -> never embed
+        assert!(!should_embed("episodic", &"x".repeat(200), 768));
+        // Too short -> don't embed
+        assert!(!should_embed("semantic", "short", 768));
+    }
+}

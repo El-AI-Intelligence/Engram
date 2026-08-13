@@ -1,0 +1,92 @@
+# Engram Revenue Roadmap
+
+**Date:** 2026-08-12
+**License:** MIT (core stays open — the paid layers are services, and the open core is what earns the trust that sells them)
+
+## Principles
+
+1. **Local-first + E2E stays.** Zero-knowledge encryption is the moat. Every paid layer is optional — a self-hoster gets the full product forever.
+2. **Flat pricing, no seats, no metering.** Customers pay one price per plan. No per-seat or per-request economics, for us or for them.
+3. **Flat infra costs.** No per-request third-party APIs in any hot path. Embeddings stay local (ONNX/candle). Any cloud LLM use is BYO-key or local-model.
+4. **The core never closes.** Only the control plane (accounts, billing, team admin) is proprietary — and it's thin enough that it lives outside this repo anyway.
+
+## What exists today (verified 2026-08-12)
+
+- `engramd` — local daemon with ONNX embeddings, FTS5 + vector + QEM holographic memory, REST + WebSocket API, MCP server (`engramd-mcp`), privacy controls (audit/purge/retention)
+- E2E sync **client** in `engramd` (`/sync/status`, `sync_server_url` config)
+- `engramd-sync` — sync **relay server**: stateless "dumb pipe" for encrypted blobs, HMAC verification, token-bucket rate limiting, tombstones with 30-day retention, API-key auth. *Built but not deployed.*
+- Live site: landing + vault UI + API behind Caddy basic auth
+- Guardrail platform experience (WebAuthn accounts, admin dashboard, roles) to reuse for the control plane
+
+---
+
+## Layer 1 — Engram Cloud Sync
+
+The Obsidian play: sell the cloud layer of a local-first product. The relay already exists; this layer is deployment + accounts + billing.
+
+**Offering:** free = 1 device + 1 GB; Solo = 5 devices + 10 GB + 30-day restore points.
+
+| Milestone | Work | Est. |
+|---|---|---|
+| 1.1 Deploy relay | Run `engramd-sync` at `sync.engram.ellmstack.dev` (Caddy, same auth pattern as the live site), wire `sync_server_url` into `engramd`, verify two-device E2E round trip | 1 wk |
+| 1.2 Accounts + devices | WebAuthn accounts (reuse guardrail's auth), per-account API keys, device registry in the vault UI, quota flags (devices, bytes) | 2–3 wks |
+| 1.3 Billing | Stripe flat plan **Solo $4/mo**; webhook → quota flags (relay was designed for this: "billing is handled by a separate service") | 1 wk |
+| 1.4 Restore points | Server-side snapshot markers; "restore from N days ago" in the vault UI | 1 wk |
+
+**Cost to run:** 1 VPS + block storage — flat, roughly $15–25/mo regardless of user count.
+
+**Why first:** builds the accounts + billing + quota foundation that Layers 2 and 3 reuse.
+
+---
+
+## Layer 2 — Team Memory
+
+The revenue core. "The AI that remembers your organization."
+
+**Offering:** shared org vault — decisions, context, tribal knowledge. Admin console with roles, retention, compliance. Flat pricing: **Team $29/mo** (≤ 10 members), **Org $99/mo** (unlimited members, SSO). No per-seat math, ever.
+
+| Milestone | Work | Est. |
+|---|---|---|
+| 2.1 Org vaults | Collections + ACLs in `engramd` config, invite/join flow, shared workspace in the vault UI | 3 wks |
+| 2.2 Admin console | Roles, retention policies, full audit/export, GDPR deletion (reuse the existing privacy routes), login via the Layer 1 account system | 3 wks |
+| 2.3 Enterprise readiness | SAML/OIDC, data residency options, on-prem offer (control plane runs on their infra) | later |
+
+**Cost to run:** Postgres + control plane on the same VPS class — flat, ~$25–50/mo.
+
+---
+
+## Layer 3 — One Memory Everywhere
+
+The consumer endgame: your memory follows you across Claude, Cursor, ChatGPT, Copilot.
+
+**Offering:** **Personal $5/mo** flat — includes Solo sync. Hook: the weekly digest ("what your AI learned about you this week").
+
+| Milestone | Work | Est. |
+|---|---|---|
+| 3.1 MCP everywhere | `engramd-mcp` already exists — bundle Claude Desktop / Cursor / Windsurf configs, polish the web vault as the read-only companion | 2–3 wks |
+| 3.2 Weekly digest | Local-model digest (zero per-request cost; BYO-key as an option), delivered by email/push | 3 wks |
+| 3.3 Consumer onboarding | 5-minute install → first memory flow; landing page focused on consumer value; browser extension later | 3 wks |
+
+**Cost to run:** digest runs locally or BYO-key — no metered costs; extension is dev time only.
+
+---
+
+## Sequencing
+
+```
+Layer 1 (sync + accounts + billing)   →   Layer 2 (team memory, the revenue core)   →   Layer 3 (consumer)
+```
+
+Layer 1 pays for the infra and de-risks accounts/billing. Layer 2's control plane powers Layer 3's consumer accounts. The MIT core never changes.
+
+## What stays MIT vs. what stays private
+
+- **MIT (this repo):** `axiom-engram`, `engramd`, `engramd-sync`, `engramd-mcp`, both UIs, deploy configs. Self-hosters get everything — that's the trust engine.
+- **Private services (never in this repo):** the control plane (accounts, billing, team admin), Stripe integration, digest delivery. Thin layers by design.
+
+## Open questions
+
+- **Brand/domain for the cloud:** keep `engram.ellmstack.dev` or move to its own domain before charging money?
+- **Capacity tiers:** are 1 GB / 10 GB the right flat buckets? (Capacity is the only meter we keep — flat tiers, not per-GB billing.)
+- **Digest model:** local small model by default, or BYO-key by default? (Both keep costs flat; differs in UX.)
+- **Org size cap:** "≤ 10 members" needs a soft limit in the app — hard limits feel un-flat; how to enforce gracefully?

@@ -1,76 +1,482 @@
-//! Engram Memory Vault — standalone encrypted memory server.
-//!
-//! Start the server:
-//! ```sh
-//! engramd                          # local-only, default vault
-//! engramd --port 8787              # custom port
-//! engramd --passphrase "secret"    # user-provided encryption
-//! ```
+// Engram — Memory Vault CLI + daemon.
+//
+// Dual-mode binary:
+// - Invoked as `engramd`: runs the HTTP daemon (backward compatible).
+// - Invoked as `engram`: dispatches CLI subcommands (`capture`, `search`,
+//   `today`, `eco`, `demo`, `init`, `mcp`, `daemon`).
 
+mod app_state;
+mod auth;
+mod cli;
+mod errors;
+mod routes;
+mod sync_client;
+
+use app_state::{AppState, LiveEvent};
+
+use axum::extract::DefaultBodyLimit;
 use clap::Parser;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::net::TcpListener;
+use tokio::sync::{broadcast, Mutex};
+use tower_http::cors::{Any, CorsLayer};
+use tower_http::services::{ServeDir, ServeFile};
+use tower_http::trace::TraceLayer;
+use tracing::info;
+use tracing_subscriber::EnvFilter;
 
-/// Engram Memory Vault — local-first encrypted memory for AI agents.
+use axiom_engram::{EngramStore, EngramStoreAdapter, QemCache, QemConfig};
+use axiom_engram::embed::Embedder;
+
+// ── Top-level CLI ──────────────────────────────────────────────────────────
+
 #[derive(Parser, Debug)]
-#[command(version, about)]
-struct Args {
-    /// Port to listen on
-    #[arg(short, long, default_value = "8787")]
-    port: u16,
+#[command(name = "engram", version, about = "Engram Memory Vault — your AI deserves a memory.")]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<cli::Commands>,
 
-    /// Path to the vault directory
-    #[arg(short, long, default_value = "~/.engram/vaults/default")]
+    // Legacy daemon flags (used when invoked as `engramd` with no subcommand)
+    /// Path to the vault directory (daemon mode).
+    /// Environment: ENGRAM_VAULT.
+    #[arg(short, long, default_value = "./engram-data", env = "ENGRAM_VAULT")]
     vault: PathBuf,
-
-    /// Passphrase for vault encryption (overrides machine-id key)
-    #[arg(short, long)]
+    /// Listen address (daemon mode).
+    /// Environment: ENGRAM_BIND.
+    #[arg(short, long, default_value = "127.0.0.1:8787", env = "ENGRAM_BIND")]
+    bind: SocketAddr,
+    /// Passphrase for vault encryption (daemon mode).
+    /// Environment: ENGRAM_PASSPHRASE.
+    #[arg(short, long, env = "ENGRAM_PASSPHRASE")]
     passphrase: Option<String>,
+    /// Path to static UI files to serve (SPA fallback).
+    /// When set, engramd serves the vault UI directly — no reverse proxy needed.
+    /// Environment: ENGRAM_UI_DIR.
+    #[arg(long, env = "ENGRAM_UI_DIR")]
+    ui_dir: Option<PathBuf>,
 }
+
+// ── Entry point ────────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
-    let args = Args::parse();
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new("info")))
+        .init();
 
-    // Resolve ~ in vault path
-    let vault_path = if args.vault.starts_with("~/") {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        PathBuf::from(home).join(args.vault.strip_prefix("~/").unwrap())
+    let cli = Cli::parse();
+
+    // Detect binary name — if invoked as `engramd`, default to daemon mode.
+    let is_engramd = std::env::args()
+        .next()
+        .map(|a| a.ends_with("engramd"))
+        .unwrap_or(false);
+
+    match cli.command {
+        Some(cmd) => dispatch_cli(cmd).await,
+        None if is_engramd => run_daemon(cli.vault, cli.bind, cli.passphrase, cli.ui_dir).await,
+        None => {
+            // `engram` with no subcommand — print help
+            Cli::parse_from(["engram", "--help"]);
+            Ok(())
+        }
+    }
+}
+
+// ── CLI dispatch ───────────────────────────────────────────────────────────
+
+async fn dispatch_cli(cmd: cli::Commands) -> anyhow::Result<()> {
+    match cmd {
+        cli::Commands::Daemon { vault, bind, passphrase, ui_dir } => {
+            let addr: SocketAddr = bind.parse()?;
+            run_daemon(vault, addr, passphrase, ui_dir).await
+        }
+        cli::Commands::Init => {
+            cli::handle_init().await
+        }
+        cli::Commands::Capture { content, tags, layer, source, valence, project, vault } => {
+            cli::handle_capture(content, tags, layer, source, valence, project, vault).await
+        }
+        cli::Commands::Search { query, limit, layer, vault } => {
+            cli::handle_search(query, limit, layer, vault).await
+        }
+        cli::Commands::Today { vault } => {
+            cli::handle_today(vault).await
+        }
+        cli::Commands::Eco { vault } => {
+            cli::handle_eco(vault).await
+        }
+        cli::Commands::Demo { vault } => {
+            cli::handle_demo(vault).await
+        }
+        cli::Commands::Mcp { command } => {
+            cli::handle_mcp(command).await
+        }
+    }
+}
+
+// ── Device identity ─────────────────────────────────────────────────────────
+
+/// Load or create a persistent device ID stored in the vault directory.
+/// This survives daemon restarts so sync vector clocks are meaningful
+/// across sessions. Without this, every restart looks like a new device
+/// and multi-device conflict resolution breaks.
+fn load_or_create_device_id(vault_path: &std::path::Path) -> String {
+    let path = vault_path.join("device.json");
+    if path.exists() {
+        if let Ok(data) = std::fs::read_to_string(&path) {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&data) {
+                if let Some(id) = json.get("device_id").and_then(|v| v.as_str()) {
+                    return id.to_string();
+                }
+            }
+        }
+    }
+    // First run — create a new device identity
+    let device_id = uuid::Uuid::new_v4().to_string();
+    let json = serde_json::json!({
+        "device_id": device_id,
+        "created_at": chrono::Utc::now().to_rfc3339(),
+        "label": hostname(),
+    });
+    if let Err(e) = std::fs::write(&path, serde_json::to_string_pretty(&json).unwrap_or_default()) {
+        tracing::warn!(error = %e, path = %path.display(), "Failed to persist device identity");
     } else {
-        args.vault.clone()
-    };
+        tracing::info!(%device_id, "Created persistent device identity");
+    }
+    device_id
+}
+
+fn hostname() -> String {
+    std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .unwrap_or_else(|_| "unknown".into())
+}
+
+/// Read the hygiene schedule interval from config.json, falling back to
+/// 24 hours if the config is missing or unparseable.
+fn load_schedule_interval(vault_path: &std::path::Path) -> u64 {
+    let config_path = vault_path.join("config.json");
+    if let Ok(data) = std::fs::read_to_string(&config_path) {
+        if let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&data) {
+            if let Some(hours) = cfg
+                .get("schedule")
+                .and_then(|s| s.get("decay_interval_hours"))
+                .and_then(|v| v.as_u64())
+            {
+                let secs = hours * 3600;
+                // Clamp: minimum 1 hour, maximum 7 days
+                return secs.clamp(3600, 604800);
+            }
+        }
+    }
+    86400 // default: 24 hours
+}
+
+// ── CORS ────────────────────────────────────────────────────────────────────
+
+/// Build a CORS layer that allows localhost origins (the daemon binds loopback,
+/// so only local processes can reach it) and the production UI domain.
+/// This replaces the previous `CorsLayer::permissive()` which allowed ANY origin
+/// to exfiltrate memories via cross-origin fetch from malicious websites.
+///
+/// Additional allowed origins can be configured via the `ENGRAM_CORS_ORIGINS`
+/// environment variable (comma-separated URLs).
+fn cors_layer() -> CorsLayer {
+    use tower_http::cors::AllowOrigin;
+
+    // Load extra allowed origins from ENGRAM_CORS_ORIGINS env var
+    let extra_origins: Vec<String> = std::env::var("ENGRAM_CORS_ORIGINS")
+        .ok()
+        .map(|s| s.split(',').map(|o| o.trim().to_string()).collect())
+        .unwrap_or_default();
+
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::predicate(
+            move |origin: &axum::http::HeaderValue, _req| {
+                if let Ok(s) = origin.to_str() {
+                    // Allow localhost on any port (dev UI, Python server, etc.)
+                    if s.starts_with("http://localhost:")
+                        || s.starts_with("http://127.0.0.1:")
+                        || s.starts_with("http://[::1]:")
+                    {
+                        return true;
+                    }
+                    // Allow the production domain
+                    if s == "https://engram.ellmstack.dev" {
+                        return true;
+                    }
+                    // Allow any domains configured via ENGRAM_CORS_ORIGINS
+                    if extra_origins.iter().any(|o| o == s) {
+                        return true;
+                    }
+                }
+                false
+            },
+        ))
+        .allow_methods(Any)
+        .allow_headers(Any)
+}
+
+// ── Daemon ─────────────────────────────────────────────────────────────────
+
+async fn run_daemon(
+    vault_path: PathBuf,
+    bind: SocketAddr,
+    passphrase: Option<String>,
+    ui_dir: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    use axum::Router;
+
     std::fs::create_dir_all(&vault_path)?;
-
-    // Open the encrypted vault
-    let store = match &args.passphrase {
-        Some(pw) => engram_core::EngramStore::open_with_passphrase(&vault_path, pw).await?,
-        None => engram_core::EngramStore::open(&vault_path).await?,
+    let store = match &passphrase {
+        Some(pw) => EngramStore::open_with_passphrase(&vault_path, pw).await?,
+        None => EngramStore::open(&vault_path).await?,
     };
-    let store = Arc::new(store);
+    let vault: Arc<Mutex<EngramStore>> = Arc::new(Mutex::new(store));
+    let start_time = chrono::Utc::now();
 
-    let addr = format!("127.0.0.1:{}", args.port);
-    let listener = TcpListener::bind(&addr).await?;
-    tracing::info!("Engram Memory Vault listening on http://{}", addr);
-    tracing::info!("Vault: {}", vault_path.display());
-    if args.passphrase.is_some() {
-        tracing::info!("Encryption: passphrase-derived key");
+    // ── Warm QEM L1 cache from L2 ──────────────────────────────────────────
+    let adapter = EngramStoreAdapter::new(vault.clone());
+    let qem = QemCache::new(adapter, QemConfig::default());
+    info!("Warming QEM L1 cache from vault...");
+    if let Err(e) = qem.warm().await {
+        tracing::warn!(error = %e, "QEM warm failed (non-fatal, cache starts cold)");
     } else {
-        tracing::info!("Encryption: machine-id-derived key");
+        info!(entries = qem.cache_size(), "QEM L1 cache warmed");
+    }
+    let qem = Arc::new(qem);
+
+    // ── Device identity (persisted across restarts) ────────────────────
+    let device_id = load_or_create_device_id(&vault_path);
+
+    // ── Event broadcast channel (WebSocket) ─────────────────────────────
+    let (events_tx, _) = broadcast::channel::<LiveEvent>(256);
+
+    // ── Embedding provider (zero-config ONNX, auto-downloads model) ──────
+    let embedder: Option<Arc<dyn Embedder>> = match axiom_engram::OnnxEmbedder::new() {
+        embedder if embedder.dimensions() > 0 => {
+            info!(model = embedder.model_name(), dims = embedder.dimensions(), "ONNX embedder ready");
+            Some(Arc::new(embedder))
+        }
+        embedder => {
+            // dimensions() == 0 means ONNX Runtime or model not available yet.
+            // Lazy init will try again on first embed() call. Keep the embedder
+            // in state so it can self-initialize later.
+            info!("ONNX embedder enqueued for lazy initialization (model will download on first use)");
+            Some(Arc::new(embedder))
+        }
+    };
+
+    let state = AppState {
+        vault: vault.clone(),
+        qem,
+        vault_path: vault_path.clone(),
+        start_time,
+        events_tx,
+        device_id: device_id.clone(),
+        embedder,
+    };
+
+    // ── Background scheduler ──────────────────────────────────────────────
+    let bg_state = state.clone();
+    tokio::spawn(async move { background_scheduler(bg_state).await });
+
+    // ── Sync loop (if enabled via config) ──────────────────────────────────
+    let sync_config_path = vault_path.join("config.json");
+    if let Ok(data) = std::fs::read_to_string(&sync_config_path) {
+        if let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&data) {
+            let sync_enabled = cfg
+                .get("sync")
+                .and_then(|s| s.get("enabled"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if sync_enabled {
+                let server_url = cfg
+                    .get("sync")
+                    .and_then(|s| s.get("server_url"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("http://localhost:8788");
+                let api_key = cfg
+                    .get("sync")
+                    .and_then(|s| s.get("api_key"))
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                let interval_secs = cfg
+                    .get("sync")
+                    .and_then(|s| s.get("interval_secs"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(60)
+                    .max(5); // minimum 5s to avoid busy-loop on misconfiguration
+
+                // The vault_id is derived from the vault path name (stable identifier)
+                let vault_id = vault_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "default".into());
+
+                // Passphrase: for sync, we use the same passphrase used to open the vault.
+                // If no passphrase was provided, sync won't work (encryption is required).
+                if let Some(ref pw) = passphrase {
+                    let initial_clock = sync_client::SyncClient::load_clock(&vault_path);
+                    let sync_client = Arc::new(sync_client::SyncClient::new(
+                        server_url.to_string(),
+                        vault_id,
+                        pw,
+                        device_id.clone(),
+                        api_key,
+                        initial_clock,
+                    ));
+                    info!(
+                        server_url = %server_url,
+                        interval_secs,
+                        %initial_clock,
+                        "Starting sync loop"
+                    );
+                    sync_client::spawn_sync_loop(
+                        sync_client,
+                        vault.clone(),
+                        vault_path.clone(),
+                        std::time::Duration::from_secs(interval_secs),
+                    );
+                } else {
+                    tracing::error!(
+                        "Sync is enabled but no passphrase is set. \
+                         Sync requires a passphrase for E2E encryption. \
+                         Restart with --passphrase or set a passphrase during init."
+                    );
+                    eprintln!(
+                        "ERROR: Sync is enabled in config but no passphrase provided. \
+                         Sync requires a passphrase for E2E encryption. \
+                         Restart engramd with --passphrase."
+                    );
+                }
+            }
+        }
     }
 
-    // TODO: build axum router with all REST endpoints
-    // For now, serve a health endpoint to verify the binary works
-    let app = axum::Router::new()
-        .route("/health", axum::routing::get(|| async {
-            axum::Json(serde_json::json!({
-                "status": "ok",
-                "version": env!("CARGO_PKG_VERSION"),
-                "vault": "default",
-            }))
-        }));
+    // ── Build router ──────────────────────────────────────────────────────
+    // Auth from environment (ENGRAMD_API_KEY). Required on non-loopback.
+    let auth_state = auth::AuthState::from_env(bind.ip().is_loopback());
+    if let Err(e) = auth_state.check_startup_safe(bind) {
+        tracing::error!("{e}");
+        anyhow::bail!(e);
+    }
 
-    axum::serve(listener, app).await?;
+    let app = Router::new()
+        .merge(routes::health::router())
+        .merge(routes::memories::router())
+        .merge(routes::context::router())
+        .merge(routes::consolidation::router())
+        .merge(routes::analytics::router())
+        .merge(routes::config::router())
+        .merge(routes::export_import::router())
+        .merge(routes::events::router())
+        .merge(routes::annotations::router())
+        .merge(routes::saved_searches::router())
+        .merge(routes::privacy::router())
+        .merge(routes::sync_status::router())
+        .with_state(state)
+        // CORS must be outermost so OPTIONS preflight is handled before auth
+        .layer(axum::middleware::from_fn_with_state(
+            auth_state,
+            auth::auth_middleware,
+        ))
+        .layer(cors_layer())
+        .layer(TraceLayer::new_for_http())
+        // Reject oversized bodies (10 MiB) with structured JSON errors
+        .layer(DefaultBodyLimit::max(10 * 1024 * 1024))
+        // Convert extractor rejections (422, 413, 400) to structured JSON errors.
+        // Applied as the outermost layer so it catches responses from all inner
+        // middleware (including DefaultBodyLimit and extractor errors).
+        .layer(
+            tower::ServiceBuilder::new()
+                .map_response(errors::handle_extractor_rejection)
+                .into_inner(),
+        );
+
+    // ── Static UI serving (optional) ──────────────────────────────────────
+    let app = if let Some(ref ui) = ui_dir {
+        info!("Serving UI from {}", ui.display());
+        app.fallback_service(
+            ServeDir::new(ui)
+                .fallback(ServeFile::new(ui.join("index.html"))),
+        )
+    } else {
+        app
+    };
+
+    info!(
+        "Engramd starting on {} (vault: {})",
+        bind,
+        vault_path.display()
+    );
+    let listener = tokio::net::TcpListener::bind(bind).await?;
+
+    // ── Graceful shutdown ──────────────────────────────────────────────────
+    let shutdown_signal = async {
+        #[cfg(unix)]
+        {
+            let mut sigterm = tokio::signal::unix::signal(
+                tokio::signal::unix::SignalKind::terminate(),
+            )
+            .expect("failed to install SIGTERM handler");
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    info!("SIGINT received, draining connections...");
+                }
+                _ = sigterm.recv() => {
+                    info!("SIGTERM received, draining connections...");
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            tokio::signal::ctrl_c()
+                .await
+                .expect("failed to install Ctrl+C handler");
+            info!("Shutdown signal received, draining connections...");
+        }
+    };
+
+    // axum 0.8 serve returns a future that we can wrap with graceful shutdown
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal)
+        .await?;
+
+    info!("Shutdown complete. Goodbye.");
     Ok(())
+}
+
+/// Background task: runs daily hygiene on a configurable schedule.
+///
+/// Reads the `schedule.decay_interval_hours` field from config.json.
+/// Defaults to 24 hours. Respects config so users can tune decay frequency.
+async fn background_scheduler(state: AppState) {
+    let interval_secs = load_schedule_interval(&state.vault_path);
+    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(interval_secs));
+    // Suppress the immediate first tick — hygiene on startup is aggressive
+    // and can conflict with vault warm-up.
+    interval.tick().await;
+    loop {
+        interval.tick().await;
+        let vault = state.vault.lock().await;
+        let (daily_strengthened, daily_decayed) = match vault.apply_daily_hygiene().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(error = %e, "Background hygiene failed — memory decay not applied");
+                continue;
+            }
+        };
+        if daily_strengthened + daily_decayed > 0 {
+            info!(daily_strengthened, daily_decayed, "Daily hygiene");
+            let _ = state.events_tx.send(LiveEvent::Decay {
+                strengthened: daily_strengthened as usize,
+                decayed: daily_decayed as usize,
+                timestamp: chrono::Utc::now().to_rfc3339(),
+            });
+        }
+    }
 }
