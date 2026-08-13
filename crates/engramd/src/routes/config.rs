@@ -26,6 +26,8 @@ struct PersistedConfig {
     summarization: SummarizationConfig,
     #[serde(default)]
     qem: QemConfigSection,
+    #[serde(default)]
+    noise: NoiseConfig,
 }
 
 impl Default for PersistedConfig {
@@ -37,7 +39,28 @@ impl Default for PersistedConfig {
             sync: SyncConfig::default(),
             summarization: SummarizationConfig::default(),
             qem: QemConfigSection::default(),
+            noise: NoiseConfig::default(),
         }
+    }
+}
+
+/// Capture-side source policy. Sources listed here are dropped at the REST
+/// route — no row, no QEM populate, no WebSocket event. Defaults to the two
+/// sources proven to be transcript-redundant noise (Claude Code shell
+/// commands); empty list restores capture-everything behavior.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct NoiseConfig {
+    #[serde(default = "default_ignored_sources")]
+    ignored_sources: Vec<String>,
+}
+
+fn default_ignored_sources() -> Vec<String> {
+    vec!["ai-session".into(), "ai-tool".into()]
+}
+
+impl Default for NoiseConfig {
+    fn default() -> Self {
+        Self { ignored_sources: default_ignored_sources() }
     }
 }
 
@@ -194,6 +217,7 @@ struct PatchConfigBody {
     sync: Option<SyncConfig>,
     summarization: Option<SummarizationConfig>,
     qem: Option<QemConfigSection>,
+    noise: Option<NoiseConfig>,
 }
 
 fn config_path(vault_path: &std::path::Path) -> std::path::PathBuf {
@@ -229,6 +253,7 @@ struct ConfigResponse {
     sync: SyncConfig,
     summarization: SummarizationConfig,
     qem: QemConfigSection,
+    noise: NoiseConfig,
 }
 
 impl From<PersistedConfig> for ConfigResponse {
@@ -243,6 +268,7 @@ impl From<PersistedConfig> for ConfigResponse {
             sync: c.sync,
             summarization: c.summarization,
             qem: c.qem,
+            noise: c.noise,
         }
     }
 }
@@ -291,6 +317,9 @@ async fn patch_config(
     }
     if let Some(qem) = body.qem {
         config.qem = qem;
+    }
+    if let Some(noise) = body.noise {
+        config.noise = noise;
     }
     save_config(&state.vault_path, &config)
         .map_err(|e| {

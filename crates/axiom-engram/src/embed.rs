@@ -11,6 +11,7 @@
 //! All callers must handle empty embeddings (skip vector search, skip storage).
 
 use async_trait::async_trait;
+#[cfg(feature = "onnx-embed")]
 use std::path::PathBuf;
 
 /// A minimal trait for generating text embeddings.

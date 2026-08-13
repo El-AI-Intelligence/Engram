@@ -195,6 +195,33 @@ fn load_qem_config(vault_path: &std::path::Path) -> QemConfig {
     config
 }
 
+/// Read `noise.ignored_sources` from config.json. Defaults to
+/// ["ai-session", "ai-tool"] (transcript-redundant agent captures) when the
+/// config is missing, unparseable, or has an empty list. Loaded once at
+/// startup — a PATCH to /config requires a restart to take effect.
+fn load_noise_ignored_sources(vault_path: &std::path::Path) -> Vec<String> {
+    const DEFAULTS: &[&str] = &["ai-session", "ai-tool"];
+    let config_path = vault_path.join("config.json");
+    if let Ok(data) = std::fs::read_to_string(&config_path) {
+        if let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&data) {
+            if let Some(list) = cfg
+                .get("noise")
+                .and_then(|n| n.get("ignored_sources"))
+                .and_then(|v| v.as_array())
+            {
+                let sources: Vec<String> = list
+                    .iter()
+                    .filter_map(|v| v.as_str())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                return sources;
+            }
+        }
+    }
+    DEFAULTS.iter().map(|s| s.to_string()).collect()
+}
+
 /// Build the optional local LLM provider for narrative consolidation.
 ///
 /// Only the `ollama:<model>` form of `summarization.llm` is accepted, and the
@@ -355,6 +382,7 @@ async fn run_daemon(
         device_id: device_id.clone(),
         embedder,
         inference: load_inference_provider(&vault_path),
+        noise_ignored_sources: load_noise_ignored_sources(&vault_path),
     };
 
     // ── Background scheduler ──────────────────────────────────────────────

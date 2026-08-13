@@ -1,7 +1,7 @@
 use crate::errors::{self, code};
 use crate::routes::err_json;
 use crate::{AppState, LiveEvent};
-use axiom_engram::{Engram, EngramLayer, EngramSource, EngramLink, WriteOutcome};
+use axiom_engram::{Engram, EngramLayer, EngramSource, EngramLink, WriteOutcome, QuarantineFilter};
 use axum::{
     extract::{Path, Query, State},
     routing::{get, post},
@@ -303,6 +303,20 @@ async fn capture(
             .map(|d| d.with_timezone(&chrono::Utc)).ok();
     }
 
+    // Source policy: captures from ignored sources are dropped here — no
+    // write, no QEM populate, no WebSocket event. List comes from
+    // `noise.ignored_sources` in config.json, loaded at startup. Compare
+    // against the FINAL source value (unknown/empty sources were already
+    // mapped to "interaction" above).
+    if state.noise_ignored_sources.iter().any(|s| s == source.as_str()) {
+        return Ok(Json(MemoryResponse {
+            skipped: true,
+            skip_reason: Some(format!("ignored source: {}", source.as_str())),
+            matched_id: None,
+            ..engram.into()
+        }));
+    }
+
     // B1/B2: noise captures and duplicates don't produce a new row — report
     // the outcome instead of pretending the memory was stored.
     let outcome = vault.write(&engram).await.map_err(|e| errors::db_error(e))?;
@@ -374,28 +388,38 @@ async fn search(
     let mut scored: std::collections::HashMap<String, (Engram, f64)> = std::collections::HashMap::new();
 
     // ── FTS5 / layer / tags search ──────────────────────────────────────
+    // B7: quarantine scope, applied in SQL by the store so paging stays
+    // correct. Default recall surface excludes quarantined rows; an explicit
+    // `imagined` layer browse shows them; `quarantined: true` is the review view.
+    let quarantine_filter = match query.quarantined {
+        Some(true) => QuarantineFilter::QuarantinedOnly,
+        Some(false) => QuarantineFilter::LiveOnly,
+        None if query.layer.as_deref() == Some("imagined") => QuarantineFilter::All,
+        None => QuarantineFilter::LiveOnly,
+    };
+
     let fts5_results: Vec<Engram> = if let Some(ref layer_str) = query.layer {
         search_type = "layer".into();
         let layer = EngramLayer::from_str(layer_str)
             .ok_or_else(|| errors::bad_request(code::INVALID_LAYER, format!("Unknown memory layer: {layer_str}. Valid layers: episodic, semantic, imagined")))?;
-        vault.search_by_layer(layer, limit).await.map_err(|e| errors::db_error(e))?
+        vault.search_by_layer_filtered(layer, limit, quarantine_filter).await.map_err(|e| errors::db_error(e))?
     } else if let Some(ref content_query) = query.query {
         if content_query.trim().is_empty() && !use_vector {
             return Err(errors::bad_request(code::CONTENT_EMPTY, "Search query cannot be empty"));
         }
         if use_fts5 && !content_query.trim().is_empty() {
             search_type = "fts5".into();
-            vault.search_by_content(content_query, limit).await.map_err(|e| errors::db_error(e))?
+            vault.search_by_content_filtered(content_query, limit, quarantine_filter).await.map_err(|e| errors::db_error(e))?
         } else {
             Vec::new()
         }
     } else if let Some(ref tags) = query.tags {
         search_type = "tags".into();
         let tag_refs: Vec<&str> = tags.iter().map(|t| t.as_str()).collect();
-        vault.search_by_tags(&tag_refs, limit).await.map_err(|e| errors::db_error(e))?
+        vault.search_by_tags_filtered(&tag_refs, limit, quarantine_filter).await.map_err(|e| errors::db_error(e))?
     } else {
         search_type = "list".into();
-        vault.list(limit, offset).await.map_err(|e| errors::db_error(e))?
+        vault.list_filtered(limit, offset, quarantine_filter).await.map_err(|e| errors::db_error(e))?
     };
 
     // Score FTS5/layer/tag results
@@ -538,10 +562,6 @@ async fn search(
         memory_results.retain(|m| m.strength >= min_s);
     }
 
-    // B7: quarantine filter — lets users review/restore noise-marked memories
-    if let Some(q) = query.quarantined {
-        memory_results.retain(|m| (m.imagined && !m.grounded) == q);
-    }
 
     // Apply sort if requested (default is relevance/recency from the query)
     if let Some(ref sort) = query.sort_by {
@@ -613,7 +633,9 @@ async fn ground(
     let vault = state.vault.lock().await;
     let mut engram = vault.get(&id).await.map_err(|e| err_json(404, e.to_string()))?;
     engram.grounded = true;
-    vault.write(&engram).await.map_err(|e| err_json(500, e.to_string()))?;
+    // Curated write: this mutation must persist even when a sibling row
+    // shares the same content hash (dedupe would swallow it on write()).
+    vault.write_curated(&engram).await.map_err(|e| err_json(500, e.to_string()))?;
     let updated = vault.get(&id).await.map_err(|e| err_json(500, e.to_string()))?;
     // Update QEM L1 cache
     let entry: axiom_engram::MemoryEntry = updated.clone().into();
@@ -635,7 +657,9 @@ async fn mark_noise(
     if !engram.tags.iter().any(|t| t == "noise") {
         engram.tags.push("noise".to_string());
     }
-    vault.write(&engram).await.map_err(|e| err_json(500, e.to_string()))?;
+    // Curated write: this mutation must persist even when a sibling row
+    // shares the same content hash (dedupe would swallow it on write()).
+    vault.write_curated(&engram).await.map_err(|e| err_json(500, e.to_string()))?;
     let updated = vault.get(&id).await.map_err(|e| err_json(500, e.to_string()))?;
     // Update QEM L1 cache
     let entry: axiom_engram::MemoryEntry = updated.clone().into();
@@ -669,7 +693,9 @@ async fn patch_one(
         engram.occurred_at = chrono::DateTime::parse_from_rfc3339(oa)
             .map(|d| d.with_timezone(&chrono::Utc)).ok();
     }
-    vault.write(&engram).await.map_err(|e| err_json(500, e.to_string()))?;
+    // Curated write: this mutation must persist even when a sibling row
+    // shares the same content hash (dedupe would swallow it on write()).
+    vault.write_curated(&engram).await.map_err(|e| err_json(500, e.to_string()))?;
     let updated = vault.get(&id).await.map_err(|e| err_json(500, e.to_string()))?;
     // Update QEM L1 cache
     let entry: axiom_engram::MemoryEntry = updated.clone().into();

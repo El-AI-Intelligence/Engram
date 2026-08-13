@@ -54,4 +54,9 @@ pub struct AppState {
     /// Ollama); never from env vars or cloud config. `None` → the narratives
     /// endpoint falls back to the deterministic heuristic summarizer.
     pub inference: Option<Arc<dyn InferenceProvider>>,
+    /// Capture sources dropped at the REST route (from `noise.ignored_sources`
+    /// in config.json). Loaded once at startup — NOT hot-reloaded; a PATCH to
+    /// /config requires a restart to take effect. Default: ["ai-session",
+    /// "ai-tool"] (transcript-redundant agent captures).
+    pub noise_ignored_sources: Vec<String>,
 }

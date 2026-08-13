@@ -44,6 +44,40 @@ pub enum WriteOutcome {
     NoiseSkipped { reason: String },
 }
 
+/// Quarantine scope for search/list queries.
+///
+/// "Quarantined" = `imagined && !grounded` — noise-marked rows and ungrounded
+/// imagined captures. The default recall surface excludes them; the review
+/// view (`quarantined: true` on the REST route) shows only them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum QuarantineFilter {
+    /// No filtering — includes quarantined rows.
+    #[default]
+    All,
+    /// Exclude quarantined rows.
+    LiveOnly,
+    /// Show only quarantined rows.
+    QuarantinedOnly,
+}
+
+impl QuarantineFilter {
+    /// SQL fragment appended after an existing WHERE clause.
+    /// `qualifier` is the table name/alias prefix — "" for plain `engrams`
+    /// queries, "e" for FTS joins on `INNER JOIN engrams e`.
+    fn sql(&self, qualifier: &str) -> String {
+        let q = if qualifier.is_empty() { String::new() } else { format!("{qualifier}.") };
+        match self {
+            QuarantineFilter::All => String::new(),
+            QuarantineFilter::LiveOnly => {
+                format!(" AND NOT ({q}imagined = 1 AND {q}grounded = 0)")
+            }
+            QuarantineFilter::QuarantinedOnly => {
+                format!(" AND {q}imagined = 1 AND {q}grounded = 0")
+            }
+        }
+    }
+}
+
 // ── Vault key derivation ──────────────────────────────────────────────────────
 
 /// Application-level salt for machine-id-based key derivation (v1).
@@ -444,14 +478,26 @@ impl EngramStore {
     /// insert + FTS + embedding + links (B6). See [`WriteOutcome`] for the
     /// three possible results.
     pub async fn write(&self, engram: &Engram) -> Result<WriteOutcome> {
-        self.write_inner(engram, None).await
+        self.write_inner(engram, None, true).await
     }
 
     /// Write an engram with an optional embedding vector.
     /// When `embedding` is provided (non-empty), it is stored in the
     /// `engram_embeddings` table for later vector search.
     pub async fn write_with_embedding(&self, engram: &Engram, embedding: Option<&[f64]>) -> Result<WriteOutcome> {
-        self.write_inner(engram, embedding).await
+        self.write_inner(engram, embedding, true).await
+    }
+
+    /// Write an already-stored memory verbatim, bypassing the capture-pipeline
+    /// gates (B1 noise filter, B2 dedupe).
+    ///
+    /// Metadata mutations — mark-noise, ground, PATCH — must always persist.
+    /// Routing them through the capture pipeline silently drops the update
+    /// when a sibling row shares the same normalized content hash (the dedupe
+    /// gate returns `Duplicate` and skips the write). Callers are route
+    /// handlers acting on an id the user already reviewed.
+    pub async fn write_curated(&self, engram: &Engram) -> Result<WriteOutcome> {
+        self.write_inner(engram, None, false).await
     }
 
     /// Internal write implementation shared by `write` and `write_with_embedding`.
@@ -459,13 +505,13 @@ impl EngramStore {
     /// Uses the raw connection handle only — the tokio Mutex is
     /// non-reentrant, so calling typed `self.*` methods from here would
     /// deadlock on the first capture.
-    async fn write_inner(&self, engram: &Engram, embedding: Option<&[f64]>) -> Result<WriteOutcome> {
+    async fn write_inner(&self, engram: &Engram, embedding: Option<&[f64]>, gates: bool) -> Result<WriteOutcome> {
         let conn = self.conn.lock().await;
 
         // B1: noise filter — only raw episodic capture streams are filtered;
         // curated sources (consolidation, imagined, user notes, …) are exempt
-        // inside is_noise itself.
-        if engram.layer == EngramLayer::Episodic {
+        // inside is_noise itself. Capture path only.
+        if gates && engram.layer == EngramLayer::Episodic {
             if let Some(reason) = crate::noise::is_noise(&engram.content, engram.source) {
                 Self::bump_metric(&conn, "noise_skips")?;
                 return Ok(WriteOutcome::NoiseSkipped { reason });
@@ -474,24 +520,28 @@ impl EngramStore {
 
         let hash = crate::noise::normalized_hash(&engram.content);
 
-        // B2: dedupe by normalized content hash. Self-exclusion is mandatory —
-        // ground/patch rewrites pass the same id and must not dedupe against
-        // themselves.
-        let duplicate: Option<String> = conn
-            .query_row(
-                "SELECT id FROM engrams WHERE content_hash = ?1 AND id != ?2 LIMIT 1",
-                params![hash, engram.id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if let Some(existing_id) = duplicate {
-            let now = Utc::now().to_rfc3339();
-            conn.execute(
-                "UPDATE engrams SET strength = MIN(2.0, strength + 0.1), last_retrieved = ?1 WHERE id = ?2",
-                params![now, existing_id],
-            )?;
-            Self::bump_metric(&conn, "dedup_saves")?;
-            return Ok(WriteOutcome::Duplicate { matched_id: existing_id });
+        // B2: dedupe by normalized content hash (capture path only). The
+        // self-exclusion here is mandatory for curated rewrites — ground/patch
+        // pass the same id — but those bypass the gate entirely via
+        // `write_curated` so a sibling row with identical content can never
+        // swallow the update.
+        if gates {
+            let duplicate: Option<String> = conn
+                .query_row(
+                    "SELECT id FROM engrams WHERE content_hash = ?1 AND id != ?2 LIMIT 1",
+                    params![hash, engram.id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(existing_id) = duplicate {
+                let now = Utc::now().to_rfc3339();
+                conn.execute(
+                    "UPDATE engrams SET strength = MIN(2.0, strength + 0.1), last_retrieved = ?1 WHERE id = ?2",
+                    params![now, existing_id],
+                )?;
+                Self::bump_metric(&conn, "dedup_saves")?;
+                return Ok(WriteOutcome::Duplicate { matched_id: existing_id });
+            }
         }
 
         // B5: auto-project + auto-tags on a local clone (never mutates the
@@ -919,52 +969,26 @@ impl EngramStore {
 
     /// Search engrams by layer
     pub async fn search_by_layer(&self, layer: EngramLayer, limit: usize) -> Result<Vec<Engram>> {
+        self.search_by_layer_filtered(layer, limit, QuarantineFilter::All).await
+    }
+
+    /// `search_by_layer` with a quarantine scope applied in SQL (see
+    /// [`QuarantineFilter`]).
+    pub async fn search_by_layer_filtered(
+        &self,
+        layer: EngramLayer,
+        limit: usize,
+        filter: QuarantineFilter,
+    ) -> Result<Vec<Engram>> {
         let conn = self.conn.lock().await;
         let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
-        let mut stmt = conn.prepare(
-            "SELECT id, layer, source, privacy_level, content, context, strength, valence, retrievals, imagined, grounded, created_at, last_retrieved, project, tags, scope, content_type, occurred_at FROM engrams WHERE layer = ?1 ORDER BY strength DESC, created_at DESC LIMIT ?2"
-        )?;
-        
-        let rows = stmt.query_map(params![layer.as_str(), limit_i64], |row| {
-            let layer_str: String = row.get(1)?;
-            let source_str: String = row.get(2)?;
-            let privacy_str: String = row.get(3)?;
-            let context_str: String = row.get(5)?;
-            let tags_str: String = row.get(14)?;
-            let created_str: String = row.get(11)?;
-            let retrieved_str: Option<String> = row.get(12)?;
-
-            Ok(Engram {
-                id: row.get(0)?,
-                layer: EngramLayer::from_str(&layer_str).unwrap_or(EngramLayer::Episodic),
-                source: EngramSource::from_str(&source_str).unwrap_or(EngramSource::Interaction),
-                content: row.get(4)?,
-                context: serde_json::from_str(&context_str).unwrap_or(serde_json::json!({})),
-                links: Vec::new(),
-                privacy_level: PrivacyLevel::from_str(&privacy_str).unwrap_or_default(),
-                strength: row.get(6)?,
-                valence: row.get(7)?,
-                retrievals: row.get(8)?,
-                imagined: row.get::<_, i32>(9)? != 0,
-                grounded: row.get::<_, i32>(10)? != 0,
-                created_at: chrono::DateTime::parse_from_rfc3339(&created_str)
-                    .map(|d| d.with_timezone(&Utc)).unwrap_or_else(|_| Utc::now()),
-                last_retrieved: retrieved_str.and_then(|s| 
-                    chrono::DateTime::parse_from_rfc3339(&s)
-                        .map(|d| d.with_timezone(&Utc)).ok()
-                ),
-                project: row.get(13)?,
-                tags: serde_json::from_str(&tags_str).unwrap_or_default(),
-                scope: row.get(15).unwrap_or_else(|_| "moment".into()),
-                content_type: row.get(16).unwrap_or_else(|_| "text".into()),
-                occurred_at: row.get::<_, Option<String>>(17).unwrap_or(None).and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).map(|d| d.with_timezone(&Utc)).ok()),
-            })
-        })?;
-        
-        let mut engrams = Vec::new();
-        for engram in rows {
-            engrams.push(engram?);
-        }
+        let sql = format!(
+            "SELECT id, layer, source, privacy_level, content, context, strength, valence, retrievals, imagined, grounded, created_at, last_retrieved, project, tags, scope, content_type, occurred_at FROM engrams WHERE layer = ?1{} ORDER BY strength DESC, created_at DESC LIMIT ?2",
+            filter.sql("")
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![layer.as_str(), limit_i64], Self::row_to_engram)?;
+        let mut engrams: Vec<Engram> = rows.collect::<rusqlite::Result<_>>()?;
         Self::enrich_links_batch(&conn, &mut engrams)?;
         Ok(engrams)
     }
@@ -972,6 +996,18 @@ impl EngramStore {
     /// Search engrams by content using FTS5 full-text index.
     /// Falls back to LIKE if the query contains characters that FTS5 can't parse.
     pub async fn search_by_content(&self, query: &str, limit: usize) -> Result<Vec<Engram>> {
+        self.search_by_content_filtered(query, limit, QuarantineFilter::All).await
+    }
+
+    /// `search_by_content` with a quarantine scope applied in SQL (see
+    /// [`QuarantineFilter`]). Both the FTS5 path and the LIKE fallback honor
+    /// the filter.
+    pub async fn search_by_content_filtered(
+        &self,
+        query: &str,
+        limit: usize,
+        filter: QuarantineFilter,
+    ) -> Result<Vec<Engram>> {
         let conn = self.conn.lock().await;
         let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
 
@@ -982,62 +1018,46 @@ impl EngramStore {
             if sanitized.is_empty() {
                 return Ok(Vec::new());
             }
-            // Wrap in quotes for exact phrase matching in FTS5
-            let fts_query = format!("\"{}\"", sanitized);
-            let mut stmt = conn.prepare(
-                "SELECT e.id, e.layer, e.source, e.privacy_level, e.content, e.context, \
-                 e.strength, e.valence, e.retrievals, e.imagined, e.grounded, \
-                 e.created_at, e.last_retrieved, e.project, e.tags, \
-                 e.scope, e.content_type, e.occurred_at \
-                 FROM engrams_fts fts \
-                 INNER JOIN engrams e ON fts.id = e.id \
-                 WHERE engrams_fts MATCH ?1 \
-                 ORDER BY rank \
-                 LIMIT ?2"
-            )?;
-            let rows = stmt.query_map(params![fts_query, limit_i64], |row| {
-                let layer_str: String = row.get(1)?;
-                let source_str: String = row.get(2)?;
-                let _privacy_str: String = row.get(3)?;
-                let context_str: String = row.get(5)?;
-                let tags_str: String = row.get(14)?;
-                let created_str: String = row.get(11)?;
-                let retrieved_str: Option<String> = row.get(12)?;
-                
-                Ok(Engram {
-                    id: row.get(0)?,
-                    layer: EngramLayer::from_str(&layer_str).unwrap_or(EngramLayer::Episodic),
-                    source: EngramSource::from_str(&source_str).unwrap_or(EngramSource::Interaction),
-                    content: row.get(4)?,
-                    context: serde_json::from_str(&context_str).unwrap_or(serde_json::json!({})),
-                    links: Vec::new(),
-                    privacy_level: {
-                        let pl_str: String = row.get(3)?;
-                        PrivacyLevel::from_str(&pl_str).unwrap_or_default()
-                    },
-                    strength: row.get(6)?,
-                    valence: row.get(7)?,
-                    retrievals: row.get(8)?,
-                    imagined: row.get::<_, i32>(9)? != 0,
-                    grounded: row.get::<_, i32>(10)? != 0,
-                    created_at: chrono::DateTime::parse_from_rfc3339(&created_str)
-                        .map(|d| d.with_timezone(&Utc)).unwrap_or_else(|_| Utc::now()),
-                    last_retrieved: retrieved_str.and_then(|s|
-                        chrono::DateTime::parse_from_rfc3339(&s)
-                            .map(|d| d.with_timezone(&Utc)).ok()
-                    ),
-                    project: row.get(13)?,
-                    tags: serde_json::from_str(&tags_str).unwrap_or_default(),
-                scope: row.get(15).unwrap_or_else(|_| "moment".into()),
-                content_type: row.get(16).unwrap_or_else(|_| "text".into()),
-                occurred_at: row.get::<_, Option<String>>(17).unwrap_or(None).and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).map(|d| d.with_timezone(&Utc)).ok()),
-                })
-            })?;
-            let mut engrams = Vec::new();
-            for engram in rows {
-                engrams.push(engram?);
+            // Tokenized AND query — natural-language questions must not be
+            // treated as one exact phrase ("what did we decide about pricing"
+            // as a phrase matches nothing, ever). Each token is stripped to
+            // alphanumerics so shell/URL fragments can't break FTS5 syntax.
+            let tokens: Vec<String> = sanitized
+                .split_whitespace()
+                .map(|t| t.chars().filter(|c| c.is_alphanumeric()).collect::<String>())
+                .filter(|t| !t.is_empty())
+                .collect();
+            if tokens.is_empty() {
+                return Ok(Vec::new());
             }
-            Ok(engrams)
+            // AND first (precise); OR when AND over-constrains (recall).
+            let run_query = |fts_query: &str| -> rusqlite::Result<Vec<Engram>> {
+                let sql = format!(
+                    "SELECT e.id, e.layer, e.source, e.privacy_level, e.content, e.context, \
+                     e.strength, e.valence, e.retrievals, e.imagined, e.grounded, \
+                     e.created_at, e.last_retrieved, e.project, e.tags, \
+                     e.scope, e.content_type, e.occurred_at \
+                     FROM engrams_fts fts \
+                     INNER JOIN engrams e ON fts.id = e.id \
+                     WHERE engrams_fts MATCH ?1{} \
+                     ORDER BY rank \
+                     LIMIT ?2",
+                    filter.sql("e")
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                let rows = stmt.query_map(params![fts_query, limit_i64], Self::row_to_engram)?;
+                rows.collect()
+            };
+
+            // AND first (precise); OR when AND over-constrains (recall).
+            let and_query = tokens.join(" AND ");
+            match run_query(&and_query) {
+                Ok(v) if !v.is_empty() => Ok(v),
+                _ => {
+                    let or_query = tokens.join(" OR ");
+                    Ok(run_query(&or_query)?)
+                }
+            }
         })();
 
         match fts_result {
@@ -1098,53 +1118,26 @@ impl EngramStore {
 
     /// List all engrams with pagination
     pub async fn list(&self, limit: usize, offset: usize) -> Result<Vec<Engram>> {
+        self.list_filtered(limit, offset, QuarantineFilter::All).await
+    }
+
+    /// `list` with a quarantine scope applied in SQL (see [`QuarantineFilter`]).
+    pub async fn list_filtered(
+        &self,
+        limit: usize,
+        offset: usize,
+        filter: QuarantineFilter,
+    ) -> Result<Vec<Engram>> {
         let conn = self.conn.lock().await;
         let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
         let offset_i64 = i64::try_from(offset).unwrap_or(i64::MAX);
-        let mut stmt = conn.prepare(
-            "SELECT id, layer, source, privacy_level, content, context, strength, valence, retrievals, imagined, grounded, created_at, last_retrieved, project, tags, scope, content_type, occurred_at FROM engrams ORDER BY created_at DESC LIMIT ?1 OFFSET ?2"
-        )?;
-        
-        let rows = stmt.query_map(params![limit_i64, offset_i64], |row| {
-            let layer_str: String = row.get(1)?;
-            let source_str: String = row.get(2)?;
-            let privacy_str: String = row.get(3)?;
-            let context_str: String = row.get(5)?;
-            let tags_str: String = row.get(14)?;
-            let created_str: String = row.get(11)?;
-            let retrieved_str: Option<String> = row.get(12)?;
-            
-            Ok(Engram {
-                id: row.get(0)?,
-                layer: EngramLayer::from_str(&layer_str).unwrap_or(EngramLayer::Episodic),
-                source: EngramSource::from_str(&source_str).unwrap_or(EngramSource::Interaction),
-                content: row.get(4)?,
-                context: serde_json::from_str(&context_str).unwrap_or(serde_json::json!({})),
-                links: Vec::new(),
-                privacy_level: PrivacyLevel::from_str(&privacy_str).unwrap_or_default(),
-                strength: row.get(6)?,
-                valence: row.get(7)?,
-                retrievals: row.get(8)?,
-                imagined: row.get::<_, i32>(9)? != 0,
-                grounded: row.get::<_, i32>(10)? != 0,
-                created_at: chrono::DateTime::parse_from_rfc3339(&created_str)
-                    .map(|d| d.with_timezone(&Utc)).unwrap_or_else(|_| Utc::now()),
-                last_retrieved: retrieved_str.and_then(|s| 
-                    chrono::DateTime::parse_from_rfc3339(&s)
-                        .map(|d| d.with_timezone(&Utc)).ok()
-                ),
-                project: row.get(13)?,
-                tags: serde_json::from_str(&tags_str).unwrap_or_default(),
-                scope: row.get(15).unwrap_or_else(|_| "moment".into()),
-                content_type: row.get(16).unwrap_or_else(|_| "text".into()),
-                occurred_at: row.get::<_, Option<String>>(17).unwrap_or(None).and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).map(|d| d.with_timezone(&Utc)).ok()),
-            })
-        })?;
-        
-        let mut engrams = Vec::new();
-        for engram in rows {
-            engrams.push(engram?);
-        }
+        let sql = format!(
+            "SELECT id, layer, source, privacy_level, content, context, strength, valence, retrievals, imagined, grounded, created_at, last_retrieved, project, tags, scope, content_type, occurred_at FROM engrams WHERE 1=1{} ORDER BY created_at DESC LIMIT ?1 OFFSET ?2",
+            filter.sql("")
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![limit_i64, offset_i64], Self::row_to_engram)?;
+        let mut engrams: Vec<Engram> = rows.collect::<rusqlite::Result<_>>()?;
         Self::enrich_links_batch(&conn, &mut engrams)?;
         Ok(engrams)
     }
@@ -1155,6 +1148,17 @@ impl EngramStore {
     /// Tags are stored as a JSON array string in the `tags` column, so we match
     /// via `LIKE '%"tag"%'` for each tag.
     pub async fn search_by_tags(&self, tags: &[&str], limit: usize) -> Result<Vec<Engram>> {
+        self.search_by_tags_filtered(tags, limit, QuarantineFilter::All).await
+    }
+
+    /// `search_by_tags` with a quarantine scope applied in SQL (see
+    /// [`QuarantineFilter`]).
+    pub async fn search_by_tags_filtered(
+        &self,
+        tags: &[&str],
+        limit: usize,
+        filter: QuarantineFilter,
+    ) -> Result<Vec<Engram>> {
         let conn = self.conn.lock().await;
         let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
 
@@ -1164,8 +1168,9 @@ impl EngramStore {
             .collect();
         let where_clause = clauses.join(" AND ");
         let sql = format!(
-            "SELECT id, layer, source, privacy_level, content, context, strength, valence, retrievals, imagined, grounded, created_at, last_retrieved, project, tags, scope, content_type, occurred_at FROM engrams WHERE {} ORDER BY created_at DESC LIMIT ?{}",
+            "SELECT id, layer, source, privacy_level, content, context, strength, valence, retrievals, imagined, grounded, created_at, last_retrieved, project, tags, scope, content_type, occurred_at FROM engrams WHERE {}{} ORDER BY created_at DESC LIMIT ?{}",
             where_clause,
+            filter.sql(""),
             tags.len() + 1
         );
 
@@ -1180,41 +1185,7 @@ impl EngramStore {
 
         let params_refs: Vec<&dyn rusqlite::types::ToSql> = param_values.iter().map(|p| p.as_ref()).collect();
 
-        let rows = stmt.query_map(params_refs.as_slice(), |row| {
-            let layer_str: String = row.get(1)?;
-            let source_str: String = row.get(2)?;
-            let privacy_str: String = row.get(3)?;
-            let context_str: String = row.get(5)?;
-            let tags_str: String = row.get(14)?;
-            let created_str: String = row.get(11)?;
-            let retrieved_str: Option<String> = row.get(12)?;
-
-            Ok(Engram {
-                id: row.get(0)?,
-                layer: EngramLayer::from_str(&layer_str).unwrap_or(EngramLayer::Episodic),
-                source: EngramSource::from_str(&source_str).unwrap_or(EngramSource::Interaction),
-                content: row.get(4)?,
-                context: serde_json::from_str(&context_str).unwrap_or(serde_json::json!({})),
-                links: Vec::new(),
-                privacy_level: PrivacyLevel::from_str(&privacy_str).unwrap_or_default(),
-                strength: row.get(6)?,
-                valence: row.get(7)?,
-                retrievals: row.get(8)?,
-                imagined: row.get::<_, i32>(9)? != 0,
-                grounded: row.get::<_, i32>(10)? != 0,
-                created_at: chrono::DateTime::parse_from_rfc3339(&created_str)
-                    .map(|d| d.with_timezone(&Utc)).unwrap_or_else(|_| Utc::now()),
-                last_retrieved: retrieved_str.and_then(|s|
-                    chrono::DateTime::parse_from_rfc3339(&s)
-                        .map(|d| d.with_timezone(&Utc)).ok()
-                ),
-                project: row.get(13)?,
-                tags: serde_json::from_str(&tags_str).unwrap_or_default(),
-                scope: row.get(15).unwrap_or_else(|_| "moment".into()),
-                content_type: row.get(16).unwrap_or_else(|_| "text".into()),
-                occurred_at: row.get::<_, Option<String>>(17).unwrap_or(None).and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).map(|d| d.with_timezone(&Utc)).ok()),
-            })
-        })?;
+        let rows = stmt.query_map(params_refs.as_slice(), Self::row_to_engram)?;
 
         let mut engrams = Vec::new();
         for engram in rows {
@@ -2248,6 +2219,34 @@ mod tests {
         assert_eq!(store.count().await.unwrap(), 1, "no new row for duplicate");
         let strengthened = store.get(&aid).await.unwrap();
         assert!(strengthened.strength > 1.0, "duplicate should strengthen, got {}", strengthened.strength);
+    }
+
+    #[tokio::test]
+    async fn test_write_curated_persists_despite_sibling_duplicate() {
+        let (store, _dir) = test_store().await;
+        // Two sibling rows with identical normalized content — a real shape
+        // in vaults (the same command captured across sessions). The second
+        // sibling can only exist via a curated write (the capture-path dedupe
+        // gate would have swallowed it).
+        let a = make_engram("sibling content here");
+        let mut b = make_engram("sibling content here");
+        let bid = b.id.clone();
+        assert_eq!(store.write(&a).await.unwrap(), WriteOutcome::Inserted);
+        assert!(matches!(store.write(&b).await.unwrap(), WriteOutcome::Duplicate { .. }));
+        assert_eq!(store.write_curated(&b).await.unwrap(), WriteOutcome::Inserted);
+        assert_eq!(store.count().await.unwrap(), 2);
+
+        // mark-noise-style mutation: through write() the dedupe gate would
+        // return Duplicate and silently drop the update; write_curated must
+        // persist it.
+        b.imagined = true;
+        b.layer = EngramLayer::Imagined;
+        b.tags = vec!["noise".into()];
+        assert_eq!(store.write_curated(&b).await.unwrap(), WriteOutcome::Inserted);
+        let updated = store.get(&bid).await.unwrap();
+        assert!(updated.imagined, "curated mutation must persist");
+        assert_eq!(updated.layer, EngramLayer::Imagined);
+        assert_eq!(store.count().await.unwrap(), 2, "no new row created");
     }
 
     #[tokio::test]
