@@ -548,13 +548,8 @@ async fn search(
                 }
             }
 
-            // Account the L1 probes we just made. The REST route reads the
-            // vault directly (not through QemCache::search), so without this
-            // the hit counters stay structurally 0. Captured before the
-            // consuming loop below moves the Vec.
-            let qem_hit = !assoc_memory_ids.is_empty();
-            if qem_hit {
-                // Fetch the full engrams for QEM hits
+            // Fetch the full engrams for QEM hits
+            if !assoc_memory_ids.is_empty() {
                 for mid in assoc_memory_ids {
                     if let Ok(engram) = vault.get(&mid).await {
                         let boost = 3.0; // QEM associative hits get highest weight
@@ -574,8 +569,6 @@ async fn search(
                     format!("{}+qem_associative", search_type)
                 };
             }
-
-            state.qem.record_lookup(qem_hit);
         }
     }
 
@@ -606,6 +599,15 @@ async fn search(
             _ => {} // "relevance" is default — no re-sort needed
         }
     }
+
+    // Honest QEM accounting: the REST route reads the vault directly (not
+    // through QemCache::search), so the hit counters would stay structurally
+    // 0 without an explicit record. Probe the finalized result set once: a
+    // hit when any returned memory is present in L1, a miss otherwise. This
+    // replaces the old qem:0x-tag-only accounting, which ignored every
+    // normal search.
+    let qem_hit = memory_results.iter().any(|r| state.qem.is_cached(&r.id));
+    state.qem.record_lookup(qem_hit);
 
     Ok(Json(SearchResponse {
         results: memory_results,

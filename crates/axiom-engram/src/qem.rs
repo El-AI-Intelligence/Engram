@@ -395,6 +395,15 @@ impl<B: MemoryBackend> QemCache<B> {
         );
     }
 
+    /// Whether a memory ID is currently present in the L1 cache.
+    ///
+    /// Lets callers (e.g. the REST search route) do honest hit accounting:
+    /// a search result that came out of L1 is a hit, regardless of how it
+    /// was found.
+    pub fn is_cached(&self, memory_id: &str) -> bool {
+        self.by_code.read().values().any(|e| e.memory_id.0 == memory_id)
+    }
+
     /// Remove an entry from the L1 cache by memory ID.
     ///
     /// Call this when a memory is deleted from the L2 backend so stale
@@ -716,6 +725,21 @@ mod tests {
         // Retrieve non-existent — miss
         let _ = cache.retrieve(&MemoryId::from_string("nonexistent")).await;
         assert!(cache.hit_rate() <= 1.0);
+    }
+
+    #[tokio::test]
+    async fn test_is_cached() {
+        let backend = TestBackend::new();
+        let cache = QemCache::new(backend, QemConfig::default());
+
+        // Capture populates L1 (write-through)
+        let entry = MemoryEntry::new_episodic("cache membership test".into(), MemorySource::Interaction);
+        let id = cache.backend().capture(entry.clone()).await.unwrap();
+        assert!(!cache.is_cached(&id.0), "capture via the raw backend must not populate L1");
+
+        cache.populate_l1(&entry);
+        assert!(cache.is_cached(&id.0), "populate_l1 must make the entry visible to is_cached");
+        assert!(!cache.is_cached("absent"), "unknown IDs are never cached");
     }
 
     #[test]
