@@ -67,7 +67,10 @@ pub fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_engrams_source ON engrams(source);
         CREATE INDEX IF NOT EXISTS idx_engrams_created_at ON engrams(created_at);
         CREATE INDEX IF NOT EXISTS idx_engrams_imagined ON engrams(imagined);
-        CREATE INDEX IF NOT EXISTS idx_engrams_content_hash ON engrams(content_hash);
+        -- NOTE: idx_engrams_content_hash is deliberately NOT created here.
+        -- Existing vaults don't have the column yet (the table is a no-op
+        -- under IF NOT EXISTS), so the index would fail. The v4 migration
+        -- block in migrate() creates it after the ALTER TABLE ADD COLUMN.
         CREATE INDEX IF NOT EXISTS idx_engram_links_source ON engram_links(source_id);
         CREATE INDEX IF NOT EXISTS idx_engram_links_target ON engram_links(target_id);
 
@@ -403,4 +406,73 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     }
 
     Ok(())
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    /// Regression test for the live-vault crash: create_tables used to create
+    /// idx_engrams_content_hash before migrate() added the column, which
+    /// failed on every pre-v4 vault (table is a no-op under IF NOT EXISTS).
+    #[test]
+    fn create_tables_then_migrate_upgrades_pre_v4_vault() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let conn = Connection::open(&path).unwrap();
+
+        // Simulate a pre-v4 vault: user_version 3, no content_hash column.
+        conn.execute_batch(
+            "CREATE TABLE engrams (
+                id TEXT PRIMARY KEY,
+                layer TEXT NOT NULL,
+                source TEXT NOT NULL,
+                privacy_level TEXT NOT NULL DEFAULT 'cloud_first',
+                content TEXT NOT NULL,
+                context TEXT NOT NULL,
+                strength REAL NOT NULL DEFAULT 1.0,
+                valence REAL NOT NULL DEFAULT 0.0,
+                retrievals INTEGER NOT NULL DEFAULT 0,
+                imagined INTEGER NOT NULL DEFAULT 0,
+                grounded INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                last_retrieved TEXT,
+                project TEXT,
+                tags TEXT,
+                scope TEXT NOT NULL DEFAULT 'moment',
+                content_type TEXT NOT NULL DEFAULT 'text',
+                occurred_at TEXT
+            );"
+        ).unwrap();
+        conn.execute_batch("PRAGMA user_version = 3;").unwrap();
+        conn.execute(
+            "INSERT INTO engrams (id, layer, source, content, context, created_at) \
+             VALUES ('m1', 'episodic', 'interaction', '  [12] [/x] Cargo   Check ', '{}', '2026-08-13T00:00:00Z')",
+            [],
+        ).unwrap();
+
+        // create_tables must succeed on a pre-v4 vault (this is where the
+        // live deploy crashed), and migrate() must upgrade it.
+        create_tables(&conn).unwrap();
+        migrate(&conn).unwrap();
+
+        let has_col: bool = {
+            let mut stmt = conn.prepare("PRAGMA table_info('engrams')").unwrap();
+            let cols: Vec<String> = stmt.query_map([], |r| r.get::<_, String>(1)).unwrap()
+                .filter_map(|r| r.ok())
+                .collect();
+            cols.iter().any(|c| c == "content_hash")
+        };
+        assert!(has_col, "content_hash column should be added by migration");
+
+        // Backfill used the runtime-normalized hash
+        let hash: String = conn
+            .query_row("SELECT content_hash FROM engrams WHERE id = 'm1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(hash, crate::noise::normalized_hash("  [12] [/x] Cargo   Check "));
+
+        // Re-running both is idempotent
+        create_tables(&conn).unwrap();
+        migrate(&conn).unwrap();
+    }
 }
