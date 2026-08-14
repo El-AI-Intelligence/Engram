@@ -673,6 +673,8 @@ async fn ground(
     let vault = state.vault.lock().await;
     let mut engram = vault.get(&id).await.map_err(|e| err_json(404, e.to_string()))?;
     engram.grounded = true;
+    // Content mutation: bump modified_at so the change re-propagates on sync.
+    engram.modified_at = chrono::Utc::now();
     // Curated write: this mutation must persist even when a sibling row
     // shares the same content hash (dedupe would swallow it on write()).
     vault.write_curated(&engram).await.map_err(|e| err_json(500, e.to_string()))?;
@@ -697,6 +699,8 @@ async fn mark_noise(
     if !engram.tags.iter().any(|t| t == "noise") {
         engram.tags.push("noise".to_string());
     }
+    // Content mutation: bump modified_at so the change re-propagates on sync.
+    engram.modified_at = chrono::Utc::now();
     // Curated write: this mutation must persist even when a sibling row
     // shares the same content hash (dedupe would swallow it on write()).
     vault.write_curated(&engram).await.map_err(|e| err_json(500, e.to_string()))?;
@@ -733,6 +737,8 @@ async fn patch_one(
         engram.occurred_at = chrono::DateTime::parse_from_rfc3339(oa)
             .map(|d| d.with_timezone(&chrono::Utc)).ok();
     }
+    // Content mutation: bump modified_at so the change re-propagates on sync.
+    engram.modified_at = chrono::Utc::now();
     // Curated write: this mutation must persist even when a sibling row
     // shares the same content hash (dedupe would swallow it on write()).
     vault.write_curated(&engram).await.map_err(|e| err_json(500, e.to_string()))?;

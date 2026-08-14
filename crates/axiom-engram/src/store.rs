@@ -596,7 +596,7 @@ impl EngramStore {
             if let Some(existing_id) = duplicate {
                 let now = Utc::now().to_rfc3339();
                 conn.execute(
-                    "UPDATE engrams SET strength = MIN(2.0, strength + 0.1), last_retrieved = ?1 WHERE id = ?2",
+                    "UPDATE engrams SET strength = MIN(2.0, strength + 0.1), last_retrieved = ?1, modified_at = ?1 WHERE id = ?2",
                     params![now, existing_id],
                 )?;
                 Self::bump_metric(&conn, "dedup_saves")?;
@@ -628,8 +628,8 @@ impl EngramStore {
             r#"INSERT INTO engrams
                (id, layer, source, privacy_level, content, context, strength, valence, retrievals,
                 imagined, grounded, created_at, last_retrieved, project, tags,
-                scope, content_type, occurred_at, content_hash)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+                scope, content_type, occurred_at, modified_at, content_hash)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
                ON CONFLICT(id) DO UPDATE SET
                 layer = ?2, source = ?3, privacy_level = ?4, content = ?5,
                 context = ?6, strength = ?7, valence = ?8, retrievals = ?9,
@@ -637,7 +637,8 @@ impl EngramStore {
                 last_retrieved = COALESCE(?13, engrams.last_retrieved),
                 project = ?14, tags = ?15, scope = ?16, content_type = ?17,
                 occurred_at = COALESCE(?18, engrams.occurred_at),
-                content_hash = ?19"#,
+                modified_at = ?19,
+                content_hash = ?20"#,
             params![
                 filled.id, filled.layer.as_str(), filled.source.as_str(),
                 filled.privacy_level.as_str(),
@@ -646,7 +647,7 @@ impl EngramStore {
                 filled.grounded as i32, filled.created_at.to_rfc3339(),
                 filled.last_retrieved.map(|d| d.to_rfc3339()), filled.project, tags_json,
                 filled.scope, filled.content_type,
-                filled.occurred_at.map(|d| d.to_rfc3339()), hash,
+                filled.occurred_at.map(|d| d.to_rfc3339()), filled.modified_at.to_rfc3339(), hash,
             ],
         )?;
 
@@ -1298,6 +1299,22 @@ impl EngramStore {
         Ok(engrams)
     }
 
+    /// List engrams whose `modified_at` is strictly after `cutoff` (RFC3339),
+    /// oldest-first — the sync push cursor. Reads (`touch`) never bump
+    /// `modified_at`, so this returns exactly the rows a push must re-send,
+    /// including edits to memories that fall outside the recency top-N.
+    pub async fn list_modified_since(&self, cutoff: &str, limit: usize) -> Result<Vec<Engram>> {
+        let conn = self.conn.lock().await;
+        let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut stmt = conn.prepare(
+            "SELECT id, layer, source, privacy_level, content, context, strength, valence, retrievals, imagined, grounded, created_at, last_retrieved, project, tags, scope, content_type, occurred_at, modified_at FROM engrams WHERE modified_at > ?1 ORDER BY modified_at ASC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![cutoff, limit_i64], Self::row_to_engram)?;
+        let mut engrams: Vec<Engram> = rows.collect::<rusqlite::Result<_>>()?;
+        Self::enrich_links_batch(&conn, &mut engrams)?;
+        Ok(engrams)
+    }
+
     /// Search engrams by tag(s). Returns engrams that contain ALL of the given
     /// tags, sorted by `created_at DESC` (newest first).
     ///
@@ -1370,6 +1387,11 @@ impl EngramStore {
         conn.execute(
             "INSERT OR REPLACE INTO engram_links (source_id, target_id, weight, link_type) VALUES (?1, ?2, ?3, ?4)",
             params![source_id, target_id, weight, link_type.as_str()],
+        )?;
+        // Bump the source row so the link change re-propagates on the next push.
+        conn.execute(
+            "UPDATE engrams SET modified_at = ?1 WHERE id = ?2",
+            params![Utc::now().to_rfc3339(), source_id],
         )?;
         Ok(())
     }
@@ -2317,6 +2339,51 @@ mod tests {
         assert_eq!(store.count().await.unwrap(), 2);
         let list = store.list(10, 0).await.unwrap();
         assert_eq!(list.len(), 2);
+    }
+
+    /// `list_modified_since` is strictly-after the cutoff, oldest-first, and
+    /// an edit to an old memory re-selects it even though it falls outside
+    /// the recency top-N — the whole reason the push filter exists.
+    #[tokio::test]
+    async fn test_list_modified_since_filters_and_orders() {
+        let (store, _dir) = test_store().await;
+        let a = make_engram("first memory");
+        let b = make_engram("second memory");
+        let a_id = a.id.clone();
+        let b_id = b.id.clone();
+        store.write(&a).await.unwrap();
+        let a_mod = store.get(&a_id).await.unwrap().modified_at;
+        store.write(&b).await.unwrap();
+        let b_mod = store.get(&b_id).await.unwrap().modified_at;
+
+        // Cutoff before both: both selected, oldest first.
+        let rows = store.list_modified_since("1970-01-01T00:00:00Z", 10).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id, a_id);
+        assert_eq!(rows[1].id, b_id);
+
+        // Cutoff at a's modified_at: strictly-after semantics exclude a.
+        let rows = store.list_modified_since(&a_mod.to_rfc3339(), 10).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, b_id);
+
+        // Edit the older memory (routes stamp modified_at before write_curated):
+        // re-selected, and the upsert preserves the caller-supplied value —
+        // sync pull relies on this to keep the remote modified_at (no echo).
+        let mut edited = store.get(&a_id).await.unwrap();
+        edited.content = "first memory edited".into();
+        edited.modified_at = Utc::now();
+        store.write_curated(&edited).await.unwrap();
+        let fetched = store.get(&a_id).await.unwrap();
+        assert_eq!(fetched.content, "first memory edited");
+        assert_eq!(fetched.modified_at, edited.modified_at);
+
+        // Cutoff after b's creation selects only the edited a — the edit
+        // re-propagates even though a is old (top-N by created_at would
+        // never see it).
+        let rows = store.list_modified_since(&b_mod.to_rfc3339(), 10).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, a_id);
     }
 
     #[tokio::test]
