@@ -390,8 +390,12 @@ async fn run_daemon(
     // ── Embedding provider (zero-config ONNX, auto-downloads model) ──────
     // dimensions() reports the configured size (384) even before the model
     // loads, so capture/search attempt embed() immediately; embed() lazy-loads
-    // the model on first use and applies retry backoff on failure.
-    let embedder: Option<Arc<dyn Embedder>> = Some(Arc::new(axiom_engram::OnnxEmbedder::new()));
+    // the model on first use and applies retry backoff on failure. The model
+    // cache lives next to the vault (not $HOME) — HOME is often unset under
+    // systemd.
+    let embedder: Option<Arc<dyn Embedder>> = Some(Arc::new(
+        axiom_engram::OnnxEmbedder::with_cache_dir(vault_path.clone()),
+    ));
     info!("ONNX embedder enabled (MiniLM model loads lazily on first embed)");
 
     // Manual sync trigger channel — /sync/now bumps the counter, the sync

@@ -75,6 +75,10 @@ pub struct OnnxEmbedder {
     inner: std::sync::Mutex<Option<CandleBert>>,
     /// Time of the last failed init attempt (for retry backoff).
     last_failure: std::sync::Mutex<Option<std::time::Instant>>,
+    /// Explicit model-cache base dir (e.g. the vault path). When None, the
+    /// home directory is used — which fails under systemd/docker, where
+    /// HOME is often unset.
+    cache_dir: Option<PathBuf>,
 }
 
 #[cfg(feature = "onnx-embed")]
@@ -102,6 +106,18 @@ impl OnnxEmbedder {
             model_name: Self::MODEL_ID.to_string(),
             inner: std::sync::Mutex::new(None),
             last_failure: std::sync::Mutex::new(None),
+            cache_dir: None,
+        }
+    }
+
+    /// Create an embedder whose model cache lives under `base` (the vault
+    /// directory) instead of the home directory. This is what engramd uses:
+    /// HOME is often unset under systemd, and keeping the model next to the
+    /// vault keeps the machine self-contained.
+    pub fn with_cache_dir(base: PathBuf) -> Self {
+        Self {
+            cache_dir: Some(base),
+            ..Self::new()
         }
     }
 
@@ -135,7 +151,7 @@ impl OnnxEmbedder {
     /// Download (if needed) and load the model. Returns Err on any failure;
     /// the caller applies the retry backoff.
     fn load_model(&self) -> Result<(), String> {
-        let model_dir = Self::model_dir()?;
+        let model_dir = self.model_dir()?;
         let config_path = model_dir.join("config.json");
         let tokenizer_path = model_dir.join("tokenizer.json");
         let weights_path = model_dir.join("model.safetensors");
@@ -199,7 +215,12 @@ impl OnnxEmbedder {
     }
 
     /// Compute the model cache directory.
-    fn model_dir() -> Result<PathBuf, String> {
+    fn model_dir(&self) -> Result<PathBuf, String> {
+        if let Some(base) = &self.cache_dir {
+            return Ok(base
+                .join(Self::MODELS_DIR)
+                .join(Self::MODEL_ID.replace('/', "_")));
+        }
         let home = dirs_fallback()
             .ok_or_else(|| "Cannot determine home directory for model cache".to_string())?;
         Ok(home
