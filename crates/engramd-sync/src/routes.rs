@@ -16,6 +16,7 @@ pub fn router() -> Router<SyncState> {
         .route("/v1/vaults/{vault_id}/push", axum::routing::post(push))
         .route("/v1/vaults/{vault_id}/pull", get(pull))
         .route("/v1/vaults/{vault_id}/stats", get(stats))
+        .route("/v1/vaults/{vault_id}/devices", get(devices))
 }
 
 /// Server health. No auth required (public endpoint).
@@ -261,6 +262,65 @@ async fn stats(
         "vault_id": vault_id,
         "total_blobs": count,
         "latest_sync": latest,
+    })))
+}
+
+/// Devices that have pushed blobs to a vault — the team roster backing the
+/// shared-vault v0 UI. Auth required, same as `stats`. The server only knows
+/// device_ids (blobs carry no labels), so the aggregating daemon annotates
+/// `is_self` for its UI.
+async fn devices(
+    State(state): State<SyncState>,
+    headers: HeaderMap,
+    Path(vault_id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    authenticate(&state, &headers).await?;
+
+    let conn = state.conn.lock().await;
+    let mut stmt = conn
+        .prepare(
+            "SELECT device_id, MAX(created_at) AS last_seen, COUNT(*) AS blob_count \
+             FROM sync_blobs WHERE vault_id = ?1 GROUP BY device_id ORDER BY last_seen DESC",
+        )
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?;
+    let rows = stmt
+        .query_map(rusqlite::params![vault_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?;
+
+    let mut device_list = Vec::new();
+    for row in rows {
+        let (device_id, last_seen, blob_count) = row.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?;
+        device_list.push(json!({
+            "device_id": device_id,
+            "last_seen": last_seen,
+            "blob_count": blob_count,
+        }));
+    }
+
+    Ok(Json(json!({
+        "vault_id": vault_id,
+        "devices": device_list,
     })))
 }
 

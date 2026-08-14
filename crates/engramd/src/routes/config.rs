@@ -176,6 +176,13 @@ struct SyncConfig {
     /// Pull interval in seconds
     #[serde(default = "default_sync_interval")]
     interval_secs: u64,
+    /// Shared-vault identity — devices pushing/pulling the same vault_id with
+    /// the same passphrase form a team (Teams v0). Null = solo vault.
+    #[serde(default)]
+    vault_id: Option<String>,
+    /// Human-readable vault/team name, shown in the Sync & Team panel.
+    #[serde(default)]
+    name: Option<String>,
 }
 
 fn default_sync_interval() -> u64 { 60 }
@@ -187,6 +194,8 @@ impl Default for SyncConfig {
             server_url: None,
             api_key: None,
             interval_secs: 60,
+            vault_id: None,
+            name: None,
         }
     }
 }
@@ -209,12 +218,33 @@ impl Default for SummarizationConfig {
     }
 }
 
+/// Sync patch — every field optional so a partial PATCH only overwrites the
+/// fields actually present (full `SyncConfig` replacement would null
+/// `vault_id`/`name` whenever the UI saves a partial form).
+#[derive(Debug, Deserialize)]
+struct SyncPatch {
+    /// The masked value from GET ("••••••••") round-trips unchanged; a real
+    /// key here replaces the stored one.
+    #[serde(default)]
+    api_key: Option<String>,
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    server_url: Option<String>,
+    #[serde(default)]
+    interval_secs: Option<u64>,
+    #[serde(default)]
+    vault_id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct PatchConfigBody {
     context: Option<ContextConfig>,
     schedule: Option<ScheduleConfig>,
     embedding: Option<EmbeddingConfig>,
-    sync: Option<SyncConfig>,
+    sync: Option<SyncPatch>,
     summarization: Option<SummarizationConfig>,
     qem: Option<QemConfigSection>,
     noise: Option<NoiseConfig>,
@@ -305,12 +335,29 @@ async fn patch_config(
         config.embedding = embedding;
     }
     if let Some(sync) = body.sync {
-        // Never persist the API key from a GET response (masked value)
-        let mut s = sync;
-        if s.api_key.as_deref() == Some("••••••••") {
-            s.api_key = config.sync.api_key.clone();
+        // Field-wise merge: a partial PATCH (e.g. just the team name) must
+        // not erase vault_id or null other untouched fields. Never persist
+        // the masked API key from a GET round-trip.
+        if sync.api_key.as_deref() != Some("••••••••") {
+            if let Some(k) = sync.api_key {
+                config.sync.api_key = Some(k);
+            }
         }
-        config.sync = s;
+        if let Some(v) = sync.enabled {
+            config.sync.enabled = v;
+        }
+        if let Some(v) = sync.server_url {
+            config.sync.server_url = Some(v);
+        }
+        if let Some(v) = sync.interval_secs {
+            config.sync.interval_secs = v;
+        }
+        if let Some(v) = sync.vault_id {
+            config.sync.vault_id = Some(v);
+        }
+        if let Some(v) = sync.name {
+            config.sync.name = Some(v);
+        }
     }
     if let Some(summarization) = body.summarization {
         config.summarization = summarization;

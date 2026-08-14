@@ -370,6 +370,7 @@ pub fn spawn_sync_loop(
     vault_path: std::path::PathBuf,
     interval: std::time::Duration,
     mut trigger: tokio::sync::watch::Receiver<u64>,
+    events_tx: tokio::sync::broadcast::Sender<crate::app_state::LiveEvent>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // Delay first sync so the server has time to start.
@@ -632,6 +633,16 @@ pub fn spawn_sync_loop(
                                         if max_pulled_modified.as_deref().unwrap_or("") < m.as_str() {
                                             max_pulled_modified = Some(m);
                                         }
+                                        // Teammate activity: broadcast the
+                                        // imported memory so the SPA live feed
+                                        // updates without a reload. The UI
+                                        // dedupes by memory id.
+                                        let _ = events_tx.send(crate::app_state::LiveEvent::Capture {
+                                            memory: serde_json::to_value(&engram).unwrap_or_else(
+                                                |_| serde_json::json!({"id": memory_id}),
+                                            ),
+                                            timestamp: chrono::Utc::now().to_rfc3339(),
+                                        });
                                     }
                                 } else {
                                     tracing::warn!(

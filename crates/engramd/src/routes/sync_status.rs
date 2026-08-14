@@ -89,7 +89,7 @@ struct SyncStatusResponse {
     remote_version: Option<String>,
     /// Sync interval in seconds
     interval_secs: u64,
-    /// Estimated memory count pending push (created since last push)
+    /// Estimated memory count pending push (modified since last push)
     pending_push_count: usize,
 }
 
@@ -165,19 +165,15 @@ async fn status(
         }
     };
 
-    // Count pending pushes: memories created after last_push
+    // Count pending pushes: memories modified after last_push (same cursor
+    // semantics as the push filter itself).
     let pending_push_count = if let Some(ref lp) = last_push {
         let vault = state.vault.lock().await;
-        let all = vault.list(1000, 0).await.unwrap_or_default();
-        all.into_iter()
-            .filter(|m| {
-                if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(lp) {
-                    m.created_at > dt.with_timezone(&chrono::Utc)
-                } else {
-                    false
-                }
-            })
-            .count()
+        vault
+            .list_modified_since(lp, 1000)
+            .await
+            .unwrap_or_default()
+            .len()
     } else {
         0
     };

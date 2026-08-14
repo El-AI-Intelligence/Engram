@@ -493,6 +493,7 @@ async fn run_daemon(
                         vault_path.clone(),
                         std::time::Duration::from_secs(interval_secs),
                         sync_trigger_rx,
+                        state.events_tx.clone(),
                     );
                 } else {
                     tracing::error!(
@@ -531,6 +532,7 @@ async fn run_daemon(
         .merge(routes::saved_searches::router())
         .merge(routes::privacy::router())
         .merge(routes::sync_status::router())
+        .merge(routes::teams::router())
         .with_state(state)
         // CORS must be outermost so OPTIONS preflight is handled before auth
         .layer(axum::middleware::from_fn_with_state(
