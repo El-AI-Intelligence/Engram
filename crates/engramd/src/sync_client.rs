@@ -405,6 +405,10 @@ pub fn spawn_sync_loop(
             match client.pull(last_sync.as_deref(), 500).await {
                 Ok(resp) => {
                     let mut latest_seen: Option<String> = None;
+                    // Highest modified_at among blobs imported this pull — the
+                    // push cursor advances past it below so pulled rows are
+                    // never re-selected and re-pushed (echo churn).
+                    let mut max_pulled_modified: Option<String> = None;
 
                     for blob in &resp.blobs {
                         // Track the latest timestamp for pagination cursor advancement
@@ -537,6 +541,22 @@ pub fn spawn_sync_loop(
                                             engram.created_at = dt.with_timezone(&chrono::Utc);
                                         }
                                     }
+                                    // Preserve the remote modified_at — the
+                                    // write_inner upsert stamps whatever the
+                                    // Engram carries, so this is what stops
+                                    // the echo: a fresh local now() here would
+                                    // re-select the row for push every cycle.
+                                    // Pre-v5 envelopes fall back to created_at,
+                                    // matching the schema-v5 backfill.
+                                    let pulled_modified = json
+                                        .get("modified_at")
+                                        .and_then(|v| v.as_str())
+                                        .or_else(|| json.get("created_at").and_then(|v| v.as_str()));
+                                    if let Some(ma) = pulled_modified {
+                                        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ma) {
+                                            engram.modified_at = dt.with_timezone(&chrono::Utc);
+                                        }
+                                    }
                                     if let Some(img) = json.get("imagined").and_then(|v| v.as_bool()) {
                                         engram.imagined = img;
                                     }
@@ -606,6 +626,12 @@ pub fn spawn_sync_loop(
                                             memory_id.to_string(),
                                             blob.vector_clock,
                                         );
+                                        // Track the imported row's modified_at
+                                        // so the push cursor skips it below.
+                                        let m = engram.modified_at.to_rfc3339();
+                                        if max_pulled_modified.as_deref().unwrap_or("") < m.as_str() {
+                                            max_pulled_modified = Some(m);
+                                        }
                                     }
                                 } else {
                                     tracing::warn!(
@@ -652,6 +678,17 @@ pub fn spawn_sync_loop(
                         // re-pull the same batch forever.
                         last_sync = Some(ts);
                     }
+
+                    // Echo-churn fix (pull side): advance the push cursor past
+                    // the modified_at of every row imported this pull. Without
+                    // this, the imported rows re-satisfy `modified_at > cutoff`
+                    // on the next cycle and get re-pushed — the server rejects
+                    // them as stale, but the churn and noise remain.
+                    if let Some(mp) = max_pulled_modified {
+                        if last_push.as_deref().unwrap_or("") < mp.as_str() {
+                            last_push = Some(mp);
+                        }
+                    }
                 }
                 Err(e) => {
                     tracing::warn!("sync pull error: {e}");
@@ -665,7 +702,7 @@ pub fn spawn_sync_loop(
                         let entry = known_clocks.entry(id).or_insert(0);
                         *entry = (*entry).max(clock);
                     }
-                    // Advance last_push so we only push newly-created memories
+                    // Advance last_push so we only push newly-modified memories
                     // on subsequent cycles. This replaces the 5-minute window.
                     if let Some(ts) = new_last_push {
                         last_push = Some(ts);
@@ -718,9 +755,9 @@ pub fn spawn_sync_loop(
 
 /// Push locally-modified memories that haven't been synced yet.
 ///
-/// Uses a persisted `last_push` timestamp to push only newly-created memories
-/// since the last successful push cycle, replacing the old 5-minute freshness
-/// window that silently dropped memories created while the daemon was down.
+/// Uses a persisted `last_push` cursor against `modified_at` to push only
+/// memories modified since the last successful push cycle — including edits
+/// to old memories, which the previous `created_at` + top-200 filter dropped.
 /// On first push (no persisted `last_push`), uses a 24-hour window.
 ///
 /// Returns the set of (memory_id, clock) pairs for blobs that were **accepted**
@@ -746,26 +783,24 @@ async fn push_local_changes(
     let mut batch_latest: Option<String> = last_push.map(String::from);
     let fresh_jsons: Vec<(String, String)> = {
         let vault = vault.lock().await;
-        let recent = vault
-            .list(200, 0)
+        // modified_at-based cursor: edits to old memories re-propagate even
+        // when they fall outside the recency top-N (reads never bump it).
+        let fresh: Vec<axiom_engram::Engram> = vault
+            .list_modified_since(&cutoff.to_rfc3339(), 500)
             .await
-            .map_err(|e| format!("list failed: {e}"))?;
-
-        let fresh: Vec<_> = recent
-            .into_iter()
-            .filter(|m| m.created_at > cutoff)
-            .collect();
+            .map_err(|e| format!("list_modified_since failed: {e}"))?;
 
         if fresh.is_empty() {
             return Ok((std::collections::HashMap::new(), batch_latest));
         }
 
-        // Track the latest created_at in the batch for advancing last_push
+        // Track the latest modified_at in the batch for advancing last_push
         let mut jsons = Vec::with_capacity(fresh.len());
         for mem in &fresh {
             let created_at = mem.created_at.to_rfc3339();
-            if batch_latest.as_deref().unwrap_or("") < created_at.as_str() {
-                batch_latest = Some(created_at.clone());
+            let modified_at = mem.modified_at.to_rfc3339();
+            if batch_latest.as_deref().unwrap_or("") < modified_at.as_str() {
+                batch_latest = Some(modified_at.clone());
             }
             // Links and the embedding ride along in the blob so the graph
             // (and vector fallback) round-trip across devices.
@@ -802,6 +837,7 @@ async fn push_local_changes(
                 "grounded": mem.grounded,
                 "retrievals": mem.retrievals,
                 "created_at": created_at,
+                "modified_at": modified_at,
                 "last_retrieved": mem.last_retrieved.map(|d| d.to_rfc3339()),
                 "occurred_at": mem.occurred_at.map(|d| d.to_rfc3339()),
                 "links": links_json,

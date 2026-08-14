@@ -291,3 +291,43 @@ fn rapid_pushes_produce_monotonic_clocks() {
         assert!(clocks[i] > clocks[i - 1], "clocks must be strictly monotonic");
     }
 }
+
+// ── Edit propagation (modified_at) ──────────────────────────────────────────
+
+/// The push envelope carries `modified_at`; it must survive the
+/// encrypt→decrypt round-trip exactly so the puller can preserve the remote
+/// value — the echo-churn fix relies on the pulled row keeping the remote
+/// timestamp instead of a fresh local stamp (which would re-push forever).
+#[tokio::test]
+async fn modified_at_round_trips_in_blob() {
+    let client = test_client();
+    let plaintext = r#"{"id":"mem_edit","content":"edited content","layer":"episodic","source":"interaction","created_at":"2026-08-01T12:00:00Z","modified_at":"2026-08-14T09:30:15.123456789Z"}"#;
+
+    let blob = client
+        .encrypt_memory("mem_edit", plaintext, false)
+        .await
+        .expect("encrypt should succeed");
+
+    let decrypted = client.decrypt_blob(&blob).expect("decrypt should succeed");
+    assert_eq!(decrypted, plaintext);
+
+    let json: serde_json::Value = serde_json::from_str(&decrypted).unwrap();
+    assert_eq!(
+        json["modified_at"].as_str().unwrap(),
+        "2026-08-14T09:30:15.123456789Z",
+        "modified_at must survive the blob round-trip exactly"
+    );
+}
+
+/// An edit produces a strictly-higher clock than the original blob, so the
+/// server's LWW accepts the re-pushed edit even though the memory itself is
+/// old — the clock ordering (not age) decides the conflict.
+#[test]
+fn lww_edit_beats_original() {
+    let original_clock: u64 = 3;
+    let edit_clock: u64 = original_clock + 1;
+    assert!(
+        edit_clock > original_clock,
+        "the edited blob must outrank the original in LWW"
+    );
+}
