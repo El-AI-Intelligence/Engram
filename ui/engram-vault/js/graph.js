@@ -206,6 +206,7 @@ export class MemoryGraph {
     const dpr  = window.devicePixelRatio || 1;
     const w = rect.width, h = rect.height;
     if (w === 0 || h === 0) return;
+    const firstLayout = !this.W || !this.H;
     this.canvas.width  = w * dpr;
     this.canvas.height = h * dpr;
     this.canvas.style.width  = w + 'px';
@@ -213,6 +214,10 @@ export class MemoryGraph {
     this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     this.W = w; this.H = h;
     this.particleGrad = null; // invalidate cache
+    // Nodes were seeded before the container had a size (or the page
+    // resized): re-center the cluster so gravity doesn't drag it to a
+    // stale center point.
+    if (firstLayout && this.nodes.length) this._initPositions();
   }
 
   _initPositions() {
@@ -778,8 +783,11 @@ export class MemoryGraph {
   }
 
   _resetView() {
-    this.view.targetX     = this.W / 2;
-    this.view.targetY     = this.H / 2;
+    // Identity view: nodes live in screen space (seeded around W/2, H/2),
+    // so the translate must be 0 — a W/2, H/2 offset pushed the whole
+    // cluster to the bottom-right corner, the "drifting down" bug.
+    this.view.targetX     = 0;
+    this.view.targetY     = 0;
     this.view.targetScale = 1;
     this.focusNode        = null;
     this.focusPulse       = 0;
