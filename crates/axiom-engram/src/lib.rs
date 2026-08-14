@@ -29,6 +29,7 @@ pub mod noise;
 
 pub use engram::{Engram, EngramLayer, EngramSource, EngramLink, PrivacyLevel, CoherenceState, CharacterTopology, Goal, GoalStatus, ConsolidationRun, LinkType};
 pub use store::EngramStore;
+pub use store::LinkInferenceConfig;
 pub use store::TemporalPattern;
 pub use store::WriteOutcome;
 pub use store::QuarantineFilter;

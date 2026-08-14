@@ -85,6 +85,18 @@ pub enum Commands {
         #[arg(long)]
         vault: Option<PathBuf>,
     },
+    /// Backfill associative links between existing memories from their embeddings
+    BackfillLinks {
+        /// Path to vault (overrides config)
+        #[arg(long)]
+        vault: Option<PathBuf>,
+        /// Max neighbors per memory
+        #[arg(long, default_value = "5")]
+        max_links: usize,
+        /// Minimum cosine similarity for a link
+        #[arg(long, default_value = "0.35")]
+        min_similarity: f64,
+    },
     /// Install MCP server config for AI editors (Claude Desktop, Cursor, Continue)
     Mcp {
         /// "install" or "status"
@@ -593,6 +605,18 @@ pub async fn handle_demo(vault_opt: Option<PathBuf>) -> Result<()> {
     println!("    → http://localhost:8787");
     println!();
 
+    Ok(())
+}
+
+pub async fn handle_backfill_links(
+    vault_opt: Option<PathBuf>,
+    max_links: usize,
+    min_similarity: f64,
+) -> Result<()> {
+    let vp = vault_path(vault_opt);
+    let store = EngramStore::open(&vp).await?;
+    let created = store.backfill_semantic_links(max_links, min_similarity).await?;
+    println!("🔗 Backfilled {created} link rows (max {max_links}/memory, min similarity {min_similarity})");
     Ok(())
 }
 

@@ -340,7 +340,7 @@ async fn capture(
             let model = state.embedder.as_ref()
                 .map(|e| e.model_name().to_string())
                 .unwrap_or_else(|| "unknown".to_string());
-            vault.write_with_embedding(&engram, Some(emb), Some(&model))
+            vault.write_with_embedding(&engram, Some(emb), Some(&model), state.link_inference.as_ref())
                 .await.map_err(|e| errors::db_error(e))?
         }
         None => vault.write(&engram).await.map_err(|e| errors::db_error(e))?,

@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{broadcast, watch, Mutex};
 
-use axiom_engram::{EngramStore, EngramStoreAdapter, QemCache};
+use axiom_engram::{EngramStore, EngramStoreAdapter, LinkInferenceConfig, QemCache};
 use axiom_engram::embed::Embedder;
 use axiom_inference::InferenceProvider;
 
@@ -63,4 +63,8 @@ pub struct AppState {
     /// increment wakes the sync loop for an immediate cycle; a counter
     /// rather than a Notify so a trigger fired mid-cycle isn't lost.
     pub sync_trigger: Arc<watch::Sender<u64>>,
+    /// Automatic associative link inference from embeddings (`links` section
+    /// of config.json). `None` disables write-time inference; loaded once at
+    /// startup — a PATCH to /config requires a restart.
+    pub link_inference: Option<LinkInferenceConfig>,
 }

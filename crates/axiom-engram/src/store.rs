@@ -305,6 +305,21 @@ pub struct EngramStore {
     conn: Arc<Mutex<rusqlite::Connection>>,
 }
 
+/// Settings for automatic associative link inference from embeddings.
+#[derive(Debug, Clone)]
+pub struct LinkInferenceConfig {
+    /// Maximum neighbors to link per write.
+    pub max_links: usize,
+    /// Minimum cosine similarity to create a link.
+    pub min_similarity: f64,
+}
+
+impl Default for LinkInferenceConfig {
+    fn default() -> Self {
+        Self { max_links: 5, min_similarity: 0.35 }
+    }
+}
+
 impl EngramStore {
     /// Open or create an encrypted engram store.
     ///
@@ -509,7 +524,7 @@ impl EngramStore {
     /// insert + FTS + embedding + links (B6). See [`WriteOutcome`] for the
     /// three possible results.
     pub async fn write(&self, engram: &Engram) -> Result<WriteOutcome> {
-        self.write_inner(engram, None, None, true).await
+        self.write_inner(engram, None, None, true, None).await
     }
 
     /// Write an engram with an optional embedding vector.
@@ -521,8 +536,9 @@ impl EngramStore {
         engram: &Engram,
         embedding: Option<&[f64]>,
         model: Option<&str>,
+        infer: Option<&LinkInferenceConfig>,
     ) -> Result<WriteOutcome> {
-        self.write_inner(engram, embedding, model, true).await
+        self.write_inner(engram, embedding, model, true, infer).await
     }
 
     /// Write an already-stored memory verbatim, bypassing the capture-pipeline
@@ -534,7 +550,7 @@ impl EngramStore {
     /// gate returns `Duplicate` and skips the write). Callers are route
     /// handlers acting on an id the user already reviewed.
     pub async fn write_curated(&self, engram: &Engram) -> Result<WriteOutcome> {
-        self.write_inner(engram, None, None, false).await
+        self.write_inner(engram, None, None, false, None).await
     }
 
     /// Internal write implementation shared by `write` and `write_with_embedding`.
@@ -548,6 +564,7 @@ impl EngramStore {
         embedding: Option<&[f64]>,
         model: Option<&str>,
         gates: bool,
+        infer: Option<&LinkInferenceConfig>,
     ) -> Result<WriteOutcome> {
         let conn = self.conn.lock().await;
 
@@ -651,6 +668,23 @@ impl EngramStore {
                     "INSERT OR REPLACE INTO engram_embeddings (engram_id, embedding, model, dimensions, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
                     params![filled.id, blob, model_name, dims, now],
                 )?;
+            }
+        }
+
+        // Persist explicit links carried on the engram (sync pull, curated
+        // writes) — links round-trip through sync blobs.
+        for link in &filled.links {
+            tx.execute(
+                "INSERT OR REPLACE INTO engram_links (source_id, target_id, weight, link_type) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![filled.id, link.target_id, link.weight, link.link_type.as_str()],
+            )?;
+        }
+
+        // B6b: semantic associative links from the fresh embedding.
+        if let (Some(emb), Some(cfg)) = (embedding, infer) {
+            if !emb.is_empty() {
+                Self::generate_semantic_links(&tx, &filled, emb, cfg)?;
             }
         }
 
@@ -782,6 +816,57 @@ impl EngramStore {
         }
 
         Ok(())
+    }
+
+    /// B6b: semantic associative linking. After an embedding is stored, link
+    /// the new memory to its top-k nearest neighbors by cosine similarity —
+    /// both directions, weight = similarity. Targets are live memories only:
+    /// a quarantined memory never receives an auto-link from a live one.
+    /// Called on the insert path inside the write transaction, after the
+    /// embedding INSERT. Raw connection handle only — see write_inner.
+    fn generate_semantic_links(
+        conn: &rusqlite::Connection,
+        engram: &Engram,
+        embedding: &[f64],
+        config: &LinkInferenceConfig,
+    ) -> Result<usize> {
+        let mut stmt = conn.prepare(
+            "SELECT ee.engram_id, ee.embedding FROM engram_embeddings ee \
+             JOIN engrams e ON e.id = ee.engram_id \
+             WHERE ee.engram_id != ?1 AND NOT (e.imagined = 1 AND e.grounded = 0)",
+        )?;
+        let rows = stmt.query_map([&engram.id], |row| {
+            let id: String = row.get(0)?;
+            let blob: Vec<u8> = row.get(1)?;
+            Ok((id, blob))
+        })?;
+
+        let mut scored: Vec<(String, f64)> = Vec::new();
+        for row in rows {
+            let (id, blob) = row?;
+            let sim = cosine_similarity(embedding, &blob_to_embedding(&blob));
+            if sim >= config.min_similarity {
+                scored.push((id, sim));
+            }
+        }
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(config.max_links);
+
+        let mut created = 0usize;
+        for (target, sim) in scored {
+            conn.execute(
+                "INSERT OR REPLACE INTO engram_links (source_id, target_id, weight, link_type) \
+                 VALUES (?1, ?2, ?3, 'associative')",
+                params![engram.id, target, sim],
+            )?;
+            conn.execute(
+                "INSERT OR REPLACE INTO engram_links (source_id, target_id, weight, link_type) \
+                 VALUES (?1, ?2, ?3, 'associative')",
+                params![target, engram.id, sim],
+            )?;
+            created += 1;
+        }
+        Ok(created)
     }
 
     /// Update retrieval counters — called on every successful read.
@@ -1373,57 +1458,114 @@ impl EngramStore {
     /// Find engrams related to the given one by following outgoing links,
     /// sorted by link weight descending.
     pub async fn search_related(&self, engram_id: &str, limit: usize) -> Result<Vec<Engram>> {
-        // Get links first, then fetch engrams — split to avoid holding conn twice
+        // Explicit links first; when they don't fill the limit, fall back to
+        // vector-similarity neighbors of this memory's own embedding. Live
+        // targets only — quarantined memories never surface as related.
         let links = self.get_links(engram_id).await?;
         let conn = self.conn.lock().await;
-        let mut engrams = Vec::new();
+        let mut seen: Vec<String> = Vec::new();
+        let mut engrams: Vec<Engram> = Vec::new();
         for link in links.iter().take(limit) {
-            let result = conn.query_row(
-                "SELECT id, layer, source, privacy_level, content, context, strength, valence, retrievals, imagined, grounded, created_at, last_retrieved, project, tags, scope, content_type, occurred_at FROM engrams WHERE id = ?1",
-                [&link.target_id],
-                |row| {
-                    let layer_str: String = row.get(1)?;
-                    let source_str: String = row.get(2)?;
-                    let privacy_str: String = row.get(3)?;
-                    let context_str: String = row.get(5)?;
-                    let tags_str: String = row.get(14)?;
-                    let created_str: String = row.get(11)?;
-                    let retrieved_str: Option<String> = row.get(12)?;
-                    Ok(Engram {
-                        id: row.get(0)?,
-                        layer: EngramLayer::from_str(&layer_str).unwrap_or(EngramLayer::Episodic),
-                        source: EngramSource::from_str(&source_str).unwrap_or(EngramSource::Interaction),
-                        content: row.get(4)?,
-                        context: serde_json::from_str(&context_str).unwrap_or(serde_json::json!({})),
-                        links: Vec::new(),
-                        privacy_level: PrivacyLevel::from_str(&privacy_str).unwrap_or_default(),
-                        strength: row.get(6)?,
-                        valence: row.get(7)?,
-                        retrievals: row.get(8)?,
-                        imagined: row.get::<_, i32>(9)? != 0,
-                        grounded: row.get::<_, i32>(10)? != 0,
-                        created_at: chrono::DateTime::parse_from_rfc3339(&created_str)
-                            .map(|d| d.with_timezone(&Utc))
-                            .unwrap_or_else(|_| Utc::now()),
-                        last_retrieved: retrieved_str.and_then(|s|
-                            chrono::DateTime::parse_from_rfc3339(&s)
-                                .map(|d| d.with_timezone(&Utc))
-                                .ok()
-                        ),
-                        project: row.get(13)?,
-                        tags: serde_json::from_str(&tags_str).unwrap_or_default(),
-                scope: row.get(15).unwrap_or_else(|_| "moment".into()),
-                content_type: row.get(16).unwrap_or_else(|_| "text".into()),
-                occurred_at: row.get::<_, Option<String>>(17).unwrap_or(None).and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).map(|d| d.with_timezone(&Utc)).ok()),
-                    })
-                },
-            );
-            if let Ok(e) = result {
+            if let Ok(e) = self.get_inner(&conn, &link.target_id) {
+                seen.push(e.id.clone());
                 engrams.push(e);
             }
         }
+
+        if engrams.len() < limit {
+            if let Ok(blob) = conn.query_row(
+                "SELECT embedding FROM engram_embeddings WHERE engram_id = ?1",
+                [engram_id],
+                |row| row.get::<_, Vec<u8>>(0),
+            ) {
+                let own = blob_to_embedding(&blob);
+                let mut scored: Vec<(String, f64)> = Vec::new();
+                {
+                    let mut stmt = conn.prepare(
+                        "SELECT ee.engram_id, ee.embedding FROM engram_embeddings ee \
+                         JOIN engrams e ON e.id = ee.engram_id \
+                         WHERE ee.engram_id != ?1 AND NOT (e.imagined = 1 AND e.grounded = 0)",
+                    )?;
+                    let rows = stmt.query_map([&engram_id], |row| {
+                        let id: String = row.get(0)?;
+                        let blob: Vec<u8> = row.get(1)?;
+                        Ok((id, blob))
+                    })?;
+                    for row in rows {
+                        let (id, blob) = row?;
+                        if seen.contains(&id) {
+                            continue;
+                        }
+                        let sim = cosine_similarity(&own, &blob_to_embedding(&blob));
+                        if sim >= MIN_RELATED_SIMILARITY {
+                            scored.push((id, sim));
+                        }
+                    }
+                }
+                scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                for (id, _) in scored.into_iter().take(limit - engrams.len()) {
+                    if let Ok(e) = self.get_inner(&conn, &id) {
+                        engrams.push(e);
+                    }
+                }
+            }
+        }
+
         Self::enrich_links_batch(&conn, &mut engrams)?;
         Ok(engrams)
+    }
+
+    /// One-shot backfill: create associative links between existing memories
+    /// from their stored embeddings. Idempotent (INSERT OR REPLACE). Returns
+    /// the number of link rows created. O(n²) — fine at vault scale.
+    pub async fn backfill_semantic_links(
+        &self,
+        max_links: usize,
+        min_similarity: f64,
+    ) -> Result<usize> {
+        let conn = self.conn.lock().await;
+        let mut all: Vec<(String, Vec<f64>)> = Vec::new();
+        {
+            let mut stmt = conn.prepare(
+                "SELECT ee.engram_id, ee.embedding FROM engram_embeddings ee \
+                 JOIN engrams e ON e.id = ee.engram_id \
+                 WHERE NOT (e.imagined = 1 AND e.grounded = 0)",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                let id: String = row.get(0)?;
+                let blob: Vec<u8> = row.get(1)?;
+                Ok((id, blob))
+            })?;
+            for row in rows {
+                let (id, blob) = row?;
+                all.push((id, blob_to_embedding(&blob)));
+            }
+        }
+
+        let mut created = 0usize;
+        for i in 0..all.len() {
+            let mut scored: Vec<(usize, f64)> = Vec::new();
+            for (j, (_, emb)) in all.iter().enumerate() {
+                if i == j {
+                    continue;
+                }
+                let sim = cosine_similarity(&all[i].1, emb);
+                if sim >= min_similarity {
+                    scored.push((j, sim));
+                }
+            }
+            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            scored.truncate(max_links);
+            for (j, sim) in scored {
+                conn.execute(
+                    "INSERT OR REPLACE INTO engram_links (source_id, target_id, weight, link_type) \
+                     VALUES (?1, ?2, ?3, 'associative')",
+                    params![all[i].0, all[j].0, sim],
+                )?;
+                created += 1;
+            }
+        }
+        Ok(created)
     }
 
     /// Apply strength decay and retrieve-strengthening for daily hygiene.
@@ -1883,6 +2025,11 @@ fn blob_to_embedding(blob: &[u8]) -> Vec<f64> {
         .collect()
 }
 
+/// Minimum cosine similarity for a vector-only "related" suggestion. Below
+/// this, neighbors aren't related, just coexisting — keep them out of the
+/// graph UI's related pane.
+const MIN_RELATED_SIMILARITY: f64 = 0.35;
+
 fn cosine_similarity(a: &[f64], b: &[f64]) -> f64 {
     if a.len() != b.len() || a.is_empty() {
         return 0.0;
@@ -2065,6 +2212,15 @@ mod tests {
             EngramSource::Interaction,
             serde_json::json!({}),
         )
+    }
+
+    /// An engram with a caller-chosen source. Used by the link-inference
+    /// tests: B6's temporal linker fires on most-recent same-source writes,
+    /// so distinct sources isolate the semantic path under test.
+    fn make_engram_sourced(content: &str, source: EngramSource) -> Engram {
+        let mut e = make_engram(content);
+        e.source = source;
+        e
     }
 
     /// Machine-keyed vaults open successfully with a passphrase via the
@@ -2440,5 +2596,121 @@ mod tests {
             .unwrap();
         assert_eq!(noise, 1);
         assert_eq!(dedup, 1);
+    }
+
+    // --- Link inference (B6b) and search_related vector fallback ---
+
+    /// Write-time inference links the new memory to similar live memories in
+    /// BOTH directions, weight = cosine similarity, and never crosses the
+    /// similarity threshold in the wrong direction.
+    #[tokio::test]
+    async fn test_semantic_links_write_time_threshold_and_bidirectional() {
+        let (store, _dir) = test_store().await;
+        let cfg = LinkInferenceConfig { max_links: 5, min_similarity: 0.35 };
+        let a = make_engram_sourced("rust borrow checker notes", EngramSource::Interaction);
+        let b = make_engram_sourced("rust lifetime semantics", EngramSource::Research);
+        let c = make_engram_sourced("grocery shopping list", EngramSource::Chat);
+        let (aid, bid, cid) = (a.id.clone(), b.id.clone(), c.id.clone());
+        store.write_with_embedding(&a, Some(&[1.0, 0.0]), Some("test-model"), Some(&cfg)).await.unwrap();
+        store.write_with_embedding(&b, Some(&[1.0, 0.0]), Some("test-model"), Some(&cfg)).await.unwrap();
+        store.write_with_embedding(&c, Some(&[0.0, 1.0]), Some("test-model"), Some(&cfg)).await.unwrap();
+
+        // a↔b: identical vectors, both directions, weight = 1.0
+        let links_a = store.get_links(&aid).await.unwrap();
+        assert_eq!(links_a.len(), 1);
+        assert_eq!(links_a[0].target_id, bid);
+        assert_eq!(links_a[0].link_type, LinkType::Associative);
+        assert!((links_a[0].weight - 1.0).abs() < 1e-9);
+        let links_b = store.get_links(&bid).await.unwrap();
+        assert_eq!(links_b.len(), 1);
+        assert_eq!(links_b[0].target_id, aid);
+        // c is orthogonal to both — below threshold, no links
+        assert!(store.get_links(&cid).await.unwrap().is_empty());
+    }
+
+    /// A quarantined memory (imagined, not grounded) must never receive an
+    /// auto-link from a live write, no matter how similar its embedding.
+    #[tokio::test]
+    async fn test_semantic_links_never_into_quarantine() {
+        let (store, _dir) = test_store().await;
+        let cfg = LinkInferenceConfig::default();
+        let q = Engram::new_imagined("hallucinated rust facts".to_string(), serde_json::json!({}));
+        let qid = q.id.clone();
+        let a = make_engram("rust borrow checker notes");
+        let aid = a.id.clone();
+        store.write_with_embedding(&q, Some(&[1.0, 0.0]), Some("test-model"), Some(&cfg)).await.unwrap();
+        store.write_with_embedding(&a, Some(&[1.0, 0.0]), Some("test-model"), Some(&cfg)).await.unwrap();
+
+        assert!(store.get_links(&aid).await.unwrap().is_empty(),
+            "live memory must not link into quarantine");
+        assert!(store.get_links(&qid).await.unwrap().is_empty(),
+            "quarantined memory must not gain links");
+    }
+
+    /// Backfill creates both directions of a qualifying pair, skips
+    /// below-threshold pairs, and is idempotent (INSERT OR REPLACE).
+    #[tokio::test]
+    async fn test_backfill_semantic_links_idempotent() {
+        let (store, _dir) = test_store().await;
+        let a = make_engram_sourced("rust borrow checker notes", EngramSource::Interaction);
+        let b = make_engram_sourced("rust lifetime semantics", EngramSource::Research);
+        let c = make_engram_sourced("grocery shopping list", EngramSource::Chat);
+        let (aid, bid, cid) = (a.id.clone(), b.id.clone(), c.id.clone());
+        // No write-time inference — backfill must create the links alone.
+        store.write_with_embedding(&a, Some(&[1.0, 0.0]), Some("test-model"), None).await.unwrap();
+        store.write_with_embedding(&b, Some(&[1.0, 0.0]), Some("test-model"), None).await.unwrap();
+        store.write_with_embedding(&c, Some(&[0.0, 1.0]), Some("test-model"), None).await.unwrap();
+
+        let first = store.backfill_semantic_links(5, 0.35).await.unwrap();
+        assert_eq!(first, 2, "one row per direction for the single qualifying pair");
+        let links_a = store.get_links(&aid).await.unwrap();
+        assert_eq!(links_a.len(), 1);
+        assert_eq!(links_a[0].target_id, bid);
+        let weight = links_a[0].weight;
+        assert_eq!(store.get_links(&bid).await.unwrap()[0].target_id, aid);
+        assert!(store.get_links(&cid).await.unwrap().is_empty());
+
+        // Rerun: same row count reported, same link set, weights unchanged.
+        let second = store.backfill_semantic_links(5, 0.35).await.unwrap();
+        assert_eq!(second, first);
+        let links_a_again = store.get_links(&aid).await.unwrap();
+        assert_eq!(links_a_again.len(), 1);
+        assert!((links_a_again[0].weight - weight).abs() < 1e-12);
+        assert!(store.get_links(&cid).await.unwrap().is_empty());
+    }
+
+    /// With no explicit links, search_related falls back to vector-similarity
+    /// neighbors of the query memory's own embedding.
+    #[tokio::test]
+    async fn test_search_related_vector_fallback() {
+        let (store, _dir) = test_store().await;
+        let a = make_engram_sourced("rust borrow checker notes", EngramSource::Interaction);
+        let b = make_engram_sourced("rust lifetime semantics", EngramSource::Research);
+        let c = make_engram_sourced("grocery shopping list", EngramSource::Chat);
+        let (aid, bid, _cid) = (a.id.clone(), b.id.clone(), c.id.clone());
+        store.write_with_embedding(&a, Some(&[1.0, 0.0]), Some("test-model"), None).await.unwrap();
+        store.write_with_embedding(&b, Some(&[1.0, 0.0]), Some("test-model"), None).await.unwrap();
+        store.write_with_embedding(&c, Some(&[0.0, 1.0]), Some("test-model"), None).await.unwrap();
+
+        let related = store.search_related(&aid, 10).await.unwrap();
+        assert_eq!(related.len(), 1, "only the similar memory, not the orthogonal one");
+        assert_eq!(related[0].id, bid);
+    }
+
+    /// A memory reachable both by explicit link and by vector similarity
+    /// appears once (seen-set dedupe), with the explicit link taking the slot.
+    #[tokio::test]
+    async fn test_search_related_explicit_links_dedupe_fallback() {
+        let (store, _dir) = test_store().await;
+        let a = make_engram_sourced("rust borrow checker notes", EngramSource::Interaction);
+        let b = make_engram_sourced("rust lifetime semantics", EngramSource::Research);
+        let (aid, bid) = (a.id.clone(), b.id.clone());
+        store.write_with_embedding(&a, Some(&[1.0, 0.0]), Some("test-model"), None).await.unwrap();
+        store.write_with_embedding(&b, Some(&[1.0, 0.0]), Some("test-model"), None).await.unwrap();
+        store.link(&aid, &bid, 0.8, LinkType::Causal).await.unwrap();
+
+        let related = store.search_related(&aid, 10).await.unwrap();
+        assert_eq!(related.len(), 1);
+        assert_eq!(related[0].id, bid);
     }
 }

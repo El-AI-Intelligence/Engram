@@ -26,7 +26,7 @@ use tower_http::trace::TraceLayer;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-use axiom_engram::{EngramStore, EngramStoreAdapter, QemCache, QemConfig};
+use axiom_engram::{EngramStore, EngramStoreAdapter, LinkInferenceConfig, QemCache, QemConfig};
 use axiom_engram::embed::Embedder;
 use axiom_inference::InferenceProvider;
 
@@ -111,6 +111,9 @@ async fn dispatch_cli(cmd: cli::Commands) -> anyhow::Result<()> {
         }
         cli::Commands::Demo { vault } => {
             cli::handle_demo(vault).await
+        }
+        cli::Commands::BackfillLinks { vault, max_links, min_similarity } => {
+            cli::handle_backfill_links(vault, max_links, min_similarity).await
         }
         cli::Commands::Mcp { command } => {
             cli::handle_mcp(command).await
@@ -220,6 +223,32 @@ fn load_noise_ignored_sources(vault_path: &std::path::Path) -> Vec<String> {
         }
     }
     DEFAULTS.iter().map(|s| s.to_string()).collect()
+}
+
+/// Read `links` inference settings from config.json. Defaults to enabled
+/// (max 5 neighbors, min cosine similarity 0.35). `links.auto_infer: false`
+/// disables write-time inference entirely. Loaded once at startup — a PATCH
+/// to /config requires a restart.
+fn load_link_inference(vault_path: &std::path::Path) -> Option<LinkInferenceConfig> {
+    let config_path = vault_path.join("config.json");
+    if let Ok(data) = std::fs::read_to_string(&config_path) {
+        if let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&data) {
+            let links = cfg.get("links");
+            if links.and_then(|l| l.get("auto_infer")).and_then(|v| v.as_bool()) == Some(false) {
+                return None;
+            }
+            let max_links = links
+                .and_then(|l| l.get("max_links"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(5) as usize;
+            let min_similarity = links
+                .and_then(|l| l.get("min_similarity"))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.35);
+            return Some(LinkInferenceConfig { max_links, min_similarity });
+        }
+    }
+    Some(LinkInferenceConfig::default())
 }
 
 /// Build the optional local LLM provider for narrative consolidation.
@@ -380,6 +409,7 @@ async fn run_daemon(
         embedder,
         inference: load_inference_provider(&vault_path),
         noise_ignored_sources: load_noise_ignored_sources(&vault_path),
+        link_inference: load_link_inference(&vault_path),
         sync_trigger: sync_trigger_tx.clone(),
     };
 
