@@ -282,6 +282,10 @@ h2 {
   border-color: var(--border);
   text-decoration: none;
 }
+.topbar-right .icon-btn#capture-btn {
+  color: var(--semantic);
+  font-size: 1.05rem;
+}
 
 /* ── Nav pills ─────────────────────────────────────────────────────────── */
 
@@ -1608,7 +1612,8 @@ h2.section {
 /* Mobile read-only (K3: mobile is browse-only) */
 body.mobile .mutation,
 body.mobile .detail-actions,
-body.mobile .purge-form { display: none !important; }
+body.mobile .purge-form,
+body.mobile #capture-btn { display: none !important; }
 
 @media (max-width: 1023px) {
   .stat-grid { grid-template-columns: repeat(2, 1fr); }
