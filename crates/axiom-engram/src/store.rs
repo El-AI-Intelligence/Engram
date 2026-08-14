@@ -900,7 +900,7 @@ impl EngramStore {
     /// Column order: id(0), layer(1), source(2), privacy_level(3), content(4),
     /// context(5), strength(6), valence(7), retrievals(8), imagined(9),
     /// grounded(10), created_at(11), last_retrieved(12), project(13), tags(14),
-    /// scope(15), content_type(16), occurred_at(17).
+    /// scope(15), content_type(16), occurred_at(17), modified_at(18).
     #[allow(dead_code)]
     fn row_to_engram(row: &rusqlite::Row) -> std::result::Result<Engram, rusqlite::Error> {
         let layer_str: String = row.get(1)?;
@@ -914,6 +914,7 @@ impl EngramStore {
         let scope_str: String = row.get(15).unwrap_or_else(|_| "moment".into());
         let content_type_str: String = row.get(16).unwrap_or_else(|_| "text".into());
         let occurred_at_str: Option<String> = row.get(17).unwrap_or(None);
+        let modified_str: String = row.get(18).unwrap_or_else(|_| created_str.clone());
         Ok(Engram {
             id: row.get(0)?,
             layer: EngramLayer::from_str(&layer_str).unwrap_or(EngramLayer::Episodic),
@@ -932,6 +933,11 @@ impl EngramStore {
                     eprintln!("[axiom-engram] Engram has corrupted created_at '{}': {}", created_str, e);
                     Utc::now()
                 }),
+            modified_at: chrono::DateTime::parse_from_rfc3339(&modified_str)
+                .map(|d| d.with_timezone(&Utc)).unwrap_or_else(|_| {
+                    chrono::DateTime::parse_from_rfc3339(&created_str)
+                        .map(|d| d.with_timezone(&Utc)).unwrap_or_else(|_| Utc::now())
+                }),
             last_retrieved: retrieved_str.and_then(|s|
                 chrono::DateTime::parse_from_rfc3339(&s)
                     .map(|d| d.with_timezone(&Utc)).ok()
@@ -949,7 +955,7 @@ impl EngramStore {
 
     /// SQL SELECT clause used by all read queries. Keep in sync with row_to_engram.
     #[allow(dead_code)]
-    const ENGRAM_SELECT: &str = "id, layer, source, privacy_level, content, context, strength, valence, retrievals, imagined, grounded, created_at, last_retrieved, project, tags, scope, content_type, occurred_at";
+    const ENGRAM_SELECT: &str = "id, layer, source, privacy_level, content, context, strength, valence, retrievals, imagined, grounded, created_at, last_retrieved, project, tags, scope, content_type, occurred_at, modified_at";
 
     /// Populate an engram's links from the engram_links table.
     /// Must be called while holding the connection lock.
@@ -1010,7 +1016,7 @@ impl EngramStore {
     pub async fn get(&self, id: &str) -> Result<Engram> {
         let conn = self.conn.lock().await;
         let mut engram = conn.query_row(
-            "SELECT id, layer, source, privacy_level, content, context, strength, valence, retrievals, imagined, grounded, created_at, last_retrieved, project, tags, scope, content_type, occurred_at FROM engrams WHERE id = ?1",
+            "SELECT id, layer, source, privacy_level, content, context, strength, valence, retrievals, imagined, grounded, created_at, last_retrieved, project, tags, scope, content_type, occurred_at, modified_at FROM engrams WHERE id = ?1",
             [id],
             |row| {
                 let layer_str: String = row.get(1)?;
@@ -1048,6 +1054,7 @@ impl EngramStore {
                 scope: row.get(15).unwrap_or_else(|_| "moment".into()),
                 content_type: row.get(16).unwrap_or_else(|_| "text".into()),
                 occurred_at: row.get::<_, Option<String>>(17).unwrap_or(None).and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).map(|d| d.with_timezone(&Utc)).ok()),
+                modified_at: row.get::<_, Option<String>>(18).unwrap_or(None).and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).map(|d| d.with_timezone(&Utc)).ok()).unwrap_or_else(|| chrono::DateTime::parse_from_rfc3339(&created_str).map(|d| d.with_timezone(&Utc)).unwrap_or_else(|_| Utc::now())),
                 })
             },
         ).map_err(|e| {
@@ -1128,7 +1135,7 @@ impl EngramStore {
         let conn = self.conn.lock().await;
         let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
         let sql = format!(
-            "SELECT id, layer, source, privacy_level, content, context, strength, valence, retrievals, imagined, grounded, created_at, last_retrieved, project, tags, scope, content_type, occurred_at FROM engrams WHERE layer = ?1{} ORDER BY strength DESC, created_at DESC LIMIT ?2",
+            "SELECT id, layer, source, privacy_level, content, context, strength, valence, retrievals, imagined, grounded, created_at, last_retrieved, project, tags, scope, content_type, occurred_at, modified_at FROM engrams WHERE layer = ?1{} ORDER BY strength DESC, created_at DESC LIMIT ?2",
             filter.sql("")
         );
         let mut stmt = conn.prepare(&sql)?;
@@ -1217,7 +1224,7 @@ impl EngramStore {
                 // FTS5 parse error — fall back to LIKE
                 let search_pattern = format!("%{}%", query);
                 let mut stmt = conn.prepare(
-                    "SELECT id, layer, source, privacy_level, content, context, strength, valence, retrievals, imagined, grounded, created_at, last_retrieved, project, tags, scope, content_type, occurred_at FROM engrams WHERE content LIKE ?1 ORDER BY strength DESC LIMIT ?2"
+                    "SELECT id, layer, source, privacy_level, content, context, strength, valence, retrievals, imagined, grounded, created_at, last_retrieved, project, tags, scope, content_type, occurred_at, modified_at FROM engrams WHERE content LIKE ?1 ORDER BY strength DESC LIMIT ?2"
                 )?;
                 let rows = stmt.query_map(params![search_pattern, limit_i64], |row| {
                     let layer_str: String = row.get(1)?;
@@ -1252,6 +1259,7 @@ impl EngramStore {
                 scope: row.get(15).unwrap_or_else(|_| "moment".into()),
                 content_type: row.get(16).unwrap_or_else(|_| "text".into()),
                 occurred_at: row.get::<_, Option<String>>(17).unwrap_or(None).and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).map(|d| d.with_timezone(&Utc)).ok()),
+                modified_at: row.get::<_, Option<String>>(18).unwrap_or(None).and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).map(|d| d.with_timezone(&Utc)).ok()).unwrap_or_else(|| chrono::DateTime::parse_from_rfc3339(&created_str).map(|d| d.with_timezone(&Utc)).unwrap_or_else(|_| Utc::now())),
                     })
                 })?;
                 let mut engrams = Vec::new();
@@ -1280,7 +1288,7 @@ impl EngramStore {
         let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
         let offset_i64 = i64::try_from(offset).unwrap_or(i64::MAX);
         let sql = format!(
-            "SELECT id, layer, source, privacy_level, content, context, strength, valence, retrievals, imagined, grounded, created_at, last_retrieved, project, tags, scope, content_type, occurred_at FROM engrams WHERE 1=1{} ORDER BY created_at DESC LIMIT ?1 OFFSET ?2",
+            "SELECT id, layer, source, privacy_level, content, context, strength, valence, retrievals, imagined, grounded, created_at, last_retrieved, project, tags, scope, content_type, occurred_at, modified_at FROM engrams WHERE 1=1{} ORDER BY created_at DESC LIMIT ?1 OFFSET ?2",
             filter.sql("")
         );
         let mut stmt = conn.prepare(&sql)?;
@@ -1316,7 +1324,7 @@ impl EngramStore {
             .collect();
         let where_clause = clauses.join(" AND ");
         let sql = format!(
-            "SELECT id, layer, source, privacy_level, content, context, strength, valence, retrievals, imagined, grounded, created_at, last_retrieved, project, tags, scope, content_type, occurred_at FROM engrams WHERE {}{} ORDER BY created_at DESC LIMIT ?{}",
+            "SELECT id, layer, source, privacy_level, content, context, strength, valence, retrievals, imagined, grounded, created_at, last_retrieved, project, tags, scope, content_type, occurred_at, modified_at FROM engrams WHERE {}{} ORDER BY created_at DESC LIMIT ?{}",
             where_clause,
             filter.sql(""),
             tags.len() + 1
@@ -1767,7 +1775,7 @@ impl EngramStore {
 
         // Get recent high-strength engrams as candidates
         let mut stmt = conn.prepare(
-            "SELECT id, layer, source, privacy_level, content, context, strength, valence, retrievals, imagined, grounded, created_at, last_retrieved, project, tags, scope, content_type, occurred_at FROM engrams WHERE strength > 0.1 ORDER BY strength DESC LIMIT 50"
+            "SELECT id, layer, source, privacy_level, content, context, strength, valence, retrievals, imagined, grounded, created_at, last_retrieved, project, tags, scope, content_type, occurred_at, modified_at FROM engrams WHERE strength > 0.1 ORDER BY strength DESC LIMIT 50"
         )?;
 
         let rows = stmt.query_map([], |row| {
@@ -1803,6 +1811,7 @@ impl EngramStore {
                 scope: row.get(15).unwrap_or_else(|_| "moment".into()),
                 content_type: row.get(16).unwrap_or_else(|_| "text".into()),
                 occurred_at: row.get::<_, Option<String>>(17).unwrap_or(None).and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).map(|d| d.with_timezone(&Utc)).ok()),
+                modified_at: row.get::<_, Option<String>>(18).unwrap_or(None).and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).map(|d| d.with_timezone(&Utc)).ok()).unwrap_or_else(|| chrono::DateTime::parse_from_rfc3339(&created_str).map(|d| d.with_timezone(&Utc)).unwrap_or_else(|_| Utc::now())),
             })
         })?;
 
@@ -1849,7 +1858,7 @@ impl EngramStore {
     /// Internal get that takes a connection reference (avoids double-locking)
     fn get_inner(&self, conn: &rusqlite::Connection, id: &str) -> Result<Engram> {
         conn.query_row(
-            "SELECT id, layer, source, privacy_level, content, context, strength, valence, retrievals, imagined, grounded, created_at, last_retrieved, project, tags, scope, content_type, occurred_at FROM engrams WHERE id = ?1",
+            "SELECT id, layer, source, privacy_level, content, context, strength, valence, retrievals, imagined, grounded, created_at, last_retrieved, project, tags, scope, content_type, occurred_at, modified_at FROM engrams WHERE id = ?1",
             params![id],
             |row| {
                 let layer_str: String = row.get(1)?;
@@ -1884,6 +1893,7 @@ impl EngramStore {
                 scope: row.get(15).unwrap_or_else(|_| "moment".into()),
                 content_type: row.get(16).unwrap_or_else(|_| "text".into()),
                 occurred_at: row.get::<_, Option<String>>(17).unwrap_or(None).and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).map(|d| d.with_timezone(&Utc)).ok()),
+                modified_at: row.get::<_, Option<String>>(18).unwrap_or(None).and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).map(|d| d.with_timezone(&Utc)).ok()).unwrap_or_else(|| chrono::DateTime::parse_from_rfc3339(&created_str).map(|d| d.with_timezone(&Utc)).unwrap_or_else(|_| Utc::now())),
                 })
             },
         ).map_err(|_| EngramError::NotFound(id.to_string()))

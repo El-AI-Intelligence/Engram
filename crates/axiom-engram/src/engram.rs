@@ -174,6 +174,11 @@ pub struct Engram {
     pub imagined: bool,
     pub grounded: bool,
     pub created_at: DateTime<Utc>,
+    /// Last time this row changed (content, grounding, links, …). Bumped on
+    /// every local write; sync pull preserves the remote value so edits
+    /// re-propagate without echo. Reads (touch) do NOT bump it.
+    #[serde(default = "default_modified_at")]
+    pub modified_at: DateTime<Utc>,
     pub last_retrieved: Option<DateTime<Utc>>,
     pub project: Option<String>,
     pub tags: Vec<String>,
@@ -202,6 +207,7 @@ impl Engram {
             imagined: false,
             grounded: false,
             created_at: Utc::now(),
+            modified_at: Utc::now(),
             last_retrieved: None,
             project: None,
             tags: Vec::new(),
@@ -227,6 +233,7 @@ impl Engram {
             imagined: true,
             grounded: false,
             created_at: Utc::now(),
+            modified_at: Utc::now(),
             last_retrieved: None,
             project: None,
             tags: Vec::new(),
@@ -236,6 +243,13 @@ impl Engram {
             occurred_at: None,
         }
     }
+}
+
+/// Serde fallback for `modified_at` when a JSON payload predates v5
+/// (e.g. blobs from an older daemon). The sync pull path overrides this
+/// with the envelope's created_at when present.
+pub fn default_modified_at() -> DateTime<Utc> {
+    Utc::now()
 }
 
 /// Link between two engrams

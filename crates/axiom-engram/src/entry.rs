@@ -442,6 +442,7 @@ impl From<MemoryEntry> for Engram {
             imagined: m.imagined,
             grounded: m.grounded,
             created_at: m.created_at,
+            modified_at: m.created_at,
             last_retrieved: m.last_retrieved,
             project: m.project,
             tags: m.tags,
