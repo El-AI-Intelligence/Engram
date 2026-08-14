@@ -672,11 +672,14 @@ impl EngramStore {
         }
 
         // Persist explicit links carried on the engram (sync pull, curated
-        // writes) — links round-trip through sync blobs.
+        // writes) — links round-trip through sync blobs. Only insert when
+        // the target exists locally: a blob can arrive before the memories
+        // it links to, and the FK would reject a dangling target. The
+        // reverse blob carries the same link, so nothing is lost.
         for link in &filled.links {
             tx.execute(
                 "INSERT OR REPLACE INTO engram_links (source_id, target_id, weight, link_type) \
-                 VALUES (?1, ?2, ?3, ?4)",
+                 SELECT ?1, ?2, ?3, ?4 WHERE EXISTS (SELECT 1 FROM engrams WHERE id = ?2)",
                 params![filled.id, link.target_id, link.weight, link.link_type.as_str()],
             )?;
         }
@@ -748,6 +751,15 @@ impl EngramStore {
     /// transaction. Takes a raw connection handle — never routes through
     /// `self.*` (see write_inner).
     fn generate_links(conn: &rusqlite::Connection, engram: &Engram) -> Result<()> {
+        // Pairs already linked by stronger signals — explicit links carried
+        // on a pulled engram, or B6b semantic links created earlier in this
+        // transaction — are left alone. B6's heuristics only fill gaps.
+        let existing: std::collections::HashSet<String> = {
+            let mut stmt = conn.prepare("SELECT target_id FROM engram_links WHERE source_id = ?1")?;
+            let rows = stmt.query_map([&engram.id], |row| row.get::<_, String>(0))?;
+            rows.filter_map(|r| r.ok()).collect()
+        };
+
         // Temporal: most recent same-source memory, preferring one from the
         // same session (context.session_id) when present.
         let temporal_prev: Option<String> = match engram.context.get("session_id").and_then(|v| v.as_str()) {
@@ -775,11 +787,13 @@ impl EngramStore {
         };
 
         if let Some(prev_id) = temporal_prev {
-            conn.execute(
-                "INSERT OR REPLACE INTO engram_links (source_id, target_id, weight, link_type) \
-                 VALUES (?1, ?2, 0.6, 'temporal')",
-                params![engram.id, prev_id],
-            )?;
+            if !existing.contains(&prev_id) {
+                conn.execute(
+                    "INSERT OR REPLACE INTO engram_links (source_id, target_id, weight, link_type) \
+                     VALUES (?1, ?2, 0.6, 'temporal')",
+                    params![engram.id, prev_id],
+                )?;
+            }
         }
 
         // Associative: among the 20 most recent same-source memories, link
@@ -808,11 +822,13 @@ impl EngramStore {
             }
         }
         if let Some((target, weight)) = best {
-            conn.execute(
-                "INSERT OR REPLACE INTO engram_links (source_id, target_id, weight, link_type) \
-                 VALUES (?1, ?2, ?3, 'associative')",
-                params![engram.id, target, weight],
-            )?;
+            if !existing.contains(&target) {
+                conn.execute(
+                    "INSERT OR REPLACE INTO engram_links (source_id, target_id, weight, link_type) \
+                     VALUES (?1, ?2, ?3, 'associative')",
+                    params![engram.id, target, weight],
+                )?;
+            }
         }
 
         Ok(())
@@ -1566,6 +1582,27 @@ impl EngramStore {
             }
         }
         Ok(created)
+    }
+
+    /// Fetch a memory's stored embedding as `(model, vector)`, if present.
+    /// Used by the sync push path so embeddings round-trip with the memory —
+    /// without them, pulled memories have no vector fallback on the far
+    /// device.
+    pub async fn get_embedding(&self, engram_id: &str) -> Result<Option<(String, Vec<f64>)>> {
+        let conn = self.conn.lock().await;
+        match conn.query_row(
+            "SELECT model, embedding FROM engram_embeddings WHERE engram_id = ?1",
+            params![engram_id],
+            |row| {
+                let model: String = row.get(0)?;
+                let blob: Vec<u8> = row.get(1)?;
+                Ok((model, blob_to_embedding(&blob)))
+            },
+        ) {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Apply strength decay and retrieve-strengthening for daily hygiene.
@@ -2712,5 +2749,48 @@ mod tests {
         let related = store.search_related(&aid, 10).await.unwrap();
         assert_eq!(related.len(), 1);
         assert_eq!(related[0].id, bid);
+    }
+
+    /// get_embedding round-trips what write_with_embedding stored (model +
+    /// vector), and returns None for memories without one.
+    #[tokio::test]
+    async fn test_get_embedding_round_trip() {
+        let (store, _dir) = test_store().await;
+        let a = make_engram("embedded memory");
+        let b = make_engram("plain memory");
+        let (aid, bid) = (a.id.clone(), b.id.clone());
+        store.write_with_embedding(&a, Some(&[0.6, 0.8]), Some("test-model"), None).await.unwrap();
+        store.write(&b).await.unwrap();
+
+        let (model, vec) = store.get_embedding(&aid).await.unwrap().expect("embedding present");
+        assert_eq!(model, "test-model");
+        assert_eq!(vec.len(), 2);
+        assert!((vec[0] - 0.6).abs() < 1e-12);
+        assert!((vec[1] - 0.8).abs() < 1e-12);
+        assert!(store.get_embedding(&bid).await.unwrap().is_none());
+    }
+
+    /// A pulled engram whose links point at not-yet-synced targets writes
+    /// successfully (dangling links skipped, FK enforced), and the links
+    /// that DO have local targets are persisted.
+    #[tokio::test]
+    async fn test_explicit_links_skip_dangling_targets() {
+        let (store, _dir) = test_store().await;
+        let b = make_engram_sourced("existing target", EngramSource::Research);
+        let bid = b.id.clone();
+        store.write(&b).await.unwrap();
+
+        let mut a = make_engram("pulled memory");
+        a.links = vec![
+            EngramLink { target_id: bid.clone(), weight: 0.7, link_type: LinkType::Associative },
+            EngramLink { target_id: "not-synced-yet".to_string(), weight: 0.9, link_type: LinkType::Causal },
+        ];
+        let aid = a.id.clone();
+        store.write(&a).await.unwrap();
+
+        let links = store.get_links(&aid).await.unwrap();
+        assert_eq!(links.len(), 1, "only the link with a local target persists");
+        assert_eq!(links[0].target_id, bid);
+        assert_eq!(links[0].link_type, LinkType::Associative);
     }
 }

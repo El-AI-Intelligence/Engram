@@ -552,8 +552,46 @@ pub fn spawn_sync_loop(
                                                 Some(dt.with_timezone(&chrono::Utc));
                                         }
                                     }
+                                    // Links and the embedding ride along in
+                                    // the blob so the graph round-trips.
+                                    if let Some(links) = json.get("links").and_then(|v| v.as_array()) {
+                                        engram.links = links
+                                            .iter()
+                                            .filter_map(|l| {
+                                                let target = l.get("target_id")?.as_str()?;
+                                                let weight = l.get("weight")?.as_f64()?;
+                                                let ty = l.get("link_type")?.as_str()?;
+                                                Some(axiom_engram::EngramLink {
+                                                    target_id: target.to_string(),
+                                                    weight,
+                                                    link_type: axiom_engram::LinkType::from_str(ty)?,
+                                                })
+                                            })
+                                            .collect();
+                                    }
+                                    let embedding: Option<Vec<f64>> = json
+                                        .get("embedding")
+                                        .and_then(|v| v.as_array())
+                                        .map(|a| a.iter().filter_map(|x| x.as_f64()).collect());
+                                    let embedding_model = json
+                                        .get("embedding_model")
+                                        .and_then(|v| v.as_str())
+                                        .map(String::from);
 
-                                    if let Err(e) = vault.write(&engram).await {
+                                    let write_result = match &embedding {
+                                        Some(emb) if !emb.is_empty() => {
+                                            vault
+                                                .write_with_embedding(
+                                                    &engram,
+                                                    Some(emb),
+                                                    embedding_model.as_deref(),
+                                                    None,
+                                                )
+                                                .await
+                                        }
+                                        _ => vault.write(&engram).await,
+                                    };
+                                    if let Err(e) = write_result {
                                         tracing::warn!(
                                             "sync: failed to write pulled memory {}: {e}",
                                             memory_id
@@ -729,6 +767,24 @@ async fn push_local_changes(
             if batch_latest.as_deref().unwrap_or("") < created_at.as_str() {
                 batch_latest = Some(created_at.clone());
             }
+            // Links and the embedding ride along in the blob so the graph
+            // (and vector fallback) round-trip across devices.
+            let links = vault.get_links(&mem.id).await.unwrap_or_default();
+            let links_json: Vec<serde_json::Value> = links
+                .iter()
+                .map(|l| {
+                    serde_json::json!({
+                        "target_id": l.target_id,
+                        "weight": l.weight,
+                        "link_type": l.link_type.as_str(),
+                    })
+                })
+                .collect();
+            let embedding = vault.get_embedding(&mem.id).await.unwrap_or(None);
+            let (embedding_json, embedding_model) = match &embedding {
+                Some((model, vec)) => (serde_json::json!(vec), serde_json::json!(model)),
+                None => (serde_json::Value::Null, serde_json::Value::Null),
+            };
             let json = serde_json::json!({
                 "id": mem.id,
                 "content": mem.content,
@@ -748,6 +804,9 @@ async fn push_local_changes(
                 "created_at": created_at,
                 "last_retrieved": mem.last_retrieved.map(|d| d.to_rfc3339()),
                 "occurred_at": mem.occurred_at.map(|d| d.to_rfc3339()),
+                "links": links_json,
+                "embedding": embedding_json,
+                "embedding_model": embedding_model,
             });
             jsons.push((mem.id.clone(), json.to_string()));
         }
