@@ -118,3 +118,27 @@ slider. Only after edges exist.
   embeddings stored, 0 links.
 - Local 8787 (`/tmp/engram-data`): sync mirror of 8799 via engramd-sync on
   8788 (vault_id `engram-local`).
+
+## Shipped (2026-08-13)
+
+- Write-time semantic linking (`generate_semantic_links`, B6b), bidirectional,
+  weight = cosine similarity, `LinkInferenceConfig { max_links: 5,
+  min_similarity: 0.35 }`; config `links.auto_infer: false` disables.
+- `search_related`: explicit links first, then vector-similarity neighbors of
+  the memory's own embedding (min 0.35), seen-set dedupe.
+- `engramd backfill-links --vault PATH [--max-links N] [--min-similarity X]`:
+  idempotent one-shot linker.
+- Sync blobs now carry `links` + `embedding` + `embedding_model`, so the graph
+  and vector fallback round-trip across devices (verified 8799 → 8787: links
+  and embeddings identical). Pulled links to not-yet-synced targets are
+  skipped (EXISTS guard) — the reverse blob carries the same link.
+- B6 (temporal/tag-overlap) now snapshots pre-existing pairs and only fills
+  gaps; it no longer clobbers explicit or B6b semantic links.
+- Quarantined memories (`imagined && !grounded`) never receive auto-links.
+
+**Known gap (pre-existing, out of scope here):** sync push/pull cursors are
+`created_at`-based, so EDITS to already-synced memories do not re-push or
+re-pull (PATCH does not bump a modified timestamp). New memories sync
+correctly, including their links and embeddings. Fixing edit propagation
+needs a `modified_at` column plus cursor changes on both client and server —
+tracked for the sync layer roadmap.
