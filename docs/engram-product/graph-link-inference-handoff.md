@@ -142,3 +142,15 @@ re-pull (PATCH does not bump a modified timestamp). New memories sync
 correctly, including their links and embeddings. Fixing edit propagation
 needs a `modified_at` column plus cursor changes on both client and server —
 tracked for the sync layer roadmap.
+
+## Graph view parked (2026-08-14)
+
+The graph UI (canvas force-sim in `ui/engram-vault/js/graph.js`) is shelved as
+a **future idea**: the execution (layout stability, readability at scale,
+interaction model) needs a rethink before it earns a place in the product.
+Entry points are hidden — nav link in `index.html` and the tour CTA in
+`js/main.js` (both commented, with re-enable notes). The route (`#/graph`),
+renderer, and all backend link machinery stay shipped and tested — so when
+the UX is revisited, the data layer is ready. Nothing in the link-inference
+backend (write-time links, vector fallback, backfill, sync round-trip) is
+affected by the park.

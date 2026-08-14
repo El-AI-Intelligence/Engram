@@ -2127,7 +2127,7 @@ route('/tour', async () => {
             <div class="tour-demo-state" id="tour-demo-state">
               ${demoCount > 0
                 ? `<span class="ok">● ${demoCount} demo memories are currently loaded</span>
-                   <span class="faint">They appear in the Explorer and Graph alongside your real memories.</span>`
+                   <span class="faint">They appear in the Explorer alongside your real memories.</span>`
                 : `<span class="faint">No demo memories loaded right now.</span>`}
             </div>
 
@@ -2140,7 +2140,7 @@ route('/tour', async () => {
             <h4>Where to look</h4>
             <div class="tour-demo-actions">
               <a class="btn" href="#/memories">Explorer — browse them</a>
-              <a class="btn" href="#/graph">Graph — see them connect</a>
+              <!-- Graph CTA parked as a future idea (2026-08-14); see index.html nav comment -->
               <a class="btn" href="#/context">Context — what your AI receives</a>
             </div>
           </div>
