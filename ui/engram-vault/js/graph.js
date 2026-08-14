@@ -202,9 +202,14 @@ export class MemoryGraph {
   }
 
   _resize() {
-    const rect = this.container.getBoundingClientRect();
+    // clientWidth/clientHeight = CONTENT box (no border). Using the
+    // border-box rect here fed a 2px growth loop: the bordered container's
+    // height became canvas+2borders, the canvas was set to that, and so on
+    // every ResizeObserver cycle — the whole graph drifted downward as the
+    // gravity center (H/2) chased the growing canvas.
     const dpr  = window.devicePixelRatio || 1;
-    const w = rect.width, h = rect.height;
+    const w = this.container.clientWidth;
+    const h = this.container.clientHeight;
     if (w === 0 || h === 0) return;
     const firstLayout = !this.W || !this.H;
     this.canvas.width  = w * dpr;
