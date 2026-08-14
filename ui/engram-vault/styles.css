@@ -1091,6 +1091,19 @@ input[type="file"] { font-size: var(--text-sm); color: var(--text-muted); }
   height: 100%;
 }
 
+/* Minimap must be out of flow: in-flow it added its height to the
+   container each ResizeObserver cycle, growing the canvas endlessly and
+   dragging the cluster downward (gravity center follows H/2). */
+.mg-minimap {
+  position: absolute;
+  right: 10px;
+  bottom: 10px;
+  z-index: 5;
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  cursor: pointer;
+}
+
 .graph-legend {
   position: absolute;
   left: var(--space-3);
