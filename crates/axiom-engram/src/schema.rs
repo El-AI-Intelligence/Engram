@@ -23,7 +23,8 @@ pub fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
             last_retrieved  TEXT,
             project         TEXT,
             tags            TEXT,
-            content_hash    TEXT
+            content_hash    TEXT,
+            modified_at     TEXT
         );
 
         CREATE TABLE IF NOT EXISTS engram_links (
@@ -140,7 +141,7 @@ pub fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
 /// Apply schema migrations for columns added after the initial release.
 ///
 /// Current schema version. Increment this when adding new migrations below.
-const CURRENT_SCHEMA_VERSION: i32 = 4;
+const CURRENT_SCHEMA_VERSION: i32 = 5;
 
 /// Versioned schema migrations using SQLite's `PRAGMA user_version`.
 ///
@@ -405,6 +406,43 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         conn.execute_batch("COMMIT")?;
     }
 
+    // v5: modified_at for edit propagation (sync re-push of edited memories).
+    //
+    // Same idempotent "ensure" pattern as v4: not gated on `version < 5` so a
+    // vault that crashed mid-migration can't claim v5 without the column.
+    // Backfill modified_at = created_at — pre-v5 rows were never edited, so
+    // this preserves push-cutoff semantics exactly (nothing re-pushes that
+    // wouldn't have before; un-pushed memories still qualify).
+    {
+        conn.execute_batch("BEGIN")?;
+
+        let has_column = |name: &str| -> rusqlite::Result<bool> {
+            let mut stmt = conn.prepare("PRAGMA table_info('engrams')")?;
+            let exists = stmt
+                .query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .any(|col| col == name);
+            Ok(exists)
+        };
+
+        if !has_column("modified_at")? {
+            conn.execute("ALTER TABLE engrams ADD COLUMN modified_at TEXT", [])?;
+        }
+        conn.execute_batch(
+            "UPDATE engrams SET modified_at = created_at WHERE modified_at IS NULL;"
+        )?;
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_engrams_modified_at ON engrams(modified_at);"
+        )?;
+
+        conn.execute(
+            &format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"),
+            [],
+        )?;
+        conn.execute_batch("COMMIT")?;
+    }
+
     Ok(())
 }
 #[cfg(test)]
@@ -474,5 +512,78 @@ mod tests {
         // Re-running both is idempotent
         create_tables(&conn).unwrap();
         migrate(&conn).unwrap();
+    }
+
+    /// Pre-v5 vault (user_version 4, content_hash present, no modified_at):
+    /// migrate() must add modified_at, backfill it from created_at, and stay
+    /// idempotent on re-run.
+    #[test]
+    fn create_tables_then_migrate_upgrades_pre_v5_vault() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let conn = Connection::open(&path).unwrap();
+
+        // Simulate a v4 vault: all v4 columns, no modified_at.
+        conn.execute_batch(
+            "CREATE TABLE engrams (
+                id TEXT PRIMARY KEY,
+                layer TEXT NOT NULL,
+                source TEXT NOT NULL,
+                privacy_level TEXT NOT NULL DEFAULT 'cloud_first',
+                content TEXT NOT NULL,
+                context TEXT NOT NULL,
+                strength REAL NOT NULL DEFAULT 1.0,
+                valence REAL NOT NULL DEFAULT 0.0,
+                retrievals INTEGER NOT NULL DEFAULT 0,
+                imagined INTEGER NOT NULL DEFAULT 0,
+                grounded INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                last_retrieved TEXT,
+                project TEXT,
+                tags TEXT,
+                scope TEXT NOT NULL DEFAULT 'moment',
+                content_type TEXT NOT NULL DEFAULT 'text',
+                occurred_at TEXT,
+                content_hash TEXT
+            );"
+        ).unwrap();
+        conn.execute_batch("PRAGMA user_version = 4;").unwrap();
+        conn.execute(
+            "INSERT INTO engrams (id, layer, source, content, context, created_at) \
+             VALUES ('m1', 'semantic', 'interaction', 'old note', '{}', '2026-08-01T00:00:00Z')",
+            [],
+        ).unwrap();
+
+        create_tables(&conn).unwrap();
+        migrate(&conn).unwrap();
+
+        let has_col: bool = {
+            let mut stmt = conn.prepare("PRAGMA table_info('engrams')").unwrap();
+            let cols: Vec<String> = stmt.query_map([], |r| r.get::<_, String>(1)).unwrap()
+                .filter_map(|r| r.ok())
+                .collect();
+            cols.iter().any(|c| c == "modified_at")
+        };
+        assert!(has_col, "modified_at column should be added by migration");
+
+        // Backfill: pre-v5 rows get modified_at = created_at (never edited)
+        let modified: String = conn
+            .query_row("SELECT modified_at FROM engrams WHERE id = 'm1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(modified, "2026-08-01T00:00:00Z");
+
+        // Idempotent
+        create_tables(&conn).unwrap();
+        migrate(&conn).unwrap();
+
+        // Index exists
+        let idx_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_engrams_modified_at'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx_count, 1);
     }
 }
