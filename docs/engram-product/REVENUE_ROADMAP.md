@@ -13,8 +13,9 @@
 ## What exists today (verified 2026-08-12)
 
 - `engramd` — local daemon with ONNX embeddings, FTS5 + vector + QEM holographic memory, REST + WebSocket API, MCP server (`engramd-mcp`), privacy controls (audit/purge/retention)
-- E2E sync **client** in `engramd` (`/sync/status`, `sync_server_url` config)
-- `engramd-sync` — sync **relay server**: stateless "dumb pipe" for encrypted blobs, HMAC verification, token-bucket rate limiting, tombstones with 30-day retention, API-key auth. *Built but not deployed.*
+- E2E sync **client** in `engramd` (`/sync/status`, `sync_server_url` config) — edit propagation via `modified_at` push cursor (2026-08-14)
+- `engramd-sync` — sync **relay server**: stateless "dumb pipe" for encrypted blobs, HMAC verification, token-bucket rate limiting, tombstones with 30-day retention, API-key auth. *Built; running locally, public deploy pending.*
+- **Shared-vault v0 (teams) shipped 2026-08-14:** `vault_id` + passphrase multi-device sync, device roster endpoint, `/teams/status`, Settings "Sync & Team" panel. Zero-knowledge core untouched — the server still only sees device IDs and blob counts.
 - Live site: landing + vault UI + API behind Caddy basic auth
 - Guardrail platform experience (WebAuthn accounts, admin dashboard, roles) to reuse for the control plane
 
@@ -44,6 +45,13 @@ The Obsidian play: sell the cloud layer of a local-first product. The relay alre
 The revenue core. "The AI that remembers your organization."
 
 **Offering:** shared org vault — decisions, context, tribal knowledge. Admin console with roles, retention, compliance. Flat pricing: **Team $29/mo** (≤ 10 members), **Org $99/mo** (unlimited members, SSO). No per-seat math, ever.
+
+**v0 substrate shipped (2026-08-14):** the MIT core already does shared
+vaults — passphrase-scoped teams with a device roster, `/teams/status`, and a
+Settings "Sync & Team" panel. What's missing is exactly the private control
+plane: accounts, roles, revocation, audit (2.1/2.2). The zero-knowledge moat
+is validated: the paid layer adds administration without touching the
+encrypted core.
 
 | Milestone | Work | Est. |
 |---|---|---|

@@ -118,11 +118,20 @@ different `ENGRAM_VAULT` paths if you need isolated vaults.
   ],
   "evidence": [],
   "created_at": "2026-08-05T14:30:01Z",
+  "modified_at": "2026-08-06T09:12:44Z",  // bumped on content mutations; sync push cursor
   "last_retrieved": "2026-08-05T16:00:00Z",
   "occurred_at": "2026-08-05T14:30:00Z",
   "context": { "session_id": "sess_abc", "turn": 3 }
 }
 ```
+
+`modified_at` is set to `created_at` on capture and bumped only by content
+mutations — capture, `PATCH /memories/:id`, `POST /memories/:id/ground`,
+`POST /memories/:id/mark-noise`, dedupe strength bumps, and
+`POST /memories/link` (source row). Plain reads (`touch`) and vault
+hygiene/consolidation do **not** bump it. It is the sync push cursor: an
+edit to an old memory re-pushes it on the next cycle, and the receiving
+device preserves the original value so blobs don't echo back.
 
 #### `POST /memories/search` — Search memories
 
@@ -492,6 +501,51 @@ Response 200: { "imported": 500, "skipped": 12, "errors": [...] }
   "context": { "default_budget": 16384 }
 }
 // Response 200: updated config
+```
+
+The `sync` block merges **field-wise** (partial patches never erase
+`vault_id` or `api_key`; an `api_key` equal to the read mask `••••••••` is
+ignored). Supported fields: `enabled`, `server_url`, `api_key`,
+`interval_secs`, `vault_id`, `name`.
+
+### 3.7 Sync & Teams
+
+Shared-vault v0 (see SYNC.md): a team is devices sharing one vault
+passphrase + `vault_id`. No accounts or revocation.
+
+#### `GET /teams/status` — Team roster + reachability (engramd)
+
+Aggregated server-side so the sync `api_key` never reaches the browser.
+
+```json
+// Response 200 — 409 {"error":{"code":"sync_disabled",...}} when sync is off
+{
+  "vault_id": "team-acme",
+  "name": "Acme Core Team",
+  "server_url": "https://sync.example.com",
+  "remote_reachable": true,
+  "devices": [
+    { "device_id": "d1…", "last_seen": "2026-08-14T09:00:00Z", "blob_count": 12, "is_self": true },
+    { "device_id": "d2…", "last_seen": "2026-08-14T08:55:00Z", "blob_count": 9, "is_self": false }
+  ],
+  "last_push": "2026-08-14T09:00:00Z",
+  "last_pull": "2026-08-14T09:00:00Z"
+}
+```
+
+#### `GET /v1/vaults/{vault_id}/devices` — Device roster (engramd-sync)
+
+Requires `Authorization: Bearer <api_key>`. Counts **pushes** — a device
+appears only after its first push to that vault.
+
+```json
+// Response 200
+{
+  "vault_id": "team-acme",
+  "devices": [
+    { "device_id": "d1…", "last_seen": "2026-08-14T09:00:00Z", "blob_count": 12 }
+  ]
+}
 ```
 
 ---

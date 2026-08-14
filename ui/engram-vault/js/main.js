@@ -93,6 +93,12 @@ const api = {
     get: () => get('/config'),
     update: (c) => fetch(API + '/config', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(c) }),
   },
+  teams: {
+    status: () => get('/teams/status'),
+  },
+  sync: {
+    now: () => post('/sync/now'),
+  },
 };
 
 // ── Router ────────────────────────────────────────────────────────────────
@@ -1498,13 +1504,15 @@ route('/consolidation', async () => {
 
 route('/settings', async () => {
   const app = document.getElementById('app');
-  let config, audit;
+  let config, audit, team;
   try { config = await api.config.get(); } catch (e) { config = { vault_path: '~/.engram/vaults/default', encryption: 'sqlcipher' }; }
   try { audit = await api.privacy.audit(); } catch (e) { audit = null; }
+  try { team = await api.teams.status(); } catch (e) { team = null; }
 
   const ctx = config.context || {};
   const sched = config.schedule || {};
   const emb = config.embedding || {};
+  const sync = config.sync || {};
   const breakdown = audit?.breakdown || {};
 
   const breakdownRows = (items, key, iconFn) => (items || []).length
@@ -1578,6 +1586,53 @@ route('/settings', async () => {
           API key authentication is configured server-side via the <code>ENGRAMD_API_KEY</code>
           environment variable when <code>engramd</code> starts. It cannot be changed from the UI.
           See <code>docs/engram-product/DEPLOY.md</code> for exposing the vault behind Caddy.
+        </div>
+      </div>
+
+      <div class="panel" style="margin-bottom:1rem;">
+        <div class="panel-header">Sync &amp; Team</div>
+        <div class="settings-note">
+          Shared-vault sync: every team member runs <code>engramd</code> with the same vault
+          passphrase and <code>vault_id</code> against one sync server. Content stays
+          end-to-end encrypted — the server only sees device IDs and blob counts.
+          Sync settings are read at daemon startup: <strong>restart engramd after saving</strong>,
+          and the daemon must be started with the vault passphrase.
+        </div>
+        <div class="health-list">
+          <div class="health-row">Vault ID: <span class="mono">${esc(team?.vault_id || 'not set')}</span>
+            <button class="btn btn-sm" id="team-copy-vault" ${team?.vault_id ? '' : 'disabled'}>Copy</button></div>
+          <div class="health-row">Server: <span id="team-reach">—</span></div>
+        </div>
+        <div class="config-row">
+          <label>Team name</label>
+          <input type="text" id="team-name" class="input-sm" value="${esc(sync.name || '')}" placeholder="e.g. core-team">
+        </div>
+        <div class="config-row">
+          <label>Sync enabled</label>
+          <label class="checkbox-label"><input type="checkbox" id="team-sync-enabled" ${sync.enabled ? 'checked' : ''}> push &amp; pull on interval</label>
+        </div>
+        <div class="config-row">
+          <label>Server URL</label>
+          <input type="text" id="team-server-url" class="input-sm" value="${esc(sync.server_url || '')}" placeholder="https://sync.example.com" style="min-width:220px;">
+        </div>
+        <div class="config-row">
+          <label>Interval (seconds)</label>
+          <input type="number" id="team-interval" min="5" max="86400" value="${sync.interval_secs || 60}" class="input-sm">
+        </div>
+        <div class="mutation" style="padding:0 1rem 1rem;display:flex;gap:0.5rem;flex-wrap:wrap;">
+          <button class="btn btn-primary" id="team-save">Save sync settings</button>
+          <button class="btn" id="team-sync-now" ${sync.enabled ? '' : 'disabled'}>Sync now</button>
+        </div>
+        <div id="team-devices" class="health-list"></div>
+        <div class="settings-note">
+          <strong>Honest caveats (shared-vault v0):</strong>
+          <ul style="margin:0.25rem 0 0 1.25rem;padding:0;">
+            <li>Team membership is just a shared passphrase — no per-member revocation or audit.</li>
+            <li>Anyone holding the sync server's API key can read every vault on that server.</li>
+            <li>Machine-keyed vaults (no passphrase) cannot sync.</li>
+            <li>Last-writer-wins: an edit from a device with a slower clock can be overwritten.</li>
+            <li>The device list counts pushes only — a teammate appears after their first push.</li>
+          </ul>
         </div>
       </div>
 
@@ -1682,6 +1737,60 @@ route('/settings', async () => {
   };
   document.getElementById('set-reserve').oninput = function() {
     document.getElementById('set-reserve-val').textContent = this.value + '%';
+  };
+
+  // ── Sync & team: roster, reachability, save, copy
+  (function renderTeam() {
+    const devicesEl = document.getElementById('team-devices');
+    const reachEl = document.getElementById('team-reach');
+    if (!team) {
+      devicesEl.innerHTML = `<div class="health-row faint">${sync.enabled ? 'Team status unavailable.' : 'Sync not enabled — configure it below and restart engramd.'}</div>`;
+      if (reachEl) reachEl.textContent = sync.enabled ? 'unknown' : 'sync disabled';
+      return;
+    }
+    if (reachEl) {
+      reachEl.innerHTML = team.remote_reachable
+        ? '<span class="ok">● reachable</span>'
+        : '<span class="error">● unreachable</span>';
+    }
+    const rows = (team.devices || []).map(d => `
+      <div class="health-row"><span class="mono">${esc(d.device_id || '?')}</span>${d.is_self ? ' <span class="badge badge-semantic">this device</span>' : ''}<span class="ml-auto faint">${d.blob_count || 0} blobs · ${esc(String(d.last_seen || '—').slice(0, 19))}</span></div>`).join('');
+    devicesEl.innerHTML = rows || '<div class="health-row faint">No devices have pushed to this vault yet.</div>';
+    const lp = team.last_push ? String(team.last_push).slice(0, 19) : '—';
+    const pl = team.last_pull ? String(team.last_pull).slice(0, 19) : '—';
+    devicesEl.insertAdjacentHTML('beforeend', `<div class="health-row faint">Last push: <span class="mono">${lp}</span> · Last pull: <span class="mono">${pl}</span></div>`);
+  })();
+
+  document.getElementById('team-copy-vault').onclick = async () => {
+    const v = team?.vault_id;
+    if (!v) return;
+    try { await navigator.clipboard.writeText(v); toast('Vault ID copied', 'ok'); }
+    catch (e) { toast('Copy failed', 'error'); }
+  };
+
+  // Field-wise merge on the server: send only what the panel edits — vault_id and
+  // api_key are never overwritten from the UI (null fields are skipped).
+  document.getElementById('team-save').onclick = async () => {
+    try {
+      const r = await api.config.update({
+        sync: {
+          enabled: document.getElementById('team-sync-enabled').checked,
+          server_url: document.getElementById('team-server-url').value.trim() || null,
+          interval_secs: parseInt(document.getElementById('team-interval').value) || 60,
+          name: document.getElementById('team-name').value.trim() || null,
+        }
+      });
+      if (!r.ok) { const err = await r.json().catch(() => ({})); toast(err.error?.message || err.error || 'Save failed', 'error'); return; }
+      toast('Sync settings saved — restart engramd to apply', 'ok');
+      render();
+    } catch (e) { toast(e.message || 'Save failed', 'error'); }
+  };
+
+  document.getElementById('team-sync-now').onclick = async () => {
+    try {
+      await api.sync.now();
+      toast('Sync triggered', 'ok');
+    } catch (e) { toast(e.message || 'Sync failed', 'error'); }
   };
 
   // ── Save context defaults (server replaces the whole sub-object — send all fields)

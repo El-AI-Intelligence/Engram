@@ -162,6 +162,74 @@ curl -X PATCH http://localhost:8787/config \
 Each device gets a unique `device_id` (stored in `device.json`) so vector
 clocks are correctly scoped per-device.
 
+### Edits propagate
+
+The push cursor tracks `modified_at`, not `created_at`: editing an old
+memory (patch, ground, mark-noise, dedupe bump, link) re-pushes it on the
+next cycle, and the receiving device preserves the original `modified_at`
+so it doesn't echo the blob back. Reading a memory (retrievals) and vault
+hygiene/consolidation do **not** re-push.
+
+## Shared Vaults (Teams v0)
+
+A **team** in Engram v0 is just a set of devices that share two things:
+
+1. The same vault **passphrase** — sync keys derive from it alone
+2. The same **`vault_id`** and sync server in their sync config
+
+There are no accounts, invitations, roles, or revocation in v0 — joining is
+purely cryptographic. The sync server stays a dumb relay: it sees device IDs
+and blob counts, never names or content.
+
+### Joining a team
+
+**Initiator** (first member) — configure sync with a shared vault id:
+
+```json
+{
+  "sync": {
+    "enabled": true,
+    "server_url": "https://sync.example.com",
+    "api_key": "...",
+    "vault_id": "team-acme",     // any string the team agrees on
+    "name": "Acme Core Team"     // optional display name
+  }
+}
+```
+
+**Teammate** — fresh vault, same passphrase, same `vault_id`:
+
+```bash
+# 1. Init a fresh vault with the SAME passphrase (each device gets its own device_id)
+engram init --vault ~/.engram/vault
+
+# 2. Point sync at the shared vault
+curl -X PATCH http://localhost:8787/config \
+  -H 'Content-Type: application/json' \
+  -d '{"sync": {"enabled": true, "server_url": "https://sync.example.com", "api_key": "...", "vault_id": "team-acme"}}'
+
+# 3. Restart with the shared passphrase
+engramd --vault ~/.engram/vault --passphrase "<same passphrase>"
+
+# 4. Force the first sync (or wait interval_secs)
+curl -X POST http://localhost:8787/sync/now
+```
+
+Memories converge in both directions, and edits propagate (see above). A
+teammate who only pulls is effectively a read-only member — nothing forces
+them to push.
+
+### Seeing the team
+
+- **Settings → Sync & Team** in the web UI: vault ID (copy button), team
+  name, sync enable/URL/interval, save, "Sync now", device roster with
+  `this device` badge, reachability, last push/pull cursors, and the
+  honest-caveats list.
+- `GET /teams/status` on each daemon aggregates the same data server-side,
+  so the sync `api_key` never reaches the browser.
+- `GET /v1/vaults/{vault_id}/devices` on the sync server lists devices that
+  have pushed blobs to that vault.
+
 ## Self-Hosting
 
 The sync server is designed to be self-hosted:
@@ -249,7 +317,16 @@ Returns current sync state and remote server health. No authentication required
 ### `PATCH /config`
 
 Update sync settings. The `api_key` field accepts plaintext on write but is
-always masked (`••••••••`) on read.
+always masked (`••••••••`) on read. The `sync` block merges field-wise:
+partial patches never erase `vault_id` or `api_key`.
+
+### `GET /teams/status`
+
+Team roster + reachability, aggregated server-side (see Shared Vaults).
+
+### `GET /v1/vaults/{vault_id}/devices` (sync server)
+
+Device roster for a vault. Requires `Authorization: Bearer <api_key>`.
 
 ## Migration from Other Memory Systems
 
@@ -268,3 +345,17 @@ If you're migrating from another memory system:
   devices edit the same memory offline and then sync.
 - **Single sync server:** Multi-server replication is not yet supported.
   Run the sync server behind a load balancer for HA.
+- **Shared vaults are trust-based:** membership = shared passphrase. There
+  is no revocation, per-member audit, or role separation yet (teams v0). If
+  someone leaves a team with the passphrase, the team must re-key a new
+  vault.
+- **Any sync-server API-key holder can read any vault on that server**
+  (blobs stay E2E-encrypted, but the key authenticates all vault operations).
+- **Machine-keyed vaults cannot sync:** a passphrase is required at daemon
+  startup.
+- **Device roster counts pushes only:** a teammate who has only pulled
+  appears in the roster after their first push.
+- **Hygiene/consolidation deltas don't re-push:** hygiene deletes and weekly
+  consolidation promotions change rows without bumping `modified_at`, so
+  those specific deltas don't propagate until the row changes again
+  (deliberate — avoids bulk re-push storms).
