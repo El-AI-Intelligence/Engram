@@ -205,6 +205,20 @@ function toast(msg, kind = 'info') {
   setTimeout(() => { el.remove(); }, 3000);
 }
 
+/**
+ * Shared capture path: POSTs a memory and surfaces the daemon's skip verdicts
+ * (duplicate/noise) as a warn toast instead of a false "Captured". Returns the
+ * API response, or null when the capture was skipped.
+ */
+async function captureMemory({ content, layer = 'episodic', tags = [] }) {
+  const r = await api.memories.create({ content, layer, source: 'interaction', tags });
+  if (r && r.skipped) {
+    toast(r.skip_reason || 'Duplicate skipped', 'warn');
+    return null;
+  }
+  return r;
+}
+
 // ── Live event stream (WebSocket + polling fallback) ─────────────────────
 
 /**
@@ -425,6 +439,46 @@ function showModal(title, bodyHtml) {
     </div>`;
 }
 
+/**
+ * Global quick capture (topbar ＋ / Ctrl+Cmd+K): one textarea, a layer
+ * selector and a tags field. On skip (duplicate/noise) the modal stays open
+ * so the content isn't lost; on success it closes.
+ */
+function openCaptureModal() {
+  showModal('Quick Capture', `
+    <textarea id="cap-input" rows="3" placeholder="What's happening?"></textarea>
+    <div class="cap-row">
+      <select id="cap-layer" class="filter-select">
+        <option value="episodic">Episodic — moment</option>
+        <option value="semantic">Semantic — durable note</option>
+        <option value="imagined">Imagined — idea to explore</option>
+      </select>
+      <input id="cap-tags" class="input-sm" placeholder="tags, comma, separated">
+    </div>
+    <div class="mutation"><button class="btn btn-primary" id="cap-submit">Capture</button></div>`);
+  const submit = async () => {
+    const input = document.getElementById('cap-input');
+    const content = input.value.trim();
+    if (!content) return;
+    const layer = document.getElementById('cap-layer').value;
+    const tags = document.getElementById('cap-tags').value.split(',').map(s => s.trim()).filter(Boolean);
+    try {
+      const r = await captureMemory({ content, layer, tags });
+      if (r === null) return; // skipped — toast shown, keep the text
+      document.getElementById('modal-root').innerHTML = '';
+      toast('Captured', 'ok');
+    } catch (e) {
+      toast('Capture failed: ' + e.message, 'error');
+    }
+  };
+  document.getElementById('cap-submit').onclick = submit;
+  const ta = document.getElementById('cap-input');
+  ta.focus();
+  ta.onkeydown = (e) => {
+    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) submit();
+  };
+}
+
 // ==========================================================================
 // SCREENS
 // ==========================================================================
@@ -607,12 +661,13 @@ route('/', async () => {
     const content = ta.value.trim();
     if (!content) return;
     try {
-      await api.memories.create({ content, layer: 'episodic', source: 'interaction' });
+      const r = await captureMemory({ content });
+      if (r === null) return; // skipped — toast shown, keep the text
       ta.value = '';
       toast('Captured', 'ok');
       // Pull the fresh memory into the feed (WS will dedupe by id)
-      const r = await api.memories.search({ sort_by: 'recency', limit: 3 });
-      const list = Array.isArray(r) ? r : (r.results || []);
+      const res = await api.memories.search({ sort_by: 'recency', limit: 3 });
+      const list = Array.isArray(res) ? res : (res.results || []);
       for (let i = list.length - 1; i >= 0; i--) addToFeed(list[i], true);
     } catch (e) {
       toast('Capture failed: ' + e.message, 'error');
@@ -2265,6 +2320,20 @@ setInterval(updateStatus, 30000);
 
 // Tour & demo: accessible at any time from the topbar
 document.getElementById('tour-btn').addEventListener('click', () => navigate('#/tour'));
+
+// Quick capture: topbar button + global hotkey (Ctrl/Cmd+K). Mobile stays
+// browse-only, so both entry points no-op under the mobile flag.
+const openCapture = () => {
+  if (document.body.classList.contains('mobile')) return;
+  openCaptureModal();
+};
+document.getElementById('capture-btn').addEventListener('click', openCapture);
+window.addEventListener('keydown', (e) => {
+  if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+    e.preventDefault();
+    openCapture();
+  }
+});
 
 // Modal close — delegated listener (CSP blocks inline event-handler attributes,
 // so closing happens here instead of onclick="" in showModal)

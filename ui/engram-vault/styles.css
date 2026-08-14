@@ -1469,6 +1469,31 @@ input[type="file"] { font-size: var(--text-sm); color: var(--text-muted); }
 .modal h3 { margin: 0 0 8px; font-size: 15.5px; }
 .modal p { color: var(--text-muted); font-size: 13.5px; margin: 0 0 18px; }
 
+/* Quick-capture modal form */
+.modal-body textarea, .modal-body select, .modal-body input {
+  width: 100%;
+  box-sizing: border-box;
+  margin-bottom: 10px;
+}
+.modal-body textarea {
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 14px;
+  padding: 10px;
+  resize: vertical;
+}
+.modal-body textarea:focus, .modal-body input:focus, .modal-body select:focus {
+  outline: none;
+  border-color: var(--semantic);
+}
+.cap-row { display: flex; gap: 8px; }
+.cap-row select { flex: 0 0 auto; margin-bottom: 0; }
+.cap-row input { flex: 1; margin-bottom: 0; }
+.cap-row + .mutation { margin-top: 12px; }
+
 /* ── Tables (priority table, vault info) ───────────────────────────────── */
 
 .table { width: 100%; border-collapse: collapse; font-size: 13px; }
