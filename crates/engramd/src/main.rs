@@ -153,6 +153,37 @@ fn load_or_create_device_id(vault_path: &std::path::Path) -> String {
     device_id
 }
 
+/// Persist the effective sync `vault_id` into config.json when it isn't
+/// pinned there yet, so `/teams/status` and later restarts agree with the
+/// id the sync loop actually uses. Best-effort: a read-only vault dir just
+/// means the id is re-derived on each start (it is deterministic anyway).
+fn pin_vault_id(vault_path: &std::path::Path, vault_id: &str) {
+    let config_path = vault_path.join("config.json");
+    let Ok(data) = std::fs::read_to_string(&config_path) else {
+        return;
+    };
+    let Ok(mut cfg) = serde_json::from_str::<serde_json::Value>(&data) else {
+        return;
+    };
+    let needs_pin = match cfg.get_mut("sync") {
+        Some(serde_json::Value::Object(obj)) if !obj.contains_key("vault_id") => {
+            obj.insert(
+                "vault_id".to_string(),
+                serde_json::Value::String(vault_id.to_string()),
+            );
+            true
+        }
+        _ => false,
+    };
+    if needs_pin {
+        if let Ok(pretty) = serde_json::to_string_pretty(&cfg) {
+            if let Err(e) = std::fs::write(&config_path, pretty) {
+                tracing::warn!(error = %e, "Failed to pin vault_id into config");
+            }
+        }
+    }
+}
+
 fn hostname() -> String {
     std::env::var("HOSTNAME")
         .or_else(|_| std::env::var("COMPUTERNAME"))
@@ -454,24 +485,32 @@ async fn run_daemon(
                     .unwrap_or(60)
                     .max(5); // minimum 5s to avoid busy-loop on misconfiguration
 
-                // The vault_id is derived from the vault path name (stable
-                // identifier), unless the config pins an explicit one — so
-                // multiple vault directories can join one logical vault.
-                let vault_id = cfg
-                    .get("sync")
-                    .and_then(|s| s.get("vault_id"))
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-                    .unwrap_or_else(|| {
-                        vault_path
-                            .file_name()
-                            .map(|n| n.to_string_lossy().to_string())
-                            .unwrap_or_else(|| "default".into())
-                    });
-
                 // Passphrase: for sync, we use the same passphrase used to open the vault.
                 // If no passphrase was provided, sync won't work (encryption is required).
                 if let Some(ref pw) = passphrase {
+                    // The vault_id is pinned in config, or derived from the sync
+                    // passphrase — same passphrase ⇒ same id, so teammates land
+                    // in the same vault with no configuration. (It must NOT come
+                    // from the vault directory name: directory names differ
+                    // across devices and binary versions, which silently split
+                    // a shared vault across devices on the server.)
+                    let vault_id = match cfg
+                        .get("sync")
+                        .and_then(|s| s.get("vault_id"))
+                        .and_then(|v| v.as_str())
+                    {
+                        Some(v) => v.to_string(),
+                        None => {
+                            let derived = sync_client::derive_vault_id(pw);
+                            pin_vault_id(&vault_path, &derived);
+                            info!(
+                                vault_id = %derived,
+                                "vault_id unset — derived from passphrase and pinned to config"
+                            );
+                            derived
+                        }
+                    };
+
                     let initial_clock = sync_client::SyncClient::load_clock(&vault_path);
                     let sync_client = Arc::new(sync_client::SyncClient::new(
                         server_url.to_string(),

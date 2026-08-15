@@ -331,3 +331,29 @@ fn lww_edit_beats_original() {
         "the edited blob must outrank the original in LWW"
     );
 }
+
+// ── vault_id passphrase fallback ────────────────────────────────────────────
+
+/// Two devices sharing a passphrase must derive the same fallback vault_id
+/// (that's what puts them in the same vault on the server), and the id must
+/// be stable and hex-shaped.
+#[test]
+fn vault_id_fallback_is_stable_across_devices() {
+    let a = engramd::sync_client::derive_vault_id("correct-horse-battery-staple");
+    let b = engramd::sync_client::derive_vault_id("correct-horse-battery-staple");
+    assert_eq!(a, b, "same passphrase must derive the same vault_id");
+    assert_eq!(a.len(), 64, "vault_id should be 32-byte hex");
+    assert!(
+        a.chars().all(|c| c.is_ascii_hexdigit()),
+        "vault_id must be lowercase hex"
+    );
+}
+
+/// Different passphrases must derive different vault ids (a collision here
+/// would merge two teams into one vault on the server).
+#[test]
+fn vault_id_fallback_is_distinct_per_passphrase() {
+    let a = engramd::sync_client::derive_vault_id("correct-horse-battery-staple");
+    let b = engramd::sync_client::derive_vault_id("correct-horse-battery-stapler");
+    assert_ne!(a, b, "different passphrases must derive different vault_ids");
+}

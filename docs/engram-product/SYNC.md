@@ -220,11 +220,13 @@ teammate who only pulls is effectively a read-only member — nothing forces
 them to push.
 
 > **Gotcha — set `vault_id` explicitly.** When `vault_id` is unset, the
-> daemon falls back to the vault **directory name**. Two devices pointed at
-> the "same" shared vault but with different directory names (or different
-> fallback derivations across binary versions) silently split into two
-> vaults on the server: blobs land under different vault ids and never
-> converge. Always PATCH an explicit `vault_id` before syncing.
+> daemon derives it from the sync passphrase (same passphrase ⇒ same id,
+> so teammates converge without configuration) and pins the derived value
+> into `config.json` on first sync. Early binaries derived it from the
+> vault **directory name** instead — different directory names across
+> devices/binary versions silently split one team into two vaults on the
+> server. Explicit `vault_id` still wins over the fallback, and is
+> recommended for anything you want to name.
 
 ### Seeing the team
 

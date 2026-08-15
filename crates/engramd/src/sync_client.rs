@@ -1092,6 +1092,17 @@ fn urlencoding(s: &str) -> String {
 /// Uses the same parameters as vault key derivation (64 MiB, 3 iterations,
 /// 4 lanes) but with a domain-separated salt so sync keys are independent
 /// from the vault encryption key.
+/// Derive a stable shared-vault id from the sync passphrase.
+///
+/// Used as the `vault_id` fallback when the config doesn't pin one: two
+/// devices initialized with the same passphrase derive the same id, so
+/// they land in the same vault on the sync server with no configuration.
+/// Domain-separated from the encryption/HMAC keys.
+pub fn derive_vault_id(passphrase: &str) -> String {
+    let key = derive_sync_key(passphrase, b"axiom-sync-vaultid-v1");
+    key.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 fn derive_sync_key(passphrase: &str, salt: &[u8]) -> [u8; 32] {
     use argon2::{
         password_hash::{PasswordHasher, SaltString},
