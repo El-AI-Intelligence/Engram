@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# install.sh — one-command installer for Engram (engramd + engramd-mcp).
+# install.sh — one-command installer for Engram (engram + engramd + engramd-mcp).
 #
 #     curl -fsSL https://engram.ellmstack.dev/install.sh | bash
 #
@@ -34,12 +34,14 @@ trap 'rm -rf "$tmpdir"' EXIT
 
 mkdir -p "$INSTALL_DIR"
 
-for bin in engramd engramd-mcp; do
+for bin in engram engramd engramd-mcp; do
+  # Downloaded under the FULL artifact name so sha256sum -c matches the
+  # filenames recorded in the .sha256 files.
   echo "→ Downloading $bin…"
-  curl -fsSL "$RELEASE_BASE/$bin-linux-x86_64" -o "$tmpdir/$bin"
-  curl -fsSL "$RELEASE_BASE/$bin-linux-x86_64.sha256" -o "$tmpdir/$bin.sha256"
-  ( cd "$tmpdir" && sha256sum -c "$bin.sha256" ) >/dev/null
-  install -m 0755 "$tmpdir/$bin" "$INSTALL_DIR/$bin"
+  curl -fsSL "$RELEASE_BASE/$bin-linux-x86_64" -o "$tmpdir/$bin-linux-x86_64"
+  curl -fsSL "$RELEASE_BASE/$bin-linux-x86_64.sha256" -o "$tmpdir/$bin-linux-x86_64.sha256"
+  ( cd "$tmpdir" && sha256sum -c "$bin-linux-x86_64.sha256" ) >/dev/null
+  install -m 0755 "$tmpdir/$bin-linux-x86_64" "$INSTALL_DIR/$bin"
   echo "✓ Installed $bin ($INSTALL_DIR/$bin)"
 done
 

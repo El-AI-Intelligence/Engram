@@ -73,11 +73,13 @@ echo "Synced landing page and vault UI to /srv/engram/"
 install -m 0644 "$REPO_ROOT/scripts/install.sh" /srv/engram/landing/install.sh
 echo "Published install.sh (https://engram.ellmstack.dev/install.sh)"
 
-if [[ -f "$REPO_ROOT/target/release/engramd" && -f "$REPO_ROOT/target/release/engramd-mcp" ]]; then
+if [[ -f "$REPO_ROOT/target/release/engram" && -f "$REPO_ROOT/target/release/engramd" && -f "$REPO_ROOT/target/release/engramd-mcp" ]]; then
   install -d -m 0755 /srv/engram/landing/releases
+  install -m 0755 "$REPO_ROOT/target/release/engram" /srv/engram/landing/releases/engram-linux-x86_64
   install -m 0755 "$REPO_ROOT/target/release/engramd" /srv/engram/landing/releases/engramd-linux-x86_64
   install -m 0755 "$REPO_ROOT/target/release/engramd-mcp" /srv/engram/landing/releases/engramd-mcp-linux-x86_64
   ( cd /srv/engram/landing/releases \
+    && sha256sum engram-linux-x86_64 > engram-linux-x86_64.sha256 \
     && sha256sum engramd-linux-x86_64 > engramd-linux-x86_64.sha256 \
     && sha256sum engramd-mcp-linux-x86_64 > engramd-mcp-linux-x86_64.sha256 )
   echo "Published release binaries + SHA-256 checksums (the installer verifies them)."
@@ -124,7 +126,10 @@ fi
 
 if [[ -f "$REPO_ROOT/target/release/engramd" ]]; then
   install -m 0755 "$REPO_ROOT/target/release/engramd" /usr/local/bin/engramd
-  echo "Installed target/release/engramd to /usr/local/bin/engramd"
+  if [[ -f "$REPO_ROOT/target/release/engram" ]]; then
+    install -m 0755 "$REPO_ROOT/target/release/engram" /usr/local/bin/engram
+  fi
+  echo "Installed target/release/engramd (and engram CLI) to /usr/local/bin/"
   if systemctl list-unit-files engramd.service >/dev/null 2>&1; then
     systemctl restart engramd
     echo "Restarted engramd with the new binary."
