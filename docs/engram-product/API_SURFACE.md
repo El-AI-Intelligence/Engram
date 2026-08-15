@@ -668,21 +668,26 @@ shapes below.
 { "origin": "http://localhost:8787" }   // must be in the relay's --origin allow-list
 
 // Response 200 — challenge.publicKey is browser-API-compatible
-// (camelCase options); challenge/user.id/excludeCredentials[].id are
+// (camelCase options); challenge/user.id/allowCredentials[].id are
 // base64url-no-pad and must be decoded to ArrayBuffers client-side.
+// excludeCredentials is omitted while empty (new-account registration).
 {
   "challenge_id": "7f4c…",
   "challenge": {
     "publicKey": {
-      "rp": { "name": "Engram Sync" },
+      "rp": { "id": "localhost", "name": "Engram Sync" },
       "user": { "id": "…base64url…", "name": "engram-account", "displayName": "Engram Account" },
       "challenge": "…base64url…",
-      "pubKeyCredParams": [ { "type": "public-key", "alg": -7 }, … ],
-      "timeout": 60000,
-      "excludeCredentials": [],
+      "pubKeyCredParams": [ { "type": "public-key", "alg": -7 }, { "type": "public-key", "alg": -257 } ],
+      "timeout": 300000,
       "authenticatorSelection": { "residentKey": "required", "requireResidentKey": true, "userVerification": "required" },
       "attestation": "none",
-      "extensions": {}
+      "extensions": {
+        "credProps": true,
+        "credentialProtectionPolicy": "userVerificationRequired",
+        "enforceCredentialProtectionPolicy": false,
+        "uvm": true
+      }
     }
   }
 }
@@ -723,14 +728,19 @@ without one, the ceremony creates a brand-new account.
 // Request
 { "origin": "http://localhost:8787" }
 
-// Response 200
+// Response 200 — same nested shape as register: challenge.publicKey
+// is browser-API-compatible (challenge/allowCredentials[].id are
+// base64url-no-pad and need ArrayBuffer conversion client-side).
 {
   "challenge_id": "9a2e…",
   "challenge": {
-    "challenge": "…base64url…", "timeout": 60000,
-    "rpId": "localhost",
-    "allowCredentials": [ { "type": "public-key", "id": "…base64url…" } ],
-    "userVerification": "required"
+    "publicKey": {
+      "challenge": "…base64url…",
+      "timeout": 300000,
+      "rpId": "localhost",
+      "allowCredentials": [ { "type": "public-key", "id": "…base64url…" } ],
+      "userVerification": "required"
+    }
   }
 }
 

@@ -444,9 +444,69 @@ async fn devices(
         }));
     }
 
+    // Devices that registered a label but have not pushed a blob yet:
+    // they have no sync_blobs row, so the blob-driven query above cannot
+    // see them. The daemon registers before its first push — without this
+    // a freshly-joined device is invisible in the roster.
+    let mut stmt = conn
+        .prepare(
+            "SELECT l.device_id, l.updated_at, (r.revoked_at IS NOT NULL) AS revoked, l.label \
+             FROM device_labels l \
+             LEFT JOIN revoked_devices r \
+                    ON r.vault_id = l.vault_id AND r.device_id = l.device_id \
+             WHERE l.vault_id = ?1 AND NOT EXISTS (\
+                 SELECT 1 FROM sync_blobs s \
+                 WHERE s.vault_id = l.vault_id AND s.device_id = l.device_id)",
+        )
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?;
+    let rows = stmt
+        .query_map(rusqlite::params![vault_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, i64>(2)? != 0,
+                r.get::<_, Option<String>>(3)?,
+            ))
+        })
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?;
+    for row in rows {
+        let (device_id, last_seen, revoked, label) = row.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?;
+        device_list.push(json!({
+            "device_id": device_id,
+            "last_seen": last_seen,
+            "blob_count": 0,
+            "revoked": revoked,
+            "label": label,
+        }));
+    }
+
+    // Keep the roster ordered by activity: label-only rows carry their
+    // registration time as last_seen, so they sort naturally.
+    let mut list = device_list;
+    list.sort_by(|a, b| {
+        let ta = a.get("last_seen").and_then(|v| v.as_str());
+        let tb = b.get("last_seen").and_then(|v| v.as_str());
+        tb.cmp(&ta)
+    });
+
     Ok(Json(json!({
         "vault_id": vault_id,
-        "devices": device_list,
+        "devices": list,
     })))
 }
 
@@ -1146,6 +1206,47 @@ mod tests {
             )
             .unwrap();
         assert_eq!(n, 1);
+    }
+
+    #[tokio::test]
+    async fn roster_lists_labeled_device_before_its_first_push() {
+        let state = test_state();
+        seed_account_key(&state, "acct-1", Some("vault-a"), "en_devreg").await;
+
+        // Label only — no sync_blobs row yet (the daemon registers at
+        // sync-loop start, before its first push).
+        let _ = do_register(&state, "en_devreg", "vault-a", "dev-fresh", "New phone")
+            .await
+            .expect("register works");
+
+        let roster = do_devices(&state, "en_devreg", "vault-a")
+            .await
+            .expect("roster works");
+        let devices = roster["devices"].as_array().unwrap();
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0]["device_id"], "dev-fresh");
+        assert_eq!(devices[0]["label"], "New phone");
+        assert_eq!(devices[0]["blob_count"], 0);
+        assert_eq!(devices[0]["revoked"], false);
+
+        // After the first push the same device still appears once, now
+        // blob-driven with the label attached.
+        {
+            let conn = state.conn.lock().await;
+            conn.execute(
+                "INSERT INTO sync_blobs (vault_id, memory_id, device_id, vector_clock, ciphertext, hmac, created_at, deleted) \
+                 VALUES ('vault-a', 'm1', 'dev-fresh', 1, 'x', 'h', 'now', 0)",
+                [],
+            )
+            .unwrap();
+        }
+        let roster = do_devices(&state, "en_devreg", "vault-a")
+            .await
+            .expect("roster works");
+        let devices = roster["devices"].as_array().unwrap();
+        assert_eq!(devices.len(), 1, "no duplicate rows after first push");
+        assert_eq!(devices[0]["label"], "New phone");
+        assert_eq!(devices[0]["blob_count"], 1);
     }
 
     #[tokio::test]
