@@ -78,6 +78,29 @@ impl QuarantineFilter {
     }
 }
 
+/// Raw window data for the weekly digest (see [`EngramStore::digest_window`]).
+/// Slices are capped at the caller's limit; counts are exact.
+#[derive(Debug, Default)]
+pub struct DigestWindow {
+    /// Live memories created inside the window, top by strength.
+    pub new: Vec<Engram>,
+    /// Live memories created before the window but retrieved inside it
+    /// (retrieval strengthens decay — these are what the AI actually used).
+    pub reinforced: Vec<Engram>,
+    /// Live memories created before the window and not retrieved inside it,
+    /// weakest first — the digest flags these for revisiting.
+    pub fading: Vec<Engram>,
+    pub new_count: usize,
+    pub reinforced_count: usize,
+    pub fading_count: usize,
+    pub live_total: usize,
+    /// Quarantined rows (`imagined && !grounded`), any age.
+    pub quarantined_count: usize,
+    /// Quarantined rows created inside the window — noise filtered out this
+    /// week ("forgotten").
+    pub quarantined_new_count: usize,
+}
+
 // ── Vault key derivation ──────────────────────────────────────────────────────
 
 /// Application-level salt for machine-id-based key derivation (v1).
@@ -1359,6 +1382,87 @@ impl EngramStore {
         Ok(())
     }
 
+    /// Windowed data for the weekly digest — the "what your AI learned this
+    /// week" query. All slices are live-only (quarantine scope applied in
+    /// SQL); `cutoff` is an RFC3339 timestamp.
+    ///
+    /// - `new`: created inside the window (top by strength)
+    /// - `reinforced`: created before the window, retrieved inside it —
+    ///   retrieval strengthens decay, so these are what the AI actually used
+    /// - `fading`: live, created before the window, not retrieved inside it
+    ///   (weakest first — the digest flags these for revisiting)
+    /// - `quarantined_new`: quarantined rows created inside the window —
+    ///   noise the system filtered out this week ("forgotten")
+    pub async fn digest_window(&self, cutoff: &str, limit: usize) -> Result<DigestWindow> {
+        let conn = self.conn.lock().await;
+        let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+        const COLS: &str = "id, layer, source, privacy_level, content, context, strength, valence, retrievals, imagined, grounded, created_at, last_retrieved, project, tags, scope, content_type, occurred_at, modified_at";
+        let live = "AND NOT (imagined = 1 AND grounded = 0)";
+        let quarantine = "AND (imagined = 1 AND grounded = 0)";
+
+        // Cutoff binds at ?1 in count SQL, ?2 in select SQL (limit holds ?1).
+        let count = |where_sql: &str, cutoff: Option<&str>| -> rusqlite::Result<usize> {
+            let sql = format!("SELECT COUNT(*) FROM engrams WHERE 1=1 {where_sql}");
+            let mut stmt = conn.prepare(&sql)?;
+            let n: i64 = match cutoff {
+                Some(c) => stmt.query_row(params![c], |row| row.get(0))?,
+                None => stmt.query_row([], |row| row.get(0))?,
+            };
+            Ok(n as usize)
+        };
+        let select = |where_sql: &str, order: &str| -> rusqlite::Result<Vec<Engram>> {
+            let sql = format!(
+                "SELECT {COLS} FROM engrams WHERE 1=1 {where_sql} ORDER BY {order} LIMIT ?1"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(params![limit_i64, cutoff], Self::row_to_engram)?;
+            rows.collect()
+        };
+
+        let new_sql = format!("{live} AND created_at >= ?2");
+        let reinforced_sql = format!("{live} AND created_at < ?2 AND last_retrieved >= ?2");
+        let fading_sql =
+            format!("{live} AND created_at < ?2 AND (last_retrieved IS NULL OR last_retrieved < ?2)");
+
+        let mut new = select(&new_sql, "strength DESC")?;
+        let mut reinforced = select(&reinforced_sql, "strength DESC")?;
+        let mut fading = select(&fading_sql, "strength ASC")?;
+        Self::enrich_links_batch(&conn, &mut new)?;
+        Self::enrich_links_batch(&conn, &mut reinforced)?;
+        Self::enrich_links_batch(&conn, &mut fading)?;
+
+        Ok(DigestWindow {
+            new_count: count(&format!("{live} AND created_at >= ?1"), Some(cutoff))?,
+            reinforced_count: count(&format!("{live} AND created_at < ?1 AND last_retrieved >= ?1"), Some(cutoff))?,
+            fading_count: count(&format!("{live} AND created_at < ?1 AND (last_retrieved IS NULL OR last_retrieved < ?1)"), Some(cutoff))?,
+            live_total: count(live, None)?,
+            quarantined_count: count(quarantine, None)?,
+            quarantined_new_count: count(&format!("{quarantine} AND created_at >= ?1"), Some(cutoff))?,
+            new,
+            reinforced,
+            fading,
+        })
+    }
+
+    /// Batch variant of [`Self::get_embedding`] for the weekly digest's theme
+    /// clustering. Rows without embeddings are absent from the map.
+    pub async fn get_embeddings(&self, ids: &[String]) -> Result<HashMap<String, Vec<f64>>> {
+        let conn = self.conn.lock().await;
+        let mut out = HashMap::new();
+        let mut stmt = conn.prepare(
+            "SELECT engram_id, embedding FROM engram_embeddings WHERE engram_id = ?1",
+        )?;
+        for id in ids {
+            if let Some(blob) = stmt
+                .query_row(params![id], |row| row.get::<_, Vec<u8>>(1))
+                .optional()?
+            {
+                out.insert(id.clone(), blob_to_embedding(&blob));
+            }
+        }
+        Ok(out)
+    }
+
     /// Search engrams by tag(s). Returns engrams that contain ALL of the given
     /// tags, sorted by `created_at DESC` (newest first).
     ///
@@ -2317,6 +2421,53 @@ mod tests {
         let path = dir.path().to_path_buf();
         let store = EngramStore::open(&path).await.unwrap();
         (store, dir)
+    }
+
+    #[tokio::test]
+    async fn digest_window_partitions_by_window_and_quarantine() {
+        let (store, _dir) = test_store().await;
+        let now = chrono::Utc::now();
+        let cutoff = (now - chrono::Duration::days(7)).to_rfc3339();
+        let old = now - chrono::Duration::days(14);
+        let fresh = now - chrono::Duration::days(1);
+
+        // 2 new in window. Multi-word contents — the B1 noise filter drops
+        // single-word "captures", which is not what this test exercises.
+        for (i, content) in ["strong decision captured this week", "weak observation captured this week"].iter().enumerate() {
+            let mut e = make_engram(content);
+            e.created_at = now - chrono::Duration::hours(24 + i as i64);
+            e.strength = if i == 0 { 1.5 } else { 0.2 };
+            store.write(&e).await.unwrap();
+        }
+        // reinforced: created long ago, retrieved inside the window
+        let mut reinforced = make_engram("reinforced memory from the old project");
+        reinforced.created_at = old;
+        reinforced.last_retrieved = Some(fresh);
+        store.write(&reinforced).await.unwrap();
+        // fading: created long ago, never retrieved
+        let mut fading = make_engram("fading note from the old project");
+        fading.created_at = old;
+        fading.strength = 0.1;
+        store.write(&fading).await.unwrap();
+        // quarantined + created in window (filtered noise). write_curated —
+        // the capture gates would noise-skip a fake capture.
+        let mut noise = make_engram("hallucinated detail that never happened");
+        noise.imagined = true;
+        noise.grounded = false;
+        noise.created_at = now - chrono::Duration::hours(1);
+        store.write_curated(&noise).await.unwrap();
+
+        let w = store.digest_window(&cutoff, 10).await.unwrap();
+        assert_eq!(w.new_count, 2);
+        assert_eq!(w.reinforced_count, 1);
+        assert_eq!(w.fading_count, 1);
+        assert_eq!(w.live_total, 4);
+        assert_eq!(w.quarantined_count, 1);
+        assert_eq!(w.quarantined_new_count, 1);
+        assert_eq!(w.new.len(), 2);
+        assert!(w.new[0].strength >= w.new[1].strength, "new sorted by strength desc");
+        assert_eq!(w.reinforced[0].content, "reinforced memory from the old project");
+        assert_eq!(w.fading[0].content, "fading note from the old project");
     }
 
     fn make_engram(content: &str) -> Engram {
