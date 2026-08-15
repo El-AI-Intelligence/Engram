@@ -219,6 +219,13 @@ Memories converge in both directions, and edits propagate (see above). A
 teammate who only pulls is effectively a read-only member — nothing forces
 them to push.
 
+> **Gotcha — set `vault_id` explicitly.** When `vault_id` is unset, the
+> daemon falls back to the vault **directory name**. Two devices pointed at
+> the "same" shared vault but with different directory names (or different
+> fallback derivations across binary versions) silently split into two
+> vaults on the server: blobs land under different vault ids and never
+> converge. Always PATCH an explicit `vault_id` before syncing.
+
 ### Seeing the team
 
 - **Settings → Sync & Team** in the web UI: vault ID (copy button), team
@@ -359,3 +366,10 @@ If you're migrating from another memory system:
   consolidation promotions change rows without bumping `modified_at`, so
   those specific deltas don't propagate until the row changes again
   (deliberate — avoids bulk re-push storms).
+- **Global push cursor can strand older edits:** push selects memories
+  strictly after a single `last_push` timestamp, and pull advances that
+  cursor past the newest pulled blob. If an older un-pushed memory sits
+  behind a pulled blob's `modified_at` (e.g. after a cursor rewind or a
+  re-configured vault), it is skipped on the next cycle and stays local.
+  A per-memory push cursor (or push retry) is the proper fix — see
+  `engramd/sync_client.rs`.
