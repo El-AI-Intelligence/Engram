@@ -101,47 +101,114 @@ async fn push(
     };
     let mut revoked_seen: HashSet<String> = HashSet::new();
 
-    let mut accepted = 0usize;
-    let mut rejected: Vec<String> = Vec::new();
-
+    // ── Validation pass: verdict + the row each blob would replace ──────
+    // `existing` (vector clock, active length, deleted, device) is fetched
+    // once here so quota projection and insertion share the same pre-image.
+    let mut entries: Vec<(&SyncBlob, bool, Option<(u64, usize, bool, String)>)> = Vec::new();
     for blob in &req.blobs {
-        // Reject oversized blobs
+        let mut reject = false;
         if blob.ciphertext.len() > crate::MAX_BLOB_SIZE {
-            rejected.push(blob.memory_id.clone());
-            continue;
-        }
-
-        // Verify vault_id matches path
-        if blob.vault_id != vault_id {
-            rejected.push(blob.memory_id.clone());
-            continue;
-        }
-
-        // Reject blobs from revoked devices (a zero-knowledge relay can
-        // block pushes; removing the passphrase needs a re-key)
-        if revoked.contains(&blob.device_id) {
-            rejected.push(blob.memory_id.clone());
+            reject = true; // oversized
+        } else if blob.vault_id != vault_id {
+            reject = true; // vault_id must match the path
+        } else if revoked.contains(&blob.device_id) {
+            // A zero-knowledge relay can block pushes; removing the
+            // passphrase needs a re-key.
+            reject = true;
             revoked_seen.insert(blob.device_id.clone());
-            continue;
         }
 
-        // Check existing vector clock — accept only if this blob is newer
-        let existing_clock: Option<u64> = conn
+        let existing: Option<(u64, usize, bool, String)> = conn
             .query_row(
-                "SELECT vector_clock FROM sync_blobs WHERE vault_id = ?1 AND memory_id = ?2",
+                "SELECT vector_clock, length(ciphertext), deleted, device_id \
+                 FROM sync_blobs WHERE vault_id = ?1 AND memory_id = ?2",
                 rusqlite::params![vault_id, blob.memory_id],
-                |r| r.get(0),
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get::<_, i64>(1)? as usize,
+                        r.get::<_, i32>(2)? != 0,
+                        r.get(3)?,
+                    ))
+                },
             )
             .ok();
-
-        if let Some(clock) = existing_clock {
-            if blob.vector_clock <= clock {
-                rejected.push(blob.memory_id.clone());
-                continue;
+        if let Some((clock, _, _, _)) = &existing {
+            if blob.vector_clock <= *clock {
+                reject = true; // stale vector clock
             }
         }
+        entries.push((blob, reject, existing));
+    }
 
-        // Insert or update
+    // ── Quota projection (account keys only; static keys are exempt) ────
+    // Pre-insert whole-batch check: the batch's projected usage must fit
+    // inside the account's limits or nothing is written.
+    if let Some(account_id) = key.entry.account_id.clone() {
+        let (limit_devices, limit_bytes) = crate::quota::effective_limits(
+            &conn,
+            &account_id,
+            state.default_quota_devices,
+            state.default_quota_bytes,
+        )
+        .map_err(|e| err_json(500, format!("Database error: {e}")))?;
+        let vaults = crate::quota::account_vaults(&conn, &account_id)
+            .map_err(|e| err_json(500, format!("Database error: {e}")))?;
+        let (used_devices, used_bytes) = crate::quota::usage_in_vaults(&conn, &vaults)
+            .map_err(|e| err_json(500, format!("Database error: {e}")))?;
+        let current_devices = crate::quota::active_devices(&conn, &vault_id)
+            .map_err(|e| err_json(500, format!("Database error: {e}")))?;
+
+        // Fold the batch over a virtual per-memory state so a memory_id
+        // appearing twice in one batch projects correctly (REPLACE-aware:
+        // overwriting shrinks/grows by the delta, not the raw sum).
+        let mut virt: std::collections::HashMap<String, (usize, bool)> =
+            std::collections::HashMap::new();
+        let mut proj_bytes = used_bytes;
+        let mut proj_new_devices: HashSet<String> = HashSet::new();
+        for (blob, reject, existing) in &entries {
+            if *reject {
+                continue;
+            }
+            let initial = match existing {
+                Some((_, len, deleted, _)) => (*len, *deleted),
+                None => (0, false),
+            };
+            let slot = virt.entry(blob.memory_id.clone()).or_insert(initial);
+            let (old_len, old_deleted) = *slot;
+            if !old_deleted {
+                proj_bytes -= old_len as i64;
+            }
+            let new_len = blob.ciphertext.len();
+            if !blob.deleted {
+                proj_bytes += new_len as i64;
+                if !current_devices.contains(&blob.device_id) {
+                    proj_new_devices.insert(blob.device_id.clone());
+                }
+            }
+            *slot = (new_len, blob.deleted);
+        }
+        let proj_devices = used_devices + proj_new_devices.len() as i64;
+        if limit_devices > 0 && proj_devices > limit_devices {
+            return Err(crate::quota::quota_error(
+                "devices",
+                limit_devices,
+                proj_devices,
+            ));
+        }
+        if limit_bytes > 0 && proj_bytes > limit_bytes {
+            return Err(crate::quota::quota_error("bytes", limit_bytes, proj_bytes));
+        }
+    }
+
+    // ── Insert pass ─────────────────────────────────────────────────────
+    let mut accepted = 0usize;
+    let mut rejected: Vec<String> = Vec::new();
+    for (blob, reject, _) in &entries {
+        if *reject {
+            rejected.push(blob.memory_id.clone());
+            continue;
+        }
         let result = conn.execute(
             "INSERT OR REPLACE INTO sync_blobs \
              (vault_id, memory_id, device_id, vector_clock, ciphertext, hmac, created_at, deleted) \
@@ -596,6 +663,14 @@ mod tests {
                  id TEXT PRIMARY KEY, account_id TEXT NOT NULL, key_hash BLOB NOT NULL UNIQUE,
                  key_prefix TEXT NOT NULL, rate REAL NOT NULL DEFAULT 100, vault_id TEXT,
                  created_at TEXT NOT NULL, revoked INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE accounts (
+                 id TEXT PRIMARY KEY, created_at TEXT NOT NULL, last_login_at TEXT,
+                 quota_devices INTEGER, quota_bytes INTEGER
+             );
+             CREATE TABLE revoked_devices (
+                 vault_id TEXT NOT NULL, device_id TEXT NOT NULL, revoked_at TEXT NOT NULL,
+                 PRIMARY KEY (vault_id, device_id)
              );",
         )
         .unwrap();
@@ -724,5 +799,205 @@ mod tests {
             .await
             .expect_err("static keys → auth required");
         assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
+
+    // ── Quotas (Phase 4) ────────────────────────────────────────────────
+
+    fn blob(vault: &str, mid: &str, dev: &str, clock: u64, text: &str) -> axiom_engram::sync::SyncBlob {
+        axiom_engram::sync::SyncBlob {
+            vault_id: vault.into(),
+            memory_id: mid.into(),
+            device_id: dev.into(),
+            vector_clock: clock,
+            ciphertext: text.into(),
+            hmac: "h".into(),
+            created_at: "now".into(),
+            deleted: false,
+        }
+    }
+
+    async fn seed_account(state: &SyncState, account_id: &str, quota_devices: i64, quota_bytes: i64) {
+        let conn = state.conn.lock().await;
+        conn.execute(
+            "INSERT INTO accounts (id, created_at, quota_devices, quota_bytes) \
+             VALUES (?1, 'now', ?2, ?3)",
+            rusqlite::params![account_id, quota_devices, quota_bytes],
+        )
+        .unwrap();
+    }
+
+    async fn seed_account_key(state: &SyncState, account_id: &str, vault: Option<&str>, plain: &str) {
+        let conn = state.conn.lock().await;
+        conn.execute(
+            "INSERT INTO api_keys (id, account_id, key_hash, key_prefix, rate, vault_id, created_at, revoked) \
+             VALUES (?1, ?2, ?3, 'en_', 100, ?4, 'now', 0)",
+            rusqlite::params![
+                format!("id-{plain}"),
+                account_id,
+                crate::auth::hash_key(plain).to_vec(),
+                vault,
+            ],
+        )
+        .unwrap();
+    }
+
+    async fn do_push(
+        state: &SyncState,
+        token: &str,
+        vault: &str,
+        blobs: Vec<axiom_engram::sync::SyncBlob>,
+    ) -> Result<axum::Json<PushResponse>, (StatusCode, Json<serde_json::Value>)> {
+        push(
+            State(state.clone()),
+            bearer(token),
+            Path(vault.to_string()),
+            Json(PushRequest { blobs }),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn quota_blocks_new_device_over_limit() {
+        let state = test_state();
+        seed_account(&state, "acct-1", 1, 0).await; // 1 device, unlimited bytes
+        seed_account_key(&state, "acct-1", Some("vault-a"), "en_devquota").await;
+        // dev-1 already holds an active blob in vault-a
+        {
+            let conn = state.conn.lock().await;
+            conn.execute(
+                "INSERT INTO sync_blobs (vault_id, memory_id, device_id, vector_clock, ciphertext, hmac, created_at, deleted) \
+                 VALUES ('vault-a', 'm0', 'dev-1', 1, 'x', 'h', 'now', 0)",
+                [],
+            )
+            .unwrap();
+        }
+        // dev-2 pushes → projected devices = 2 > 1 → 402, nothing written
+        let err = do_push(
+            &state,
+            "en_devquota",
+            "vault-a",
+            vec![blob("vault-a", "m1", "dev-2", 1, "abc")],
+        )
+        .await
+        .expect_err("device quota");
+        assert_eq!(err.0, StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(err.1["error"]["code"], "quota_exceeded");
+        assert_eq!(err.1["error"]["detail"], "devices");
+        assert_eq!(err.1["error"]["limit"], 1);
+        assert_eq!(err.1["error"]["used"], 2);
+        let conn = state.conn.lock().await;
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_blobs WHERE memory_id = 'm1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0, "whole batch rejected — nothing written");
+    }
+
+    #[tokio::test]
+    async fn quota_counts_same_device_once_in_batch() {
+        let state = test_state();
+        seed_account(&state, "acct-1", 1, 0).await;
+        seed_account_key(&state, "acct-1", Some("vault-a"), "en_samedev").await;
+        // Two blobs from the same new device in one batch → 1 device.
+        let res = do_push(
+            &state,
+            "en_samedev",
+            "vault-a",
+            vec![
+                blob("vault-a", "m1", "dev-1", 1, "aa"),
+                blob("vault-a", "m2", "dev-1", 1, "bb"),
+            ],
+        )
+        .await
+        .expect("one device, two blobs");
+        assert_eq!(res.accepted, 2);
+        assert!(res.rejected.is_empty());
+    }
+
+    #[tokio::test]
+    async fn quota_replace_shrink_fits_but_growth_blocks() {
+        let state = test_state();
+        seed_account(&state, "acct-1", 0, 10).await; // 10-byte quota
+        seed_account_key(&state, "acct-1", Some("vault-a"), "en_bytes").await;
+        {
+            let conn = state.conn.lock().await;
+            conn.execute(
+                "INSERT INTO sync_blobs (vault_id, memory_id, device_id, vector_clock, ciphertext, hmac, created_at, deleted) \
+                 VALUES ('vault-a', 'm1', 'dev-1', 1, 'xxxx', 'h', 'now', 0)",
+                [],
+            )
+            .unwrap();
+        }
+        // Overwrite big→small: projected 2 ≤ 10 → accepted.
+        let res = do_push(
+            &state,
+            "en_bytes",
+            "vault-a",
+            vec![blob("vault-a", "m1", "dev-1", 2, "xx")],
+        )
+        .await
+        .expect("REPLACE-shrink fits");
+        assert_eq!(res.accepted, 1);
+
+        // New blob pushes projected bytes to 2 + 9 = 11 > 10 → 402.
+        let err = do_push(
+            &state,
+            "en_bytes",
+            "vault-a",
+            vec![blob("vault-a", "m2", "dev-1", 1, "123456789")],
+        )
+        .await
+        .expect_err("bytes quota");
+        assert_eq!(err.0, StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(err.1["error"]["detail"], "bytes");
+        assert_eq!(err.1["error"]["limit"], 10);
+        assert_eq!(err.1["error"]["used"], 11);
+    }
+
+    #[tokio::test]
+    async fn zero_limits_are_unlimited() {
+        let state = test_state();
+        seed_account(&state, "acct-1", 0, 0).await;
+        seed_account_key(&state, "acct-1", Some("vault-a"), "en_unlim").await;
+        let res = do_push(
+            &state,
+            "en_unlim",
+            "vault-a",
+            vec![blob("vault-a", "m1", "dev-1", 1, &"x".repeat(5000))],
+        )
+        .await
+        .expect("0 = unlimited");
+        assert_eq!(res.accepted, 1);
+    }
+
+    #[tokio::test]
+    async fn static_keys_are_exempt_from_quota() {
+        let mut state = test_state();
+        // Account with a tiny quota — but the request uses a static key.
+        seed_account(&state, "acct-1", 1, 1).await;
+        let static_key = "static-key-0000002";
+        Arc::get_mut(&mut state.api_keys)
+            .unwrap()
+            .insert(
+                static_key.into(),
+                Arc::new(ApiKeyEntry {
+                    rate: 100.0,
+                    vaults: None,
+                    admin_vaults: HashSet::new(),
+                    account_id: None,
+                }),
+            );
+        let res = do_push(
+            &state,
+            static_key,
+            "vault-a",
+            vec![blob("vault-a", "m1", "dev-1", 1, "big blob way over one byte")],
+        )
+        .await
+        .expect("static keys exempt");
+        assert_eq!(res.accepted, 1);
     }
 }

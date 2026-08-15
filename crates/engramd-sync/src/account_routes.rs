@@ -377,9 +377,9 @@ async fn get_account(
         None => (state.default_quota_devices, state.default_quota_bytes),
     };
 
-    let vaults = account_vaults(&conn, &account_id)
+    let vaults = crate::quota::account_vaults(&conn, &account_id)
         .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
-    let (devices_used, bytes_used) = usage_in_vaults(&conn, &vaults)
+    let (devices_used, bytes_used) = crate::quota::usage_in_vaults(&conn, &vaults)
         .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
 
     let mut stmt = conn
@@ -504,58 +504,6 @@ async fn revoke_account_key(
         ));
     }
     Ok(Json(json!({"key_id": key_id, "revoked": true})))
-}
-
-/// Vaults an account reaches: its unrevoked scoped keys, or every vault
-/// with blobs when it holds an unrevoked unscoped key.
-fn account_vaults(conn: &rusqlite::Connection, account_id: &str) -> rusqlite::Result<Vec<String>> {
-    let has_unscoped: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM api_keys \
-         WHERE account_id = ?1 AND revoked = 0 AND vault_id IS NULL)",
-        rusqlite::params![account_id],
-        |r| r.get(0),
-    )?;
-    if has_unscoped {
-        let mut stmt = conn.prepare("SELECT DISTINCT vault_id FROM sync_blobs WHERE deleted = 0")?;
-        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-        return Ok(rows.filter_map(|r| r.ok()).collect());
-    }
-    let mut stmt = conn.prepare(
-        "SELECT DISTINCT vault_id FROM api_keys \
-         WHERE account_id = ?1 AND revoked = 0 AND vault_id IS NOT NULL",
-    )?;
-    let rows = stmt.query_map(rusqlite::params![account_id], |r| r.get::<_, String>(0))?;
-    Ok(rows.filter_map(|r| r.ok()).collect())
-}
-
-/// Devices and stored bytes used across a vault set (active blobs only).
-/// `length(ciphertext)` counts base64 characters — the ciphertext column
-/// is what eats storage, so chars ≈ bytes for quota purposes.
-fn usage_in_vaults(
-    conn: &rusqlite::Connection,
-    vaults: &[String],
-) -> rusqlite::Result<(i64, i64)> {
-    if vaults.is_empty() {
-        return Ok((0, 0));
-    }
-    let placeholders = vec!["?"; vaults.len()].join(",");
-    let devices: i64 = conn.query_row(
-        &format!(
-            "SELECT COUNT(DISTINCT device_id) FROM sync_blobs \
-             WHERE deleted = 0 AND vault_id IN ({placeholders})"
-        ),
-        rusqlite::params_from_iter(vaults.iter()),
-        |r| r.get(0),
-    )?;
-    let bytes: i64 = conn.query_row(
-        &format!(
-            "SELECT COALESCE(SUM(length(ciphertext)), 0) FROM sync_blobs \
-             WHERE deleted = 0 AND vault_id IN ({placeholders})"
-        ),
-        rusqlite::params_from_iter(vaults.iter()),
-        |r| r.get(0),
-    )?;
-    Ok((devices, bytes))
 }
 
 // ── Session helpers (shared with account-key routes) ────────────────────────
