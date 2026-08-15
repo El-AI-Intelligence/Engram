@@ -775,7 +775,7 @@ pub async fn handle_digest(url: String, days: u32, prose: bool) -> Result<()> {
                         .map(|t| t.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", "))
                         .filter(|s| !s.is_empty());
                     match tags {
-                        Some(t) => println!("    • {content}\n      [{}{}]", m["layer"].as_str().unwrap_or(""), t),
+                        Some(t) => println!("    • {content}\n      [{}] [{}]", m["layer"].as_str().unwrap_or(""), t),
                         None => println!("    • {content}\n      [{}]", m["layer"].as_str().unwrap_or("")),
                     }
                 }
