@@ -27,11 +27,17 @@ engram daemon        # starts on http://localhost:8787
 
 Open `http://localhost:8787` — the vault UI walks you through onboarding.
 
-For AI tools, connect via MCP:
+For AI tools, connect via MCP — one command writes the config for every
+supported editor (Claude Desktop, Cursor, Windsurf), merging with whatever
+MCP servers you already have:
 
 ```bash
-engram mcp install   # prints config for Claude Desktop / Cursor / Windsurf
+engram mcp install   # writes configs + prints snippets for anything undetected
+engram mcp status    # binary, daemon, and per-editor state
 ```
+
+Claude Code: `claude mcp add --scope user engram -- engramd-mcp --engramd-url http://127.0.0.1:8787`.
+Full guide: [docs/engram-product/MCP.md](docs/engram-product/MCP.md).
 
 Or from source: `cargo install --path crates/engramd` (also provides the `engram` CLI).
 
@@ -55,6 +61,7 @@ Or from source: `cargo install --path crates/engramd` (also provides the `engram
 
 - [DEPLOY.md](docs/engram-product/DEPLOY.md) — deploy the live site (Caddy + systemd + API key auth)
 - [SYNC.md](docs/engram-product/SYNC.md) — E2E sync protocol and self-hosting the relay
+- [MCP.md](docs/engram-product/MCP.md) — connect Claude, Cursor, and Windsurf to your vault
 - [API_SURFACE.md](docs/engram-product/API_SURFACE.md) — REST/WS API contract
 - [REVENUE_ROADMAP.md](docs/engram-product/REVENUE_ROADMAP.md) — the plan for paid layers (cloud sync, team memory) on top of the MIT core
 

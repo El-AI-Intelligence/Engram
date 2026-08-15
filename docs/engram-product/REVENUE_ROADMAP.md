@@ -71,7 +71,7 @@ The consumer endgame: your memory follows you across Claude, Cursor, ChatGPT, Co
 
 | Milestone | Work | Est. |
 |---|---|---|
-| 3.1 MCP everywhere | `engramd-mcp` already exists — bundle Claude Desktop / Cursor / Windsurf configs, polish the web vault as the read-only companion | 2–3 wks |
+| 3.1 MCP everywhere | **Shipped 2026-08-15:** `engram mcp install` writes/merges configs for Claude Desktop / Cursor / Windsurf (creates where the app is installed, prints snippets otherwise), `engram mcp status` checks binary + daemon + editors, `claude mcp add` for Claude Code, repo `.mcp.json`, capture tools report skipped duplicates honestly, search uses the daemon's hybrid default — docs in MCP.md. Web-vault read-only polish deferred | done |
 | 3.2 Weekly digest | Local-model digest (zero per-request cost; BYO-key as an option), delivered by email/push | 3 wks |
 | 3.3 Consumer onboarding | 5-minute install → first memory flow; landing page focused on consumer value; browser extension later | 3 wks |
 
