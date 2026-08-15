@@ -141,7 +141,7 @@ pub fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
 /// Apply schema migrations for columns added after the initial release.
 ///
 /// Current schema version. Increment this when adding new migrations below.
-const CURRENT_SCHEMA_VERSION: i32 = 5;
+const CURRENT_SCHEMA_VERSION: i32 = 6;
 
 /// Versioned schema migrations using SQLite's `PRAGMA user_version`.
 ///
@@ -159,6 +159,8 @@ const CURRENT_SCHEMA_VERSION: i32 = 5;
 ///   v1 → v2: Fixed FTS5 content_rowid mismatch — engrams uses TEXT PK, not INTEGER PK (2026-08-11)
 ///   v2 → v3: Added ai-session, ai-tool to source CHECK constraint (2026-08-11)
 ///   v3 → v4: Added content_hash for capture dedupe + app_metrics counters (2026-08-13)
+///   v4 → v5: Added modified_at so edits re-push to sync (2026-08-13)
+///   v5 → v6: Added synced_at for the per-memory push cursor (2026-08-14)
 #[allow(clippy::needless_return)]
 pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     let version: i32 = conn.query_row(
@@ -443,6 +445,40 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         conn.execute_batch("COMMIT")?;
     }
 
+    // v6: synced_at for the per-memory push cursor (sync v5.1).
+    //
+    // Same idempotent "ensure" pattern. Backfill synced_at = modified_at —
+    // rows predating the per-memory cursor are treated as already synced,
+    // preserving the v5 last_push semantics exactly (no bulk re-push on
+    // upgrade). Sync resets this when it first enables on a vault that has
+    // no persisted push state, so a fresh enable still does a full push.
+    {
+        conn.execute_batch("BEGIN")?;
+
+        let has_column = |name: &str| -> rusqlite::Result<bool> {
+            let mut stmt = conn.prepare("PRAGMA table_info('engrams')")?;
+            let exists = stmt
+                .query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .any(|col| col == name);
+            Ok(exists)
+        };
+
+        if !has_column("synced_at")? {
+            conn.execute("ALTER TABLE engrams ADD COLUMN synced_at TEXT", [])?;
+        }
+        conn.execute_batch(
+            "UPDATE engrams SET synced_at = modified_at WHERE synced_at IS NULL;"
+        )?;
+
+        conn.execute(
+            &format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"),
+            [],
+        )?;
+        conn.execute_batch("COMMIT")?;
+    }
+
     Ok(())
 }
 #[cfg(test)]
@@ -585,5 +621,76 @@ mod tests {
             )
             .unwrap();
         assert_eq!(idx_count, 1);
+    }
+
+    /// Pre-v6 vault (user_version 5, modified_at present, no synced_at):
+    /// migrate() must add synced_at, backfill it from modified_at (not
+    /// created_at), bump to user_version 6, and stay idempotent on re-run.
+    #[test]
+    fn create_tables_then_migrate_upgrades_pre_v6_vault() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let conn = Connection::open(&path).unwrap();
+
+        // Simulate a v5 vault: all v5 columns including modified_at, no synced_at.
+        conn.execute_batch(
+            "CREATE TABLE engrams (
+                id TEXT PRIMARY KEY,
+                layer TEXT NOT NULL,
+                source TEXT NOT NULL,
+                privacy_level TEXT NOT NULL DEFAULT 'cloud_first',
+                content TEXT NOT NULL,
+                context TEXT NOT NULL,
+                strength REAL NOT NULL DEFAULT 1.0,
+                valence REAL NOT NULL DEFAULT 0.0,
+                retrievals INTEGER NOT NULL DEFAULT 0,
+                imagined INTEGER NOT NULL DEFAULT 0,
+                grounded INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                last_retrieved TEXT,
+                project TEXT,
+                tags TEXT,
+                scope TEXT NOT NULL DEFAULT 'moment',
+                content_type TEXT NOT NULL DEFAULT 'text',
+                occurred_at TEXT,
+                content_hash TEXT,
+                modified_at TEXT
+            );"
+        ).unwrap();
+        conn.execute_batch("PRAGMA user_version = 5;").unwrap();
+        conn.execute(
+            "INSERT INTO engrams (id, layer, source, content, context, created_at, modified_at) \
+             VALUES ('m1', 'semantic', 'interaction', 'old note', '{}', '2026-08-01T00:00:00Z', '2026-08-10T00:00:00Z')",
+            [],
+        ).unwrap();
+
+        create_tables(&conn).unwrap();
+        migrate(&conn).unwrap();
+
+        let has_col: bool = {
+            let mut stmt = conn.prepare("PRAGMA table_info('engrams')").unwrap();
+            let cols: Vec<String> = stmt.query_map([], |r| r.get::<_, String>(1)).unwrap()
+                .filter_map(|r| r.ok())
+                .collect();
+            cols.iter().any(|c| c == "synced_at")
+        };
+        assert!(has_col, "synced_at column should be added by migration");
+
+        // Backfill: synced_at = modified_at (rows treated as already synced
+        // so the upgrade causes no bulk re-push), NOT created_at.
+        let synced: String = conn
+            .query_row("SELECT synced_at FROM engrams WHERE id = 'm1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(synced, "2026-08-10T00:00:00Z");
+
+        // Schema version bumped to 6
+        let version: i32 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 6);
+
+        // Idempotent
+        create_tables(&conn).unwrap();
+        migrate(&conn).unwrap();
     }
 }

@@ -1315,6 +1315,50 @@ impl EngramStore {
         Ok(engrams)
     }
 
+    /// List engrams that need pushing under the per-memory sync cursor:
+    /// never synced (`synced_at IS NULL`) or edited since their last
+    /// successful push (`modified_at > synced_at`). Oldest-first.
+    ///
+    /// Unlike the old global `last_push` cutoff, a pull can never strand
+    /// these rows — each row's own `synced_at` only advances when that row
+    /// itself is accepted by the sync server.
+    pub async fn list_unsynced(&self, limit: usize) -> Result<Vec<Engram>> {
+        let conn = self.conn.lock().await;
+        let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut stmt = conn.prepare(
+            "SELECT id, layer, source, privacy_level, content, context, strength, valence, retrievals, imagined, grounded, created_at, last_retrieved, project, tags, scope, content_type, occurred_at, modified_at FROM engrams WHERE synced_at IS NULL OR modified_at > synced_at ORDER BY modified_at ASC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit_i64], Self::row_to_engram)?;
+        let mut engrams: Vec<Engram> = rows.collect::<rusqlite::Result<_>>()?;
+        Self::enrich_links_batch(&conn, &mut engrams)?;
+        Ok(engrams)
+    }
+
+    /// Stamp `synced_at` for rows accepted by the sync server. Each row gets
+    /// the `modified_at` of the blob that was actually pushed — never `now()`,
+    /// which could skip an edit that lands mid-push.
+    pub async fn mark_synced(&self, rows: &[(String, String)]) -> Result<()> {
+        let mut conn = self.conn.lock().await;
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare("UPDATE engrams SET synced_at = ?1 WHERE id = ?2")?;
+            for (id, modified_at) in rows {
+                stmt.execute(params![modified_at, id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Clear the per-memory sync cursor — used when sync is enabled on a
+    /// vault that has no persisted push state, so the first cycle pushes
+    /// everything (matching the old epoch-cutoff first push).
+    pub async fn reset_synced(&self) -> Result<()> {
+        let conn = self.conn.lock().await;
+        conn.execute("UPDATE engrams SET synced_at = NULL", [])?;
+        Ok(())
+    }
+
     /// Search engrams by tag(s). Returns engrams that contain ALL of the given
     /// tags, sorted by `created_at DESC` (newest first).
     ///
@@ -2384,6 +2428,43 @@ mod tests {
         let rows = store.list_modified_since(&b_mod.to_rfc3339(), 10).await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, a_id);
+    }
+
+    /// The per-memory push cursor: fresh rows qualify, stamping marks them
+    /// synced, edits re-qualify, and reset clears everything (first sync).
+    #[tokio::test]
+    async fn test_per_memory_sync_cursor() {
+        let (store, _dir) = test_store().await;
+        let a = make_engram("cursor a");
+        let b = make_engram("cursor b");
+        store.write(&a).await.unwrap();
+        store.write(&b).await.unwrap();
+
+        // Fresh rows are unsynced (synced_at NULL on insert).
+        let rows = store.list_unsynced(10).await.unwrap();
+        assert_eq!(rows.len(), 2, "fresh rows must be unsynced");
+
+        // Stamp a as synced with its own modified_at: only b remains.
+        let a_mod = store.get(&a.id).await.unwrap().modified_at.to_rfc3339();
+        store.mark_synced(&[(a.id.clone(), a_mod)]).await.unwrap();
+        let rows = store.list_unsynced(10).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, b.id);
+
+        // Edit a: modified_at > synced_at re-selects it (re-propagation),
+        // and the upsert preserves the stamped synced_at.
+        let mut edited = store.get(&a.id).await.unwrap();
+        edited.content = "cursor a edited".into();
+        edited.modified_at = Utc::now();
+        store.write_curated(&edited).await.unwrap();
+        let rows = store.list_unsynced(10).await.unwrap();
+        assert_eq!(rows.len(), 2, "edited row must re-qualify for push");
+        assert!(rows.iter().any(|r| r.id == a.id));
+
+        // Reset clears the cursor entirely (first-sync full push).
+        store.reset_synced().await.unwrap();
+        let rows = store.list_unsynced(10).await.unwrap();
+        assert_eq!(rows.len(), 2, "reset must re-select every row");
     }
 
     #[tokio::test]

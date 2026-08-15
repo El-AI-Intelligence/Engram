@@ -390,6 +390,16 @@ pub fn spawn_sync_loop(
                 })
             });
 
+        // First-sync reset: with no persisted push state, every row must
+        // qualify for the initial full push. The schema-v6 backfill marks
+        // pre-existing rows as already synced, which is only correct when
+        // sync was already active on this vault.
+        if last_push.is_none() {
+            if let Err(e) = vault.lock().await.reset_synced().await {
+                tracing::warn!("sync: failed to reset per-memory cursor: {e}");
+            }
+        }
+
         let mut last_sync: Option<String> = None;
         // Track (memory_id, vector_clock) pairs we've already processed for
         // dedup across paginated batches. Uses (id, clock) instead of just
@@ -406,10 +416,6 @@ pub fn spawn_sync_loop(
             match client.pull(last_sync.as_deref(), 500).await {
                 Ok(resp) => {
                     let mut latest_seen: Option<String> = None;
-                    // Highest modified_at among blobs imported this pull — the
-                    // push cursor advances past it below so pulled rows are
-                    // never re-selected and re-pushed (echo churn).
-                    let mut max_pulled_modified: Option<String> = None;
 
                     for blob in &resp.blobs {
                         // Track the latest timestamp for pagination cursor advancement
@@ -627,11 +633,18 @@ pub fn spawn_sync_loop(
                                             memory_id.to_string(),
                                             blob.vector_clock,
                                         );
-                                        // Track the imported row's modified_at
-                                        // so the push cursor skips it below.
+                                        // Stamp the per-memory cursor so the
+                                        // imported row is never re-pushed
+                                        // (echo): synced_at now equals its
+                                        // modified_at.
                                         let m = engram.modified_at.to_rfc3339();
-                                        if max_pulled_modified.as_deref().unwrap_or("") < m.as_str() {
-                                            max_pulled_modified = Some(m);
+                                        if let Err(e) = vault
+                                            .mark_synced(&[(memory_id.to_string(), m)])
+                                            .await
+                                        {
+                                            tracing::warn!(
+                                                "sync: failed to stamp synced_at for {memory_id}: {e}"
+                                            );
                                         }
                                         // Teammate activity: broadcast the
                                         // imported memory so the SPA live feed
@@ -690,16 +703,11 @@ pub fn spawn_sync_loop(
                         last_sync = Some(ts);
                     }
 
-                    // Echo-churn fix (pull side): advance the push cursor past
-                    // the modified_at of every row imported this pull. Without
-                    // this, the imported rows re-satisfy `modified_at > cutoff`
-                    // on the next cycle and get re-pushed — the server rejects
-                    // them as stale, but the churn and noise remain.
-                    if let Some(mp) = max_pulled_modified {
-                        if last_push.as_deref().unwrap_or("") < mp.as_str() {
-                            last_push = Some(mp);
-                        }
-                    }
+                    // Echo prevention now lives in the per-memory cursor:
+                    // each imported row gets synced_at = modified_at stamped
+                    // above, so no global cursor advancement is needed here.
+                    // (The old global `last_push` advance could strand older
+                    // un-pushed rows behind a pulled row's modified_at.)
                 }
                 Err(e) => {
                     tracing::warn!("sync pull error: {e}");
@@ -713,8 +721,8 @@ pub fn spawn_sync_loop(
                         let entry = known_clocks.entry(id).or_insert(0);
                         *entry = (*entry).max(clock);
                     }
-                    // Advance last_push so we only push newly-modified memories
-                    // on subsequent cycles. This replaces the 5-minute window.
+                    // last_push now only mirrors the per-memory cursor as a
+                    // status metric (the push selection is per-row synced_at).
                     if let Some(ts) = new_last_push {
                         last_push = Some(ts);
                     }
@@ -766,13 +774,15 @@ pub fn spawn_sync_loop(
 
 /// Push locally-modified memories that haven't been synced yet.
 ///
-/// Uses a persisted `last_push` cursor against `modified_at` to push only
-/// memories modified since the last successful push cycle — including edits
-/// to old memories, which the previous `created_at` + top-200 filter dropped.
-/// On first push (no persisted `last_push`), uses a 24-hour window.
+/// Uses the per-memory sync cursor (`synced_at IS NULL OR modified_at >
+/// synced_at`) to push new captures and edits to old memories — including
+/// rows stranded by the old global `last_push` cursor, which a pull could
+/// silently advance past them. Accepted rows get their `synced_at` stamped
+/// with the blob's own `modified_at`.
 ///
 /// Returns the set of (memory_id, clock) pairs for blobs that were **accepted**
-/// by the server (not rejected), plus the new `last_push` timestamp to persist.
+/// by the server (not rejected), plus the latest `modified_at` in the batch
+/// to persist as the status `last_push` timestamp.
 ///
 /// The vault lock is held only while collecting fresh memories; it is dropped
 /// before the network call so an unreachable sync server doesn't stall the
@@ -782,37 +792,32 @@ async fn push_local_changes(
     vault: &Arc<Mutex<axiom_engram::EngramStore>>,
     last_push: Option<&str>,
 ) -> Result<(std::collections::HashMap<String, u64>, Option<String>), String> {
-    // Use the persisted last_push timestamp as the cutoff, or a broad
-    // window on first push. This replaces the old 5-minute freshness window
-    // which silently dropped memories created while the daemon was down.
-    let cutoff = last_push
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-        .map(|dt| dt.with_timezone(&chrono::Utc))
-        .unwrap_or_else(|| chrono::Utc::now() - chrono::Duration::hours(24));
-
     // Collect fresh memories under the vault lock, then drop it before I/O.
     let mut batch_latest: Option<String> = last_push.map(String::from);
-    let fresh_jsons: Vec<(String, String)> = {
+    let (fresh_jsons, fresh_modifieds): (Vec<(String, String)>, std::collections::HashMap<String, String>) = {
         let vault = vault.lock().await;
-        // modified_at-based cursor: edits to old memories re-propagate even
+        // Per-memory cursor: new rows and edited rows re-propagate even
         // when they fall outside the recency top-N (reads never bump it).
         let fresh: Vec<axiom_engram::Engram> = vault
-            .list_modified_since(&cutoff.to_rfc3339(), 500)
+            .list_unsynced(500)
             .await
-            .map_err(|e| format!("list_modified_since failed: {e}"))?;
+            .map_err(|e| format!("list_unsynced failed: {e}"))?;
 
         if fresh.is_empty() {
             return Ok((std::collections::HashMap::new(), batch_latest));
         }
 
-        // Track the latest modified_at in the batch for advancing last_push
+        // Track the latest modified_at in the batch for the status cursor,
+        // and each row's own modified_at for the per-row stamp after accept.
         let mut jsons = Vec::with_capacity(fresh.len());
+        let mut modifieds = std::collections::HashMap::new();
         for mem in &fresh {
             let created_at = mem.created_at.to_rfc3339();
             let modified_at = mem.modified_at.to_rfc3339();
             if batch_latest.as_deref().unwrap_or("") < modified_at.as_str() {
                 batch_latest = Some(modified_at.clone());
             }
+            modifieds.insert(mem.id.clone(), modified_at.clone());
             // Links and the embedding ride along in the blob so the graph
             // (and vector fallback) round-trip across devices.
             let links = vault.get_links(&mem.id).await.unwrap_or_default();
@@ -857,7 +862,7 @@ async fn push_local_changes(
             });
             jsons.push((mem.id.clone(), json.to_string()));
         }
-        jsons
+        (jsons, modifieds)
         // vault lock dropped here
     };
 
@@ -907,6 +912,21 @@ async fn push_local_changes(
         }
         Err(e) => {
             return Err(format!("push failed: {e}"));
+        }
+    }
+
+    // Stamp the per-memory cursor for accepted rows only — rejected blobs
+    // lost LWW to a newer remote version, which the pull will import (and
+    // stamp) instead. Each row gets the modified_at of the blob that was
+    // actually pushed, so an edit landing mid-push is still re-selected.
+    if !pushed_clocks.is_empty() {
+        let rows: Vec<(String, String)> = pushed_clocks
+            .keys()
+            .filter_map(|id| fresh_modifieds.get(id).map(|m| (id.clone(), m.clone())))
+            .collect();
+        let vault = vault.lock().await;
+        if let Err(e) = vault.mark_synced(&rows).await {
+            tracing::warn!("sync: failed to stamp synced_at after push: {e}");
         }
     }
 
