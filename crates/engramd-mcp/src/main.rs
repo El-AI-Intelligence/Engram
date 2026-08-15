@@ -116,7 +116,7 @@ fn tools_list() -> Value {
             },
             {
                 "name": "engram_capture",
-                "description": "Capture a new memory into your Engram vault. Use this to remember important facts, decisions, bugs, or context for future sessions.",
+                "description": "Capture a new memory into your Engram vault. Use this to remember important facts, decisions, bugs, or context for future sessions. Duplicates and noise are skipped — the result reports whether the memory was actually stored.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -203,11 +203,11 @@ impl McpServer {
         let query = get_str(args, "query")?;
         let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10).min(50);
 
+        // No search_mode — the daemon's default (auto) resolves to hybrid
+        // when an embedder is active, so semantic recall works out of the box.
         let body = json!({
             "query": query,
             "limit": limit,
-            "search_mode": "fts5",
-            "min_strength": 0.0,
         });
 
         let resp = self
@@ -280,6 +280,32 @@ impl McpServer {
             .json::<Value>()
             .await
             .map_err(|e| format!("parse error: {e}"))?;
+
+        // The daemon skips noise and duplicates instead of writing (B1/B2) —
+        // report the real outcome so the assistant never claims a memory was
+        // stored when it wasn't.
+        if resp.get("skipped").and_then(|v| v.as_bool()).unwrap_or(false) {
+            let reason = resp
+                .get("skip_reason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown reason");
+            if let Some(matched) = resp.get("matched_id").and_then(|v| v.as_str()) {
+                // Duplicate: the memory is already in the vault — intent satisfied.
+                return Ok(json!({
+                    "content": [{
+                        "type": "text",
+                        "text": format!("Already in your vault (matches {matched}) — not stored again.")
+                    }]
+                }));
+            }
+            return Ok(json!({
+                "content": [{
+                    "type": "text",
+                    "text": format!("Capture skipped: {reason}. Not stored.")
+                }],
+                "isError": true,
+            }));
+        }
 
         let id = resp.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
 
