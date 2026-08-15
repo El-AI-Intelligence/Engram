@@ -29,7 +29,7 @@ The Obsidian play: sell the cloud layer of a local-first product. The relay alre
 
 | Milestone | Work | Est. |
 |---|---|---|
-| 1.1 Deploy relay | Run `engramd-sync` at `sync.engram.ellmstack.dev` (Caddy, same auth pattern as the live site), wire `sync_server_url` into `engramd`, verify two-device E2E round trip | 1 wk |
+| 1.1 Deploy relay | **Shipped 2026-08-15:** `engramd-sync` live at `sync.ellmstack.dev` (Hetzner, Caddy + LE TLS, systemd + sandbox, nightly snapshots). Verified two-device bidirectional E2E round trip through the public URL; relay DB audit shows only IDs/vector clocks/ciphertext/HMAC — zero plaintext. Runbook: `deploy/sync-relay.md`. | done |
 | 1.2 Accounts + devices | WebAuthn accounts (reuse guardrail's auth), per-account API keys, device registry in the vault UI, quota flags (devices, bytes) | 2–3 wks |
 | 1.3 Billing | Stripe flat plan **Solo $4/mo**; webhook → quota flags (relay was designed for this: "billing is handled by a separate service") | 1 wk |
 | 1.4 Restore points | Server-side snapshot markers; "restore from N days ago" in the vault UI | 1 wk |

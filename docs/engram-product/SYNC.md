@@ -84,6 +84,15 @@ SYNC_API_KEYS="my-secret-key-32chars:100" engramd-sync \
   --bind 0.0.0.0:8788
 ```
 
+#### Managed relay (no self-hosting)
+
+A managed relay runs at **https://sync.ellmstack.dev** — same dumb-pipe
+binary, same zero-knowledge properties (deployed 2026-08-15; operational
+runbook in [`deploy/sync-relay.md`](../../deploy/sync-relay.md)). API keys are
+issued manually for now; self-service keys arrive with accounts (revenue
+roadmap 1.2). Set `server_url` to the URL above and `api_key` to your issued
+key — everything else in this document applies unchanged.
+
 ### 2. Configure your vault
 
 Add sync settings to `~/.engram/vault/config.json`:

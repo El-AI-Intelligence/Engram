@@ -1,0 +1,30 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# sync.ellmstack.dev — Engram Sync Relay (public)
+# (alias: sync.engram.ellmstack.dev — add its DNS record to activate it)
+#
+# Caddy v2 site config. Import from the main Caddyfile with:
+#
+#     import /etc/caddy/sync.Caddyfile
+#
+# Architecture:
+#   engramd client → Caddy :443 (automatic TLS via Let's Encrypt)
+#     → reverse_proxy 127.0.0.1:8788 (engramd-sync)
+#
+# Auth note: NO basic auth here. The relay does its own API-key auth —
+# clients send `Authorization: Bearer <key>` straight from their sync config
+# (crates/engramd/src/sync_client.rs), and Caddy passes the header through
+# untouched. All payloads are E2E-encrypted blobs; the relay is a dumb pipe
+# (see docs/engram-product/SYNC.md).
+# ─────────────────────────────────────────────────────────────────────────────
+
+sync.ellmstack.dev, sync.engram.ellmstack.dev {
+	encode zstd gzip
+
+	reverse_proxy 127.0.0.1:8788
+
+	header {
+		X-Frame-Options "DENY"
+		X-Content-Type-Options "nosniff"
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+	}
+}

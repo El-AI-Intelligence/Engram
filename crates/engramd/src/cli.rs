@@ -17,13 +17,13 @@ pub enum Commands {
     /// Start the engramd daemon (same as running `engramd` directly)
     Daemon {
         /// Path to the vault directory
-        #[arg(short, long, default_value = "./engram-data")]
+        #[arg(short, long, default_value = "./engram-data", env = "ENGRAM_VAULT")]
         vault: PathBuf,
         /// Listen address
-        #[arg(short, long, default_value = "127.0.0.1:8787")]
+        #[arg(short, long, default_value = "127.0.0.1:8787", env = "ENGRAM_BIND")]
         bind: String,
         /// Passphrase for vault encryption
-        #[arg(short, long)]
+        #[arg(short, long, env = "ENGRAM_PASSPHRASE")]
         passphrase: Option<String>,
         /// Path to static UI files to serve
         #[arg(long, env = "ENGRAM_UI_DIR")]

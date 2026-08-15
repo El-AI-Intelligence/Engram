@@ -15,7 +15,7 @@ AI agents forget everything between sessions. Engram fixes that:
 - **AI-native API** — REST + WebSocket + MCP server. Claude Code, Cursor, Windsurf — one command to connect your AI tools.
 - **Memory hygiene** — automatic decay, strengthening, and consolidation. Important memories get stronger; noise fades away.
 - **Weekly digest** — "what your AI learned about you this week": new/reinforced/fading memories, themes clustered from local embeddings. Fully local and free; optional AI-written prose via your own BYO-key endpoint (`engram digest`, or the Digest tab in the vault UI).
-- **Cross-device sync** — E2E encrypted sync (AES-256-GCM + HMAC) with vector-clock conflict resolution. Self-host the relay (`engramd-sync`) or use a managed one.
+- **Cross-device sync** — E2E encrypted sync (AES-256-GCM + HMAC) with vector-clock conflict resolution. Self-host the relay (`engramd-sync`) or use the managed one at `sync.ellmstack.dev`.
 - **Privacy controls** — full audit trail, purge by criteria, retention policies. You control what's stored and for how long.
 
 ## Quick start
