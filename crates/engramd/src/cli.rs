@@ -115,11 +115,14 @@ pub enum Commands {
         #[arg(long, default_value = "0.35")]
         min_similarity: f64,
     },
-    /// Install MCP server config for AI editors (Claude Desktop, Cursor, Continue)
+    /// Install MCP server config for AI editors (Claude Desktop, Cursor, Windsurf)
     Mcp {
         /// "install" or "status"
         #[arg(default_value = "status")]
         command: String,
+        /// Engramd API URL the MCP server should talk to
+        #[arg(long, default_value = "http://127.0.0.1:8787")]
+        url: String,
     },
 }
 
@@ -758,57 +761,294 @@ pub async fn handle_backfill_links(
     Ok(())
 }
 
-pub async fn handle_mcp(command: String) -> Result<()> {
-    match command.as_str() {
-        "install" => {
-            let home = home_dir();
-            let mut configured = Vec::new();
+// ── MCP install ─────────────────────────────────────────────────────────────
 
-            // Claude Desktop
-            let claude_config = home.join("Library/Application Support/Claude/claude_desktop_config.json");
-            if claude_config.exists() {
-                configured.push("Claude Desktop".to_string());
-            }
-            // Check Linux path too
-            let claude_linux = home.join(".config/Claude/claude_desktop_config.json");
-            if claude_linux.exists() {
-                configured.push("Claude Desktop (Linux)".to_string());
-            }
+/// A supported MCP client: where its config lives, and where a fresh config
+/// may be created (the client is installed but has no MCP config yet).
+struct McpClient {
+    label: &'static str,
+    config_path: PathBuf,
+    config_dir: Option<PathBuf>,
+}
 
-            // Cursor
-            let cursor_config = home.join(".cursor/mcp.json");
-            if cursor_config.exists() {
-                configured.push("Cursor".to_string());
-            }
+/// The MCP clients `engram mcp install` knows about, for this platform.
+fn mcp_clients() -> Vec<McpClient> {
+    let home = home_dir();
+    let mut clients = Vec::new();
 
-            // Continue
-            let continue_config = home.join(".continue/config.json");
-            if continue_config.exists() {
-                configured.push("Continue".to_string());
-            }
+    #[cfg(target_os = "macos")]
+    {
+        let dir = home.join("Library/Application Support/Claude");
+        clients.push(McpClient {
+            label: "Claude Desktop",
+            config_path: dir.join("claude_desktop_config.json"),
+            config_dir: Some(dir),
+        });
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let dir = home.join(".config/Claude");
+        clients.push(McpClient {
+            label: "Claude Desktop",
+            config_path: dir.join("claude_desktop_config.json"),
+            config_dir: Some(dir),
+        });
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let dir = std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .map(|p| p.join("Claude"))
+            .unwrap_or_default();
+        clients.push(McpClient {
+            label: "Claude Desktop",
+            config_path: dir.join("claude_desktop_config.json"),
+            config_dir: Some(dir),
+        });
+    }
 
-            if configured.is_empty() {
-                println!("No supported AI editors detected.");
-                println!();
-                println!("Manual MCP config — add to your editor's MCP config file:");
-                println!();
-                println!(r#"{{"engram": {{"command": "engramd-mcp", "args": ["--engramd-url", "http://127.0.0.1:8787"]}}}}"#);
-                println!();
-            } else {
-                println!("Configured MCP for: {}", configured.join(", "));
-                println!("MCP server command: engramd-mcp");
+    let cursor_dir = home.join(".cursor");
+    clients.push(McpClient {
+        label: "Cursor",
+        config_path: cursor_dir.join("mcp.json"),
+        config_dir: Some(cursor_dir),
+    });
+    let windsurf_dir = home.join(".codeium/windsurf");
+    clients.push(McpClient {
+        label: "Windsurf",
+        config_path: windsurf_dir.join("mcp_config.json"),
+        config_dir: Some(windsurf_dir),
+    });
+    clients
+}
+
+/// Insert (or replace) the `engram` entry under `mcpServers` in a client's
+/// MCP config JSON, preserving every other entry and top-level key.
+/// `existing` may be "" for a brand-new config. Pure — no I/O.
+fn merge_mcp_server(existing: &str, engramd_url: &str) -> Result<String, String> {
+    let mut doc: serde_json::Value = if existing.trim().is_empty() {
+        serde_json::json!({})
+    } else {
+        serde_json::from_str(existing).map_err(|e| format!("config is not valid JSON: {e}"))?
+    };
+    if !doc.is_object() {
+        return Err("config root is not a JSON object".into());
+    }
+    let servers = doc
+        .as_object_mut()
+        .expect("checked object above")
+        .entry("mcpServers")
+        .or_insert_with(|| serde_json::json!({}));
+    if !servers.is_object() {
+        return Err("`mcpServers` is not a JSON object".into());
+    }
+    servers["engram"] = serde_json::json!({
+        "command": "engramd-mcp",
+        "args": ["--engramd-url", engramd_url],
+    });
+    serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())
+}
+
+/// The snippet a user pastes into an editor's MCP config manually.
+fn manual_mcp_snippet(url: &str) -> String {
+    serde_json::to_string_pretty(&serde_json::json!({
+        "mcpServers": {
+            "engram": {
+                "command": "engramd-mcp",
+                "args": ["--engramd-url", url],
             }
         }
-        _ => {
+    }))
+    .unwrap_or_default()
+}
+
+/// Is `engramd-mcp` available on PATH?
+fn mcp_binary_on_path() -> bool {
+    let name = if cfg!(windows) { "engramd-mcp.exe" } else { "engramd-mcp" };
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(name).is_file()))
+        .unwrap_or(false)
+}
+
+/// Is the daemon answering /health at `url`? (2s timeout — install-time
+/// probe, not a benchmark.)
+async fn daemon_reachable(url: &str) -> bool {
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+    else {
+        return false;
+    };
+    client
+        .get(format!("{}/health", url.trim_end_matches('/')))
+        .send()
+        .await
+        .map(|r| r.status().is_success())
+        .unwrap_or(false)
+}
+
+/// Does this config file already carry an `engram` MCP entry?
+fn mcp_config_has_engram(path: &PathBuf) -> bool {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|data| serde_json::from_str::<serde_json::Value>(&data).ok())
+        .and_then(|doc| doc.get("mcpServers").and_then(|s| s.get("engram")).cloned())
+        .is_some()
+}
+
+/// `engram mcp install` — write an `engram` entry into the MCP configs of
+/// the supported clients installed on this machine (Claude Desktop, Cursor,
+/// Windsurf), merging with any servers already configured. Clients that
+/// aren't installed get the exact snippet to paste. Also points Claude Code
+/// users at `claude mcp add` (its config is machine-managed, not edited).
+///
+/// `engram mcp status` — report binary, daemon, and per-client state.
+pub async fn handle_mcp(command: String, engramd_url: String) -> Result<()> {
+    match command.as_str() {
+        "install" => {
+            // Preflight: the configs point at a binary and a daemon that
+            // should actually exist, or the editor will just show a dead
+            // server.
+            if !mcp_binary_on_path() {
+                println!("⚠️  `engramd-mcp` is not on your PATH.");
+                println!("   Install it first:");
+                println!("     cargo install --path crates/engramd-mcp   # from the engram repo");
+                println!();
+            }
+            if !daemon_reachable(&engramd_url).await {
+                println!("⚠️  engramd is not reachable at {engramd_url} — MCP tools will fail until it is.");
+                println!("   Start it with: engram daemon");
+                println!();
+            }
+
+            for client in mcp_clients() {
+                if client.config_path.exists() {
+                    // Merge into the existing config — never clobber other
+                    // servers the user has configured.
+                    let existing =
+                        std::fs::read_to_string(&client.config_path).unwrap_or_default();
+                    match merge_mcp_server(&existing, &engramd_url) {
+                        Ok(merged) => {
+                            std::fs::write(&client.config_path, merged)?;
+                            println!(
+                                "✅ {} — updated {}",
+                                client.label,
+                                client.config_path.display()
+                            );
+                        }
+                        Err(e) => println!(
+                            "⚠️  {} — {e}; left the existing config untouched",
+                            client.label
+                        ),
+                    }
+                } else if client.config_dir.as_ref().map(|d| d.exists()).unwrap_or(false) {
+                    // The app is installed but has no MCP config yet — create
+                    // a fresh one rather than making the user hand-write JSON.
+                    let merged = merge_mcp_server("", &engramd_url).map_err(anyhow::Error::msg)?;
+                    std::fs::write(&client.config_path, merged)?;
+                    println!(
+                        "✅ {} — created {}",
+                        client.label,
+                        client.config_path.display()
+                    );
+                } else {
+                    println!(
+                        "ℹ️  {} — not detected; add this to its MCP config file manually:",
+                        client.label
+                    );
+                    println!("{}", manual_mcp_snippet(&engramd_url));
+                    println!();
+                }
+            }
+
+            println!("ℹ️  Claude Code — run:");
+            println!(
+                "     claude mcp add --scope user engram -- engramd-mcp --engramd-url {engramd_url}"
+            );
+            println!();
+            println!("Restart the editor after installing — MCP servers load at startup.");
+            println!("Docs: docs/engram-product/MCP.md");
+            Ok(())
+        }
+        "status" => {
+            let binary = if mcp_binary_on_path() { "on PATH ✅" } else { "NOT on PATH ⚠️" };
+            let daemon = if daemon_reachable(&engramd_url).await {
+                format!("{engramd_url} ✅")
+            } else {
+                format!("{engramd_url} unreachable ⚠️")
+            };
             println!("MCP server status:");
-            println!("  Command:  engramd-mcp --engramd-url http://127.0.0.1:8787");
+            println!("  Command:  engramd-mcp --engramd-url {engramd_url}");
+            println!("  Binary:   {binary}");
+            println!("  Daemon:   {daemon}");
             println!("  Tools:    6 (engram_search, engram_capture, engram_get, engram_context, engram_health, engram_decay)");
             println!("  Transport: stdio");
             println!();
-            println!("To install: engram mcp install");
+            let mut any = false;
+            for client in mcp_clients() {
+                let state = if client.config_path.exists() {
+                    if mcp_config_has_engram(&client.config_path) {
+                        "configured ✅"
+                    } else {
+                        "present but no engram entry"
+                    }
+                } else {
+                    "not detected"
+                };
+                println!("  {:<16} {}", client.label, state);
+                any |= client.config_path.exists();
+            }
+            if !any {
+                println!();
+                println!("No supported editors detected. Run: engram mcp install");
+            }
+            Ok(())
+        }
+        other => {
+            anyhow::bail!("Unknown MCP command: {other}. Usage: engram mcp [install|status] [--url URL]")
         }
     }
-    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_creates_fresh_config() {
+        let merged = merge_mcp_server("", "http://127.0.0.1:8787").unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        assert_eq!(doc["mcpServers"]["engram"]["command"], "engramd-mcp");
+        assert_eq!(doc["mcpServers"]["engram"]["args"][1], "http://127.0.0.1:8787");
+    }
+
+    #[test]
+    fn merge_preserves_other_servers_and_keys() {
+        let existing = r#"{
+            "mcpServers": {"other": {"command": "x", "args": []}},
+            "extra": true
+        }"#;
+        let merged = merge_mcp_server(existing, "http://127.0.0.1:8799").unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        assert_eq!(doc["mcpServers"]["other"]["command"], "x");
+        assert_eq!(doc["extra"], true);
+        assert_eq!(doc["mcpServers"]["engram"]["args"][1], "http://127.0.0.1:8799");
+    }
+
+    #[test]
+    fn merge_replaces_existing_engram_entry() {
+        let existing = r#"{"mcpServers": {"engram": {"command": "engramd-mcp", "args": ["--engramd-url", "http://old:1"]}}}"#;
+        let merged = merge_mcp_server(existing, "http://127.0.0.1:8787").unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        assert_eq!(doc["mcpServers"]["engram"]["args"][1], "http://127.0.0.1:8787");
+    }
+
+    #[test]
+    fn merge_rejects_bad_input() {
+        assert!(merge_mcp_server("{not json", "http://127.0.0.1:8787").is_err());
+        assert!(merge_mcp_server("[1,2,3]", "http://127.0.0.1:8787").is_err());
+        assert!(merge_mcp_server(r#"{"mcpServers": "oops"}"#, "http://127.0.0.1:8787").is_err());
+    }
 }
 
 // ── Demo data ──────────────────────────────────────────────────────────────
