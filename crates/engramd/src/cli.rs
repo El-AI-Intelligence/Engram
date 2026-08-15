@@ -30,6 +30,24 @@ pub enum Commands {
     },
     /// Interactive setup wizard — configure your vault
     Init,
+    /// Join an existing team vault — fresh vault + sync preset
+    Join {
+        /// Vault directory (defaults to ~/.engram/vault)
+        #[arg(long)]
+        vault: Option<PathBuf>,
+        /// Sync server URL
+        #[arg(long, default_value = "http://127.0.0.1:8788")]
+        server_url: String,
+        /// Sync server API key (omit for loopback servers)
+        #[arg(long)]
+        api_key: Option<String>,
+        /// Shared vault ID (derived from the passphrase when omitted)
+        #[arg(long)]
+        vault_id: Option<String>,
+        /// Team display name (optional)
+        #[arg(long)]
+        name: Option<String>,
+    },
     /// Capture a memory into the vault
     Capture {
         /// The memory content to store
@@ -261,6 +279,126 @@ pub async fn handle_init() -> Result<()> {
     println!("    engram daemon          Start the vault server");
     println!("    engram capture \"...\"   Capture your first memory");
     println!("    engram demo            See the demo");
+    println!();
+
+    Ok(())
+}
+
+/// Join a team vault: fresh vault + passphrase + sync preset written to the
+/// vault-local config.json. The passphrase MUST match the team's — sync keys
+/// derive from it alone, and the server verifies every blob's HMAC against
+/// them. A wrong passphrase means the server rejects (or the vault silently
+/// splits) — there is no account recovery, by design.
+pub async fn handle_join(
+    vault_opt: Option<PathBuf>,
+    server_url: String,
+    api_key: Option<String>,
+    vault_id: Option<String>,
+    name: Option<String>,
+) -> Result<()> {
+    println!();
+    println!("  ╔══════════════════════════════════════════╗");
+    println!("  ║     Engram — Join a Team Vault           ║");
+    println!("  ║     One passphrase. One vault.           ║");
+    println!("  ╚══════════════════════════════════════════╝");
+    println!();
+
+    let default_path = home_dir().join(".engram").join("vault");
+    let vault_path = vault_opt.unwrap_or(default_path);
+
+    // Never touch a vault that already has memories — join is for fresh
+    // vaults; existing vaults configure sync via the Settings panel.
+    if vault_path.join("engrams.db").exists() {
+        anyhow::bail!(
+            "{} already contains a vault (engrams.db exists).\n\
+             `engram join` is for fresh vaults. To sync an existing vault, configure\n\
+             the sync block in its config.json or use Settings → Sync & Team in the UI.",
+            vault_path.display()
+        );
+    }
+
+    // Passphrase — required (machine-keyed vaults cannot sync).
+    println!("Team passphrase (the SAME one your teammates use; leave blank to abort):");
+    print!("> ");
+    let mut passphrase = String::new();
+    std::io::stdin().read_line(&mut passphrase)?;
+    let passphrase = passphrase.trim().to_string();
+    if passphrase.is_empty() {
+        println!();
+        println!("  ⚠️  Join aborted — sync requires a passphrase.");
+        println!();
+        return Ok(());
+    }
+    println!("Confirm passphrase:");
+    print!("> ");
+    let mut confirm = String::new();
+    std::io::stdin().read_line(&mut confirm)?;
+    if passphrase != confirm.trim() {
+        println!();
+        println!("  ❌ Passphrases do not match. Please run `engram join` again.");
+        println!();
+        return Ok(());
+    }
+    if passphrase.len() < 8 {
+        println!();
+        println!("  ⚠️  Passphrase is short (< 8 characters). Consider a longer one —");
+        println!("     the whole team's vault security rests on it.");
+        println!();
+    }
+
+    // Create the vault (writes device.json with a fresh device_id)
+    std::fs::create_dir_all(&vault_path)?;
+    let _store = EngramStore::open_with_passphrase(&vault_path, &passphrase).await?;
+
+    // Sync preset in the vault-local config.json (what the daemon reads).
+    // vault_id is omitted when not given — the daemon derives it from the
+    // passphrase and pins it on first sync.
+    let mut sync = serde_json::json!({
+        "enabled": true,
+        "server_url": server_url,
+        "api_key": api_key,
+        "interval_secs": 60,
+    });
+    if let Some(ref id) = vault_id {
+        sync["vault_id"] = serde_json::Value::String(id.clone());
+    }
+    if let Some(ref n) = name {
+        sync["name"] = serde_json::Value::String(n.clone());
+    }
+    let config = serde_json::json!({ "sync": sync });
+    let cfg_path = vault_path.join("config.json");
+    std::fs::write(&cfg_path, serde_json::to_string_pretty(&config)?)?;
+
+    // Global CLI config (vault_path pointer) — only if one isn't already set
+    // for another vault; it is never required for the daemon.
+    let global_cfg = config_file_path();
+    if !global_cfg.exists() {
+        std::fs::create_dir_all(config_dir())?;
+        let global = serde_json::json!({
+            "vault_path": vault_path.to_string_lossy(),
+            "has_passphrase": true,
+            "created_at": chrono::Utc::now().to_rfc3339(),
+            "default_url": "http://localhost:8787",
+        });
+        std::fs::write(&global_cfg, serde_json::to_string_pretty(&global)?)?;
+        println!("  ✅ Global config saved to {}", global_cfg.display());
+    }
+
+    println!();
+    println!("  ✅ Vault created at {}", vault_path.display());
+    println!("  ✅ Sync preset written to {}", cfg_path.display());
+    if vault_id.is_none() {
+        println!("     (vault_id unset — derived from the passphrase on first sync)");
+    }
+    if api_key.is_some() {
+        println!("     (api_key stored — it is masked in all status output)");
+    }
+    println!();
+    println!("  Next steps:");
+    println!("    engramd --vault {} --passphrase \"<team passphrase>\"", vault_path.display());
+    println!("    curl -X POST http://localhost:8787/sync/now   # force the first sync");
+    println!();
+    println!("  Teammates' memories appear within one sync interval.");
     println!();
 
     Ok(())

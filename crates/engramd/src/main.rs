@@ -97,6 +97,9 @@ async fn dispatch_cli(cmd: cli::Commands) -> anyhow::Result<()> {
         cli::Commands::Init => {
             cli::handle_init().await
         }
+        cli::Commands::Join { vault, server_url, api_key, vault_id, name } => {
+            cli::handle_join(vault, server_url, api_key, vault_id, name).await
+        }
         cli::Commands::Capture { content, tags, layer, source, valence, project, vault } => {
             cli::handle_capture(content, tags, layer, source, valence, project, vault).await
         }

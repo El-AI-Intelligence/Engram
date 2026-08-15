@@ -203,10 +203,28 @@ and blob counts, never names or content.
 }
 ```
 
-**Teammate** — fresh vault, same passphrase, same `vault_id`:
+**Teammate** — join with `engram join`:
 
 ```bash
-# 1. Init a fresh vault with the SAME passphrase (each device gets its own device_id)
+# 1. Fresh vault + passphrase + sync preset in one step.
+#    Omit --vault-id to derive it from the passphrase (same id ⇒ same vault).
+engram join --server-url https://sync.example.com
+
+# 2. Start the daemon with the shared passphrase
+engramd --vault ~/.engram/vault --passphrase "<same passphrase>"
+
+# 3. Force the first sync (or wait interval_secs)
+curl -X POST http://localhost:8787/sync/now
+```
+
+`engram join` refuses to touch a vault that already has memories — it is
+for fresh vaults only (each device gets its own `device_id` on first
+daemon start). To sync an existing vault, configure the sync block via
+Settings → Sync & Team (or edit its `config.json`) instead. Without the
+CLI, the same flow works manually:
+
+```bash
+# 1. Init a fresh vault with the SAME passphrase
 engram init --vault ~/.engram/vault
 
 # 2. Point sync at the shared vault

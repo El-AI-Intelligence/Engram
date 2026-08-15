@@ -52,7 +52,10 @@ impl TestServer {
 
     fn wait_ready(&self) {
         let client = reqwest::blocking::Client::new();
-        for _ in 0..50 {
+        // Generous cap: under a parallel workspace run (several test binaries
+        // plus daemons on the same machine), a cold engramd can take well
+        // over 5s to open the SQLCipher vault and bind.
+        for _ in 0..200 {
             if let Ok(resp) = client.get(&format!("{}/health", self.base_url)).send() {
                 if resp.status().is_success() {
                     return;
@@ -60,7 +63,7 @@ impl TestServer {
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        panic!("engramd did not start within 5 seconds");
+        panic!("engramd did not start within 20 seconds");
     }
 
     fn url(&self, path: &str) -> String {
