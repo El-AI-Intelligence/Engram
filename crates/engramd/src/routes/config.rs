@@ -28,6 +28,8 @@ struct PersistedConfig {
     qem: QemConfigSection,
     #[serde(default)]
     noise: NoiseConfig,
+    #[serde(default)]
+    digest: DigestConfig,
 }
 
 impl Default for PersistedConfig {
@@ -40,6 +42,7 @@ impl Default for PersistedConfig {
             summarization: SummarizationConfig::default(),
             qem: QemConfigSection::default(),
             noise: NoiseConfig::default(),
+            digest: DigestConfig::default(),
         }
     }
 }
@@ -239,6 +242,67 @@ struct SyncPatch {
     name: Option<String>,
 }
 
+/// Weekly digest settings. The digest core (stats + themes) is deterministic
+/// and local — zero cost, works forever offline. The optional `llm` block
+/// upgrades prose via a BYO-key OpenAI-compatible endpoint (a local Ollama
+/// qualifies: base_url "http://localhost:11434/v1"). Prose is generated only
+/// on the explicit `?prose=1` request flag — BYO-key calls bill the user's
+/// own key, so they are never automatic.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DigestConfig {
+    #[serde(default = "default_true")]
+    enabled: bool,
+    #[serde(default)]
+    llm: Option<DigestLlmConfig>,
+}
+
+impl Default for DigestConfig {
+    fn default() -> Self {
+        Self { enabled: true, llm: None }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DigestLlmConfig {
+    /// OpenAI-compatible base URL ending in /v1, e.g. "http://localhost:11434/v1"
+    #[serde(default)]
+    base_url: String,
+    /// Provider API key. Masked in /config responses; never persisted when the
+    /// masked value round-trips.
+    #[serde(default)]
+    api_key: Option<String>,
+    /// Model name, e.g. "gpt-4o-mini" or "llama3.1"
+    #[serde(default)]
+    model: String,
+}
+
+impl Default for DigestLlmConfig {
+    fn default() -> Self {
+        Self { base_url: String::new(), api_key: None, model: String::new() }
+    }
+}
+
+/// Digest patch — fields merge field-wise like `SyncPatch`. `llm` is a nested
+/// option: absent = untouched, `null` = clear the whole block, object =
+/// field-wise merge into it.
+#[derive(Debug, Deserialize)]
+struct DigestPatch {
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    llm: Option<Option<DigestLlmPatch>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DigestLlmPatch {
+    #[serde(default)]
+    base_url: Option<String>,
+    #[serde(default)]
+    api_key: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct PatchConfigBody {
     context: Option<ContextConfig>,
@@ -248,6 +312,7 @@ struct PatchConfigBody {
     summarization: Option<SummarizationConfig>,
     qem: Option<QemConfigSection>,
     noise: Option<NoiseConfig>,
+    digest: Option<DigestPatch>,
 }
 
 fn config_path(vault_path: &std::path::Path) -> std::path::PathBuf {
@@ -284,6 +349,7 @@ struct ConfigResponse {
     summarization: SummarizationConfig,
     qem: QemConfigSection,
     noise: NoiseConfig,
+    digest: DigestConfig,
 }
 
 impl From<PersistedConfig> for ConfigResponse {
@@ -299,7 +365,17 @@ impl From<PersistedConfig> for ConfigResponse {
             summarization: c.summarization,
             qem: c.qem,
             noise: c.noise,
+            digest: c.digest,
         }
+    }
+}
+
+/// Mask every secret in a config response — sync api_key and digest llm
+/// api_key are never returned in plaintext.
+fn mask_secrets(resp: &mut ConfigResponse) {
+    resp.sync.api_key = resp.sync.api_key.take().map(|_| "••••••••".into());
+    if let Some(ref mut llm) = resp.digest.llm {
+        llm.api_key = llm.api_key.take().map(|_| "••••••••".into());
     }
 }
 
@@ -311,8 +387,7 @@ async fn get_config(
         errors::internal(errors::code::INTERNAL, "Failed to load configuration")
     })?;
     let mut resp: ConfigResponse = config.into();
-    // Mask API key — never return it in plaintext
-    resp.sync.api_key = resp.sync.api_key.map(|_| "••••••••".into());
+    mask_secrets(&mut resp);
     resp.vault_path = state.vault_path.to_string_lossy().to_string();
     Ok(Json(resp))
 }
@@ -368,14 +443,39 @@ async fn patch_config(
     if let Some(noise) = body.noise {
         config.noise = noise;
     }
+    if let Some(digest) = body.digest {
+        // Field-wise merge like sync: a partial PATCH must not erase the
+        // other digest fields. `llm: null` explicitly clears the block.
+        if let Some(v) = digest.enabled {
+            config.digest.enabled = v;
+        }
+        match digest.llm {
+            None => {}
+            Some(None) => config.digest.llm = None,
+            Some(Some(llm)) => {
+                let slot = config.digest.llm.get_or_insert_with(DigestLlmConfig::default);
+                // Never persist the masked API key from a GET round-trip.
+                if llm.api_key.as_deref() != Some("••••••••") {
+                    if let Some(k) = llm.api_key {
+                        slot.api_key = Some(k);
+                    }
+                }
+                if let Some(v) = llm.base_url {
+                    slot.base_url = v;
+                }
+                if let Some(v) = llm.model {
+                    slot.model = v;
+                }
+            }
+        }
+    }
     save_config(&state.vault_path, &config)
         .map_err(|e| {
             tracing::error!(error = %e, "Failed to save config");
             errors::internal(errors::code::INTERNAL, "Failed to save configuration to disk")
         })?;
-    // Mask API key in response
     let mut resp: ConfigResponse = config.into();
-    resp.sync.api_key = resp.sync.api_key.map(|_| "••••••••".into());
+    mask_secrets(&mut resp);
     resp.vault_path = state.vault_path.to_string_lossy().to_string();
     Ok(Json(resp))
 }

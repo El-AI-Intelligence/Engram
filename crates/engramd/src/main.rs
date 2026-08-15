@@ -578,6 +578,7 @@ async fn run_daemon(
         .merge(routes::privacy::router())
         .merge(routes::sync_status::router())
         .merge(routes::teams::router())
+        .merge(routes::digest::router())
         .with_state(state)
         // CORS must be outermost so OPTIONS preflight is handled before auth
         .layer(axum::middleware::from_fn_with_state(
