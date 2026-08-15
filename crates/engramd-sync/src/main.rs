@@ -197,6 +197,29 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    // ── Background WAL checkpoint (every 5 min) ───────────────────────
+    // In WAL mode all writes land in sync.db-wal first; without a
+    // checkpoint the main db file stays a stale shell and the WAL grows
+    // unbounded. TRUNCATE folds the WAL into the main db each pass, so a
+    // hard crash loses at most ~5 minutes of blobs (WAL replay still
+    // covers everything since the last checkpoint).
+    let checkpoint_state = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(300));
+        loop {
+            interval.tick().await;
+            let conn = checkpoint_state.conn.lock().await;
+            match wal_checkpoint(&conn) {
+                Ok(0) => {}
+                Ok(_) => tracing::warn!("WAL checkpoint busy — truncating next pass"),
+                Err(e) => tracing::warn!("WAL checkpoint error: {e}"),
+            }
+        }
+    });
+
+    // Keep a handle for the shutdown checkpoint (the router owns `state`).
+    let shutdown_state = state.clone();
+
     // ── Build router ───────────────────────────────────────────────────
     let app = axum::Router::new()
         .merge(routes::router())
@@ -216,9 +239,39 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Engram Sync Server starting on {}", cli.bind);
     let listener = tokio::net::TcpListener::bind(cli.bind).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+
+    // ── Final WAL checkpoint on shutdown ───────────────────────────────
+    let conn = shutdown_state.conn.lock().await;
+    match wal_checkpoint(&conn) {
+        Ok(0) => tracing::info!("Final WAL checkpoint complete"),
+        Ok(_) => tracing::warn!("Final WAL checkpoint busy (readers active)"),
+        Err(e) => tracing::warn!("Final WAL checkpoint error: {e}"),
+    }
+    tracing::info!("Engram Sync Server shut down cleanly");
 
     Ok(())
+}
+
+/// Checkpoint the WAL into the main database and truncate it.
+/// Returns the PRAGMA busy column: 0 = complete, 1 = busy (checkpointed
+/// as far as possible but not truncated).
+fn wal_checkpoint(conn: &rusqlite::Connection) -> rusqlite::Result<i64> {
+    conn.query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |r| r.get(0))
+}
+
+/// Resolves once SIGINT (Ctrl+C) or SIGTERM is received, so the server
+/// can checkpoint and exit cleanly.
+async fn shutdown_signal() {
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("install SIGTERM handler");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {},
+        _ = sigterm.recv() => {},
+    }
+    tracing::info!("Shutdown signal received — draining connections");
 }
 
 /// Load API keys from the SYNC_API_KEYS environment variable.
