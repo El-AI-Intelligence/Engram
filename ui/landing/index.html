@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="dark light">
 <meta name="theme-color" content="#0b0f14">
-<meta name="description" content="Engram — a local-first memory vault, built for AI agents today. What to keep, what to strengthen, and what to forget is a problem far older than AI.">
+<meta name="description" content="Engram — a local-first, end-to-end encrypted memory vault. Your AI remembers across sessions, and your memory follows you across Claude, Cursor, and Windsurf.">
 <title>Engram — Memory for AI</title>
 <style>
   /* ── Tokens: family structure, Engram palette ──────────────────── */
@@ -229,6 +229,7 @@
   </div>
   <div class="nav-links">
     <a href="#how" class="hide-sm">How it works</a>
+    <a href="#everywhere" class="hide-sm">Everywhere</a>
     <a href="#science" class="hide-sm">Science</a>
     <a href="#compare" class="hide-sm">Compare</a>
     <a href="https://github.com/El-AI-Intelligence/engram" target="_blank" rel="noopener">GitHub</a>
@@ -254,20 +255,17 @@
 
     <h1>Your AI deserves <span>a memory</span>.</h1>
     <p>
-      Engram is a local-first memory vault, built for AI agents today.
-      But the problem it solves — what to keep, what to strengthen, and
-      what to forget — is far older than AI.
-      Capture once, recall forever — with Ebbinghaus decay and
-      holographic caching.
+      A local-first, end-to-end encrypted memory vault. Your AI captures what
+      matters, recalls it across sessions, and forgets the noise — and your
+      memory follows you across Claude, Cursor, and Windsurf.
     </p>
     <div class="hero-buttons">
-      <a href="https://github.com/El-AI-Intelligence/engram#readme" class="btn btn-primary btn-lg" target="_blank" rel="noopener">
-        ⬇ Install
-      </a>
+      <a href="#install" class="btn btn-primary btn-lg">⬇ Install in one command</a>
       <a href="/app" class="btn btn-outline btn-lg">Open Vault →</a>
     </div>
-    <div class="hero-code">
-      <span class="prompt">$</span> curl -fsSL https://engram.ellmstack.dev/install.sh | bash
+    <div class="hero-code" id="install">
+      <div><span class="prompt">$</span> curl -fsSL https://engram.ellmstack.dev/install.sh | bash</div>
+      <div><span class="prompt">$</span> engram onboarding&nbsp; <span style="color:var(--muted)"># vault + first memory in ~5 minutes</span></div>
     </div>
   </div>
 </section>
@@ -303,27 +301,65 @@
         <div class="step-num">1</div>
         <h3>Install</h3>
         <p>
-          One command: <code>cargo install engramd</code>.
-          Or use <code>brew install engramd</code>, <code>pip install engramd</code>,
-          or <code>npm install engramd</code>. Starts in seconds.
+          One command: <code>curl -fsSL https://engram.ellmstack.dev/install.sh | bash</code>,
+          then <code>engram onboarding</code> — encrypted vault, first memory, and
+          a running daemon in about five minutes.
         </p>
       </div>
       <div class="step">
         <div class="step-num">2</div>
-        <h3>Capture</h3>
+        <h3>Connect</h3>
         <p>
-          Your AI agent captures facts, decisions, and observations as discrete
-          memories. MCP auto-capture does it passively — memory "just happens."
+          <code>engram mcp install</code> wires Claude Desktop, Cursor, Windsurf, and
+          Claude Code to your vault in one command. Capture, search, and context
+          become tools your AI just has.
         </p>
       </div>
       <div class="step">
         <div class="step-num">3</div>
-        <h3>Retrieve</h3>
+        <h3>Recall</h3>
         <p>
           Engram assembles relevant context for every query, reducing your LLM's
           token consumption by 40-70%. Forgetting is efficient — and green.
         </p>
       </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── One memory everywhere ────────────────────────────────────────── -->
+<section id="everywhere">
+  <div class="container">
+    <div class="section-label">MCP everywhere</div>
+    <div class="section-title">One memory. Every AI you use.</div>
+    <div class="section-sub">
+      <code>engram mcp install</code> writes a merge-safe <code>engram</code> entry
+      into every supported editor's MCP config — preserving whatever servers you
+      already have — and prints a ready snippet for anything it can't detect.
+      Capture once in Claude Desktop, recall it in Cursor.
+    </div>
+
+    <div class="steps">
+      <div class="step">
+        <h3>Claude Desktop</h3>
+        <p>Config merged into <code>claude_desktop_config.json</code> — no hand-editing, nothing overwritten.</p>
+      </div>
+      <div class="step">
+        <h3>Claude Code</h3>
+        <p>One command: <code>claude mcp add --scope user engram -- engramd-mcp --engramd-url http://127.0.0.1:8787</code></p>
+      </div>
+      <div class="step">
+        <h3>Cursor &amp; Windsurf</h3>
+        <p>Wired via <code>~/.cursor/mcp.json</code> and <code>~/.codeium/windsurf/mcp_config.json</code> — same one command.</p>
+      </div>
+    </div>
+
+    <div class="calc" style="margin-top:28px;">
+      <p style="text-align:center;">
+        <strong>Personal — $5/month, flat.</strong> Cloud sync included.
+        No seats, no metering, ever.
+        <span style="color:var(--muted);">Coming soon. Self-hosting stays free, MIT, forever.</span>
+      </p>
     </div>
   </div>
 </section>
@@ -417,7 +453,7 @@
     <div class="section-title">Why Engram?</div>
     <div class="section-sub">
       Most memory solutions are vector databases with a search bar.
-      Engram is a memory system — with forgetting, consolidation, and MCP auto-capture.
+      Engram is a memory system — with forgetting, consolidation, E2E sync, and MCP auto-capture.
     </div>
 
     <div style="overflow-x:auto;">
@@ -469,7 +505,7 @@
         </tr>
         <tr>
           <td>E2E encrypted sync</td>
-          <td class="cross">🔜 Roadmap</td>
+          <td class="check">✓ Shipped</td>
           <td class="cross">✗</td>
           <td class="cross">✗</td>
           <td class="cross">✗</td>
@@ -508,7 +544,7 @@
       Built with Rust. Runs on your machine. Your memories, your key.
     </p>
     <p style="color:var(--muted);">
-      Zero telemetry. No cloud required. When sync ships, the relay never sees plaintext.
+      Zero telemetry. No cloud required. Even with sync, the relay never sees plaintext.
     </p>
     <div style="margin-top:22px;display:flex;gap:12px;justify-content:center;flex-wrap:wrap;">
       <a href="https://github.com/El-AI-Intelligence/engram" class="btn btn-outline" target="_blank" rel="noopener">GitHub</a>

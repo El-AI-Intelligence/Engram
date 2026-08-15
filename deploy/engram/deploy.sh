@@ -3,6 +3,7 @@
 # deploy.sh — install Engram Memory Vault artifacts on this host.
 #
 #   - Syncs the static landing page and vault UI into /srv/engram/
+#   - Publishes scripts/install.sh and release binaries (verified downloads)
 #   - Installs the Caddy site config (imported from the main Caddyfile)
 #   - Installs the engramd systemd unit (ONLY if none exists — an existing
 #     unit is host-specific and is never overwritten)
@@ -64,6 +65,26 @@ install -d -m 0755 /srv/engram /srv/engram/landing /srv/engram/vault
 rsync -a --delete "$REPO_ROOT/ui/landing/" /srv/engram/landing/
 rsync -a --delete "$REPO_ROOT/ui/engram-vault/" /srv/engram/vault/
 echo "Synced landing page and vault UI to /srv/engram/"
+
+# Staged AFTER rsync --delete: these artifacts live outside ui/landing in the
+# repo, so rsync would wipe them on every deploy if they weren't re-staged.
+# ── One-command installer + public release binaries ──────────────────────────
+
+install -m 0644 "$REPO_ROOT/scripts/install.sh" /srv/engram/landing/install.sh
+echo "Published install.sh (https://engram.ellmstack.dev/install.sh)"
+
+if [[ -f "$REPO_ROOT/target/release/engramd" && -f "$REPO_ROOT/target/release/engramd-mcp" ]]; then
+  install -d -m 0755 /srv/engram/landing/releases
+  install -m 0755 "$REPO_ROOT/target/release/engramd" /srv/engram/landing/releases/engramd-linux-x86_64
+  install -m 0755 "$REPO_ROOT/target/release/engramd-mcp" /srv/engram/landing/releases/engramd-mcp-linux-x86_64
+  ( cd /srv/engram/landing/releases \
+    && sha256sum engramd-linux-x86_64 > engramd-linux-x86_64.sha256 \
+    && sha256sum engramd-mcp-linux-x86_64 > engramd-mcp-linux-x86_64.sha256 )
+  echo "Published release binaries + SHA-256 checksums (the installer verifies them)."
+else
+  echo "NOTE: release binaries not found (run: cargo build --release -p engramd -p engramd-mcp)."
+  echo "      install.sh is live but downloads will 404 until releases are staged."
+fi
 
 # ── Caddy site config ────────────────────────────────────────────────────────
 
