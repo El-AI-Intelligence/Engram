@@ -2,7 +2,7 @@
 //!
 //! Design principles:
 //!   - Server NEVER sees plaintext — all encryption happens client-side
-//!   - Stateless: no sessions, no user accounts beyond API key
+//!   - Accounts are pseudonymous: passkey-only, no email/name/PII
 //!   - Single responsibility: accept blobs, serve blobs, verify HMAC
 //!   - Billing is handled by a separate service (Stripe webhooks)
 //!
@@ -13,13 +13,20 @@
 //!   GET    /v1/vaults/{vault_id}/stats                   — vault statistics
 //!   GET    /v1/vaults/{vault_id}/devices                 — device roster
 //!   DELETE /v1/vaults/{vault_id}/devices/{device_id}     — revoke a device
+//!   POST   /auth/register/start|finish                   — create account (passkey)
+//!   POST   /auth/login/start|finish                      — sign in (passkey)
+//!   POST   /auth/logout                                  — end session
+//!   GET    /account, POST/DELETE /account/keys           — account + API keys
 //!
-//! Auth:
-//!   Set SYNC_API_KEYS in env. Clients send
-//!   Authorization: Bearer <key>. Auth is optional on loopback,
-//!   required on non-loopback (matches Guardrail's default-secure pattern).
+//! Auth (two tiers):
+//!   1. Static keys from SYNC_API_KEYS env — the original operator keys.
+//!   2. Account keys minted via /account/keys (stored as sha256 hashes).
+//!   Clients send Authorization: Bearer <key>. Auth is optional on
+//!   loopback only while no account keys exist; once the first account
+//!   key is minted, keyless loopback requests are rejected like any
+//!   other (matches Guardrail's default-secure pattern).
 //!
-//!   Key format (comma-separated entries):
+//!   Static key format (comma-separated entries):
 //!     key                        — all vaults, rate limit 100 req/s
 //!     key:rate                   — all vaults, custom rate limit
 //!     key:rate:vault1;vault2     — scoped to the listed vaults only
@@ -30,8 +37,11 @@
 //!   on that vault — the substrate a hosted control plane mints
 //!   per-member keys against.
 
+mod account_routes;
+mod auth;
 mod routes;
 
+use crate::auth::{build_webauthn, WebauthnStore, Webauthn};
 use clap::Parser;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -63,6 +73,27 @@ struct Cli {
     /// Listen address
     #[arg(short, long, default_value = "0.0.0.0:8788")]
     bind: SocketAddr,
+
+    /// WebAuthn Relying Party ID — a registrable domain suffix of the
+    /// vault UI origin. Passkeys bind to it: changing it orphans them.
+    #[arg(long, default_value = "localhost")]
+    rp_id: String,
+
+    /// Allowed browser origins for WebAuthn ceremonies, comma-separated.
+    /// The vault SPA sends window.location.origin; each finish validates
+    /// against this list.
+    #[arg(long, default_value = "http://localhost:8787")]
+    origin: String,
+
+    /// Default per-account device quota (0 = unlimited). Per-account
+    /// overrides live in the accounts table (roadmap 1.3 billing sets
+    /// them).
+    #[arg(long, default_value_t = 0)]
+    quota_devices: i64,
+
+    /// Default per-account stored-bytes quota (0 = unlimited).
+    #[arg(long, default_value_t = 0)]
+    quota_bytes: i64,
 }
 
 /// Per-key rate limiter: simple token bucket with 1-second refill.
@@ -116,6 +147,18 @@ pub struct SyncState {
     pub rate_limiters: Arc<Mutex<HashMap<String, RateLimiter>>>,
     /// Whether the server is bound to loopback (affects auth strictness).
     pub is_loopback: bool,
+    /// WebAuthn Relying Party ID (see `Cli::rp_id`).
+    pub rp_id: String,
+    /// Allowed WebAuthn browser origins (see `Cli::origin`).
+    pub allowed_origins: Arc<HashSet<String>>,
+    /// Default per-account device quota (0 = unlimited).
+    pub default_quota_devices: i64,
+    /// Default per-account stored-bytes quota (0 = unlimited).
+    pub default_quota_bytes: i64,
+    /// WebAuthn instance for passkey ceremonies.
+    pub webauthn: Arc<Webauthn>,
+    /// In-flight ceremony state (registrations + authentications).
+    pub auth_store: Arc<WebauthnStore>,
 }
 
 #[tokio::main]
@@ -150,6 +193,31 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("Loaded {} API key(s)", api_keys.len());
     }
 
+    // ── WebAuthn (accounts) ────────────────────────────────────────────
+    let allowed_origins: HashSet<String> = cli
+        .origin
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let primary_origin = allowed_origins.iter().next().cloned().unwrap_or_else(|| {
+        tracing::error!("--origin list is empty after parsing {:?}", cli.origin);
+        std::process::exit(1);
+    });
+    let webauthn = match build_webauthn(&cli.rp_id, &primary_origin) {
+        Ok(w) => Arc::new(w),
+        Err(e) => {
+            tracing::error!("{e:#}");
+            std::process::exit(1);
+        }
+    };
+    let auth_store = Arc::new(WebauthnStore::new());
+    tracing::info!(
+        "WebAuthn accounts enabled: rp_id={:?}, origins={:?}",
+        cli.rp_id,
+        allowed_origins
+    );
+
     // ── Database ───────────────────────────────────────────────────────
     std::fs::create_dir_all(&cli.data_dir)?;
     let db_path = cli.data_dir.join("sync.db");
@@ -176,6 +244,57 @@ async fn main() -> anyhow::Result<()> {
             vault_id   TEXT NOT NULL,
             device_id  TEXT NOT NULL,
             revoked_at TEXT NOT NULL,
+            PRIMARY KEY (vault_id, device_id)
+        );
+        -- Accounts (roadmap 1.2): standalone passkeys, no email/name/PII.
+        -- quota_* NULL = server default (--quota-devices / --quota-bytes).
+        CREATE TABLE IF NOT EXISTS accounts (
+            id            TEXT PRIMARY KEY,
+            created_at    TEXT NOT NULL,
+            last_login_at TEXT,
+            quota_devices INTEGER,
+            quota_bytes   INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS passkeys (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id    TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+            credential_id BLOB NOT NULL UNIQUE,
+            public_key    BLOB NOT NULL,
+            created_at    TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_passkeys_account ON passkeys(account_id);
+        -- Sessions: token_hash is sha256 of the Bearer token; the plaintext
+        -- token exists only in the browser's localStorage.
+        CREATE TABLE IF NOT EXISTS sessions (
+            token_hash BLOB PRIMARY KEY,
+            account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_sessions_account ON sessions(account_id);
+        -- Account API keys: key_hash is sha256 of the full key (shown once
+        -- at creation). vault_id NULL = key reaches every vault the account
+        -- has synced; a value scopes the key to that vault.
+        CREATE TABLE IF NOT EXISTS api_keys (
+            id         TEXT PRIMARY KEY,
+            account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+            key_hash   BLOB NOT NULL UNIQUE,
+            key_prefix TEXT NOT NULL,
+            rate       REAL NOT NULL DEFAULT 100,
+            vault_id   TEXT,
+            created_at TEXT NOT NULL,
+            revoked    INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_api_keys_account ON api_keys(account_id);
+        CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys(key_hash);
+        -- Human-readable device labels for the roster. Daemons register
+        -- their device.json label at sync start; the label lives here (the
+        -- encrypted blob envelope is deliberately untouched).
+        CREATE TABLE IF NOT EXISTS device_labels (
+            vault_id   TEXT NOT NULL,
+            device_id  TEXT NOT NULL,
+            label      TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
             PRIMARY KEY (vault_id, device_id)
         );",
     )?;
@@ -207,6 +326,12 @@ async fn main() -> anyhow::Result<()> {
         api_keys: Arc::new(api_keys),
         rate_limiters: Arc::new(Mutex::new(HashMap::new())),
         is_loopback,
+        rp_id: cli.rp_id.clone(),
+        allowed_origins: Arc::new(allowed_origins),
+        default_quota_devices: cli.quota_devices,
+        default_quota_bytes: cli.quota_bytes,
+        webauthn,
+        auth_store,
     };
 
     // ── Background tombstone cleanup (daily) ───────────────────────────
@@ -252,8 +377,11 @@ async fn main() -> anyhow::Result<()> {
     let shutdown_state = state.clone();
 
     // ── Build router ───────────────────────────────────────────────────
+    account_routes::spawn_session_sweeper(state.clone());
+
     let app = axum::Router::new()
         .merge(routes::router())
+        .merge(account_routes::router())
         .with_state(state)
         .layer(
             CorsLayer::new()

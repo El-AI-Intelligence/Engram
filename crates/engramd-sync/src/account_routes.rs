@@ -1,0 +1,546 @@
+//! Account routes — passkey registration/login, sessions.
+//!
+//! The account model is deliberately pseudonymous: an account is an opaque
+//! UUID plus its passkeys. No email, name, or other PII ever reaches the
+//! relay (billing, which needs an email, is a separate private service —
+//! roadmap 1.3).
+//!
+//! Ceremony flow (webauthn-rs two-step, in-memory challenge store):
+//!   register/start → browser create() → register/finish  (no session = new
+//!   account; valid session = add a passkey to that account)
+//!   login/start    → browser get()    → login/finish
+//! Sessions are opaque Bearer tokens (sha256 at rest, 7-day TTL) kept in
+//! the browser's localStorage — cross-site cookies won't stick between the
+//! vault UI origin and the relay origin.
+
+use crate::auth::{self, SESSION_TTL};
+use crate::SyncState;
+use axum::{
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    routing::post,
+    Json, Router,
+};
+use rusqlite::OptionalExtension;
+use serde_json::{json, Value};
+use webauthn_rs::prelude::*;
+use webauthn_rs_proto::{AuthenticatorSelectionCriteria, ResidentKeyRequirement, UserVerificationPolicy};
+
+type ApiError = (StatusCode, Json<Value>);
+
+pub fn router() -> Router<SyncState> {
+    Router::new()
+        .route("/auth/register/start", post(register_start))
+        .route("/auth/register/finish", post(register_finish))
+        .route("/auth/login/start", post(login_start))
+        .route("/auth/login/finish", post(login_finish))
+        .route("/auth/logout", post(logout))
+}
+
+// ── Register ────────────────────────────────────────────────────────────────
+
+async fn register_start(
+    State(state): State<SyncState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let origin = str_field(&body, "origin")?;
+    validate_origin(&state, origin)?;
+
+    // A valid session means "add another passkey to my account"; otherwise
+    // this ceremony creates a brand-new account.
+    let attach_account = match authenticate_session(&state, &headers).await {
+        Ok(account_id) => Some(account_id),
+        Err(e) if e.0 == StatusCode::UNAUTHORIZED => None,
+        Err(e) => return Err(e),
+    };
+    let user_unique_id = attach_account
+        .as_ref()
+        .and_then(|a| Uuid::parse_str(a).ok())
+        .unwrap_or_else(Uuid::new_v4);
+    // The account id IS the WebAuthn user handle: existing account when
+    // attaching, fresh uuid when this ceremony creates the account.
+    let account_id = attach_account
+        .clone()
+        .unwrap_or_else(|| user_unique_id.to_string());
+
+    let (mut challenge, reg_state) = state
+        .webauthn
+        .start_passkey_registration(user_unique_id, "engram-account", "Engram Account", None)
+        .map_err(|e| err_json(500, "webauthn_error", &e.to_string()))?;
+
+    // Belt-and-braces: 0.5's passkey registration already requests resident
+    // keys, but some authenticators only honor an explicit request. This is
+    // the guardrail-hardened pattern (resident keys + no reliance on hints).
+    let selection = challenge
+        .public_key
+        .authenticator_selection
+        .get_or_insert_with(|| AuthenticatorSelectionCriteria {
+            authenticator_attachment: None,
+            resident_key: Some(ResidentKeyRequirement::Required),
+            require_resident_key: true,
+            user_verification: UserVerificationPolicy::Required,
+        });
+    selection.resident_key = Some(ResidentKeyRequirement::Required);
+    selection.require_resident_key = true;
+
+    let challenge_id = Uuid::new_v4().to_string();
+    state
+        .auth_store
+        .put_registration(challenge_id.clone(), challenge.clone(), reg_state, Some(account_id));
+
+    Ok(Json(json!({
+        "challenge_id": challenge_id,
+        "challenge": serde_json::to_value(&challenge)
+            .map_err(|e| err_json(500, "serialize_error", &e.to_string()))?,
+    })))
+}
+
+async fn register_finish(
+    State(state): State<SyncState>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let origin = str_field(&body, "origin")?;
+    validate_origin(&state, origin)?;
+
+    let challenge_id = str_field(&body, "challenge_id")?;
+    let (_, reg_state, account) = state
+        .auth_store
+        .take_registration(challenge_id, std::time::Instant::now())
+        .ok_or_else(|| {
+            err_json(
+                400,
+                "invalid_challenge",
+                "unknown or expired registration challenge",
+            )
+        })?;
+    // `account` is always Some (set in start); the fallback is unreachable
+    // but keeps the tuple shape honest.
+    let account_id = account.unwrap_or_else(|| Uuid::new_v4().to_string());
+
+    let registration: RegisterPublicKeyCredential =
+        serde_json::from_value(body.get("registration").cloned().unwrap_or(Value::Null))
+            .map_err(|e| err_json(400, "bad_registration", &e.to_string()))?;
+
+    let passkey = state
+        .webauthn
+        .finish_passkey_registration(&registration, &reg_state)
+        .map_err(|e| err_json(400, "registration_failed", &e.to_string()))?;
+
+    let credential_id = passkey.cred_id().to_vec();
+    let public_key = serde_json::to_vec(&passkey)
+        .map_err(|e| err_json(500, "serialize_error", &e.to_string()))?;
+
+    let now = chrono::Utc::now();
+    let now_str = now.to_rfc3339();
+    let conn = state.conn.lock().await;
+
+    // New accounts get created here; attaching to an existing account is a
+    // no-op thanks to OR IGNORE.
+    conn.execute(
+        "INSERT OR IGNORE INTO accounts (id, created_at, last_login_at) VALUES (?1, ?2, ?2)",
+        rusqlite::params![account_id, now_str],
+    )
+    .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+
+    let insert = conn.execute(
+        "INSERT INTO passkeys (account_id, credential_id, public_key, created_at) \
+         VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![account_id, credential_id, public_key, now_str],
+    );
+    match insert {
+        Ok(_) => {}
+        // Same passkey submitted twice (double click, retry): the credential
+        // already exists — behave like a login instead of erroring.
+        Err(e) if is_unique_violation(&e) => {
+            let existing: Option<String> = conn
+                .query_row(
+                    "SELECT account_id FROM passkeys WHERE credential_id = ?1",
+                    rusqlite::params![credential_id],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+            match existing {
+                Some(a) => {
+                    let session_token = mint_and_store_session(&conn, &a)?;
+                    return Ok(Json(json!({
+                        "account_id": a,
+                        "session_token": session_token,
+                        "already_registered": true,
+                    })));
+                }
+                None => {
+                    return Err(err_json(
+                        409,
+                        "passkey_conflict",
+                        "passkey already registered to another account",
+                    ))
+                }
+            }
+        }
+        Err(e) => return Err(err_json(500, "database_error", &e.to_string())),
+    }
+
+    conn.execute(
+        "UPDATE accounts SET last_login_at = ?1 WHERE id = ?2",
+        rusqlite::params![now_str, account_id],
+    )
+    .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+
+    let session_token = mint_and_store_session(&conn, &account_id)?;
+    Ok(Json(json!({
+        "account_id": account_id,
+        "session_token": session_token,
+    })))
+}
+
+// ── Login ───────────────────────────────────────────────────────────────────
+
+async fn login_start(
+    State(state): State<SyncState>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let origin = str_field(&body, "origin")?;
+    validate_origin(&state, origin)?;
+
+    let conn = state.conn.lock().await;
+    // User-less login: load every stored passkey and let the browser offer
+    // them as a picker. The credential is identified in finish (the auth
+    // state carries the allowed-credential list).
+    let mut stmt = conn
+        .prepare("SELECT public_key FROM passkeys")
+        .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+    let rows = stmt
+        .query_map([], |r| r.get::<_, Vec<u8>>(0))
+        .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+    let mut passkeys: Vec<Passkey> = Vec::new();
+    for row in rows {
+        let bytes = row.map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+        passkeys.push(
+            serde_json::from_slice(&bytes)
+                .map_err(|e| err_json(500, "corrupt_passkey", &e.to_string()))?,
+        );
+    }
+    if passkeys.is_empty() {
+        return Err(err_json(
+            409,
+            "no_passkeys",
+            "no passkeys registered on this server yet — register first",
+        ));
+    }
+
+    let (challenge, auth_state) = state
+        .webauthn
+        .start_passkey_authentication(&passkeys)
+        .map_err(|e| err_json(500, "webauthn_error", &e.to_string()))?;
+
+    let challenge_id = Uuid::new_v4().to_string();
+    state
+        .auth_store
+        .put_authentication(challenge_id.clone(), challenge.clone(), auth_state);
+
+    Ok(Json(json!({
+        "challenge_id": challenge_id,
+        "challenge": serde_json::to_value(&challenge)
+            .map_err(|e| err_json(500, "serialize_error", &e.to_string()))?,
+    })))
+}
+
+async fn login_finish(
+    State(state): State<SyncState>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let origin = str_field(&body, "origin")?;
+    validate_origin(&state, origin)?;
+
+    let challenge_id = str_field(&body, "challenge_id")?;
+    let (_, auth_state) = state
+        .auth_store
+        .take_authentication(challenge_id, std::time::Instant::now())
+        .ok_or_else(|| {
+            err_json(
+                400,
+                "invalid_challenge",
+                "unknown or expired login challenge",
+            )
+        })?;
+
+    let credential: PublicKeyCredential =
+        serde_json::from_value(body.get("credential").cloned().unwrap_or(Value::Null))
+            .map_err(|e| err_json(400, "bad_credential", &e.to_string()))?;
+    let credential_id = credential.get_credential_id().to_vec();
+
+    let conn = state.conn.lock().await;
+    let row: Option<(String, Vec<u8>)> = conn
+        .query_row(
+            "SELECT account_id, public_key FROM passkeys WHERE credential_id = ?1",
+            rusqlite::params![credential_id.clone()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+    let (account_id, public_key_bytes) = row.ok_or_else(|| {
+        err_json(
+            400,
+            "unknown_credential",
+            "no passkey registered with this credential id",
+        )
+    })?;
+
+    let passkey: Passkey = serde_json::from_slice(&public_key_bytes)
+        .map_err(|e| err_json(500, "corrupt_passkey", &e.to_string()))?;
+
+    let result = state
+        .webauthn
+        .finish_passkey_authentication(&credential, &auth_state)
+        .map_err(|e| err_json(401, "auth_failed", &e.to_string()))?;
+
+    // Persist counter/backup-state changes when the authenticator advanced
+    // them (rare, but the stored copy must not regress).
+    if result.needs_update() {
+        let mut updated = passkey;
+        if updated.update_credential(&result).unwrap_or(false) {
+            let public_key = serde_json::to_vec(&updated)
+                .map_err(|e| err_json(500, "serialize_error", &e.to_string()))?;
+            conn.execute(
+                "UPDATE passkeys SET public_key = ?1 WHERE credential_id = ?2",
+                rusqlite::params![public_key, credential_id],
+            )
+            .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+        }
+    }
+
+    let now_str = chrono::Utc::now().to_rfc3339();
+    sweep_expired_sessions(&conn).map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+    conn.execute(
+        "UPDATE accounts SET last_login_at = ?1 WHERE id = ?2",
+        rusqlite::params![now_str, account_id],
+    )
+    .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+
+    let session_token = mint_and_store_session(&conn, &account_id)?;
+    Ok(Json(json!({
+        "account_id": account_id,
+        "session_token": session_token,
+    })))
+}
+
+// ── Logout ──────────────────────────────────────────────────────────────────
+
+async fn logout(
+    State(state): State<SyncState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let Ok(token) = bearer_token(&headers) else {
+        return Ok(Json(json!({"logged_out": false})));
+    };
+    let conn = state.conn.lock().await;
+    conn.execute(
+        "DELETE FROM sessions WHERE token_hash = ?1",
+        rusqlite::params![auth::hash_token(token).to_vec()],
+    )
+    .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+    Ok(Json(json!({"logged_out": true})))
+}
+
+// ── Session helpers (shared with account-key routes) ────────────────────────
+
+/// Resolve a Bearer session token to an account id (401 when absent/expired).
+pub async fn authenticate_session(
+    state: &SyncState,
+    headers: &HeaderMap,
+) -> Result<String, ApiError> {
+    let token = bearer_token(headers)?;
+    let conn = state.conn.lock().await;
+    let account_id: Option<String> = conn
+        .query_row(
+            "SELECT account_id FROM sessions WHERE token_hash = ?1 AND expires_at > ?2",
+            rusqlite::params![
+                auth::hash_token(token).to_vec(),
+                chrono::Utc::now().to_rfc3339()
+            ],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+    account_id.ok_or_else(|| err_json(401, "invalid_session", "not signed in"))
+}
+
+// Sync on purpose: callers hold the conn mutex guard (which is !Send) and
+// an await point here would make every handler future non-Send.
+fn mint_and_store_session(
+    conn: &rusqlite::Connection,
+    account_id: &str,
+) -> Result<String, ApiError> {
+    let token = auth::mint_session_token()
+        .map_err(|e| err_json(500, "rng_error", &e.to_string()))?;
+    let now = chrono::Utc::now();
+    let expires = now + chrono::Duration::from_std(SESSION_TTL).unwrap();
+    conn.execute(
+        "INSERT INTO sessions (token_hash, account_id, created_at, expires_at) \
+         VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![
+            auth::hash_token(&token).to_vec(),
+            account_id,
+            now.to_rfc3339(),
+            expires.to_rfc3339(),
+        ],
+    )
+    .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+    Ok(token)
+}
+
+fn sweep_expired_sessions(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    conn.execute(
+        "DELETE FROM sessions WHERE expires_at < ?1",
+        rusqlite::params![chrono::Utc::now().to_rfc3339()],
+    )?;
+    Ok(())
+}
+
+/// Background sweep of expired sessions (login/finish also sweeps inline).
+pub fn spawn_session_sweeper(state: SyncState) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(3600));
+        loop {
+            interval.tick().await;
+            let conn = state.conn.lock().await;
+            if let Err(e) = sweep_expired_sessions(&conn) {
+                tracing::warn!("Session sweep error: {e}");
+            }
+        }
+    });
+}
+
+// ── Helpers ─────────────────────────────────────────────────────────────────
+
+fn str_field<'a>(body: &'a Value, name: &str) -> Result<&'a str, ApiError> {
+    body.get(name)
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| err_json(400, "missing_field", &format!("missing {name}")))
+}
+
+fn validate_origin(state: &SyncState, origin: &str) -> Result<(), ApiError> {
+    if state.allowed_origins.contains(origin) {
+        Ok(())
+    } else {
+        Err(err_json(
+            401,
+            "origin_not_allowed",
+            "origin is not in the server's --origin allow-list",
+        ))
+    }
+}
+
+fn bearer_token<'a>(headers: &'a HeaderMap) -> Result<&'a str, ApiError> {
+    let value = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| err_json(401, "missing_authorization", "missing Authorization header"))?;
+    let token = value
+        .strip_prefix("Bearer ")
+        .map(str::trim)
+        .ok_or_else(|| err_json(401, "bad_authorization", "expected Bearer token"))?;
+    if token.is_empty() {
+        return Err(err_json(401, "bad_authorization", "empty token"));
+    }
+    Ok(token)
+}
+
+fn err_json(status: u16, code: &str, msg: &str) -> ApiError {
+    (
+        StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        Json(json!({"code": code, "error": msg})),
+    )
+}
+
+fn is_unique_violation(e: &rusqlite::Error) -> bool {
+    matches!(
+        e,
+        rusqlite::Error::SqliteFailure(f, _) if f.code == rusqlite::ErrorCode::ConstraintViolation
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    fn test_state() -> SyncState {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "PRAGMA foreign_keys=ON;
+             CREATE TABLE accounts (
+                 id TEXT PRIMARY KEY, created_at TEXT NOT NULL, last_login_at TEXT,
+                 quota_devices INTEGER, quota_bytes INTEGER
+             );
+             CREATE TABLE passkeys (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+                 credential_id BLOB NOT NULL UNIQUE, public_key BLOB NOT NULL, created_at TEXT NOT NULL
+             );
+             CREATE TABLE sessions (
+                 token_hash BLOB PRIMARY KEY, account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+                 created_at TEXT NOT NULL, expires_at TEXT NOT NULL
+             );",
+        )
+        .unwrap();
+        SyncState {
+            conn: Arc::new(Mutex::new(conn)),
+            start_time: chrono::Utc::now(),
+            data_dir: std::path::PathBuf::from("/tmp"),
+            api_keys: Arc::new(Default::default()),
+            rate_limiters: Arc::new(Mutex::new(Default::default())),
+            is_loopback: true,
+            rp_id: "localhost".into(),
+            allowed_origins: Arc::new(
+                ["http://localhost:8787".to_string()]
+                    .into_iter()
+                    .collect(),
+            ),
+            default_quota_devices: 0,
+            default_quota_bytes: 0,
+            webauthn: Arc::new(crate::auth::build_webauthn("localhost", "http://localhost:8787").unwrap()),
+            auth_store: Arc::new(crate::auth::WebauthnStore::new()),
+        }
+    }
+
+    #[tokio::test]
+    async fn origin_allow_list_rejects_unknown_origins() {
+        let state = test_state();
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer whatever".parse().unwrap());
+        let res = register_start(
+            State(state.clone()),
+            headers,
+            Json(json!({"origin": "https://evil.example"})),
+        )
+        .await;
+        let (status, body) = res.expect_err("must be rejected");
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["code"], "origin_not_allowed");
+    }
+
+    #[tokio::test]
+    async fn login_start_with_no_passkeys_returns_409() {
+        let state = test_state();
+        let res = login_start(State(state), Json(json!({"origin": "http://localhost:8787"}))).await;
+        let (status, body) = res.expect_err("no passkeys yet");
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["code"], "no_passkeys");
+    }
+
+    #[test]
+    fn bearer_token_parses_and_rejects() {
+        let mut headers = HeaderMap::new();
+        assert!(bearer_token(&headers).is_err());
+        headers.insert("authorization", "Basic abc".parse().unwrap());
+        assert!(bearer_token(&headers).is_err());
+        headers.insert("authorization", "Bearer tok".parse().unwrap());
+        assert_eq!(bearer_token(&headers).unwrap(), "tok");
+        headers.insert("authorization", "Bearer ".parse().unwrap());
+        assert!(bearer_token(&headers).is_err());
+    }
+}

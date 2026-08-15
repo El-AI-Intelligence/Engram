@@ -28,3 +28,10 @@ rusqlite = { version = "0.32", features = ["bundled-sqlcipher"] }
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
+
+# Accounts (WebAuthn passkeys)
+webauthn-rs = { version = "0.5.5", features = ["resident-key-support", "workaround-google-passkey-specific-issues"] }
+webauthn-rs-proto = "0.5.5"
+sha2 = "0.10"
+base64 = "0.22"
+rand = "0.9"
