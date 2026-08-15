@@ -32,6 +32,9 @@ struct TeamStatusResponse {
     last_push: Option<String>,
     /// Last pull cursor (sync_state.json).
     last_pull: Option<String>,
+    /// Last push error (sync_state.json last_push_error) — surfaced so a
+    /// stuck team sync (e.g. quota 402) is visible in the UI.
+    last_push_error: Option<String>,
 }
 
 /// GET /teams/status — team roster + sync reachability, aggregated
@@ -79,18 +82,21 @@ async fn status(
 
     // Sync state from sync_state.json
     let sync_state_path = state.vault_path.join("sync_state.json");
-    let (last_push, last_pull): (Option<String>, Option<String>) =
+    let (last_push, last_pull, last_push_error): (Option<String>, Option<String>, Option<String>) =
         if let Ok(data) = std::fs::read_to_string(&sync_state_path) {
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&data) {
                 (
                     json.get("last_push").and_then(|v| v.as_str()).map(String::from),
                     json.get("updated_at").and_then(|v| v.as_str()).map(String::from),
+                    json.get("last_push_error")
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
                 )
             } else {
-                (None, None)
+                (None, None, None)
             }
         } else {
-            (None, None)
+            (None, None, None)
         };
 
     // This device's identity (for the is_self annotation)
@@ -157,5 +163,6 @@ async fn status(
         devices,
         last_push,
         last_pull,
+        last_push_error,
     }))
 }

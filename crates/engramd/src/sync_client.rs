@@ -236,6 +236,40 @@ impl SyncClient {
         *self.clock.lock().await
     }
 
+    /// Register this device's human-readable label with the relay so the
+    /// team roster can show who is who. Best-effort and silent: pre-1.2
+    /// relays 404 (old rosters simply show no label), and any failure must
+    /// never block or disturb the sync loop.
+    pub async fn register_device_label(&self, label: &str) {
+        let url = format!(
+            "{}/v1/vaults/{}/devices/register",
+            self.server_url,
+            urlencoding(&self.vault_id)
+        );
+        let body = serde_json::json!({
+            "device_id": self.device_id,
+            "label": label,
+        });
+        let mut req = self.http.post(&url).json(&body);
+        if let Some(ref key) = self.api_key {
+            req = req.header("Authorization", format!("Bearer {key}"));
+        }
+        match req.send().await {
+            Ok(resp) if resp.status().is_success() => {
+                tracing::debug!("sync: device label registered ({label})");
+            }
+            Ok(resp) => {
+                tracing::debug!(
+                    "sync: device label registration skipped (HTTP {})",
+                    resp.status().as_u16()
+                );
+            }
+            Err(e) => {
+                tracing::debug!("sync: device label registration failed: {e}");
+            }
+        }
+    }
+
     /// Persist the vector clock to device.json so it survives restarts.
     /// Called after each successful push cycle.
     ///
@@ -375,6 +409,20 @@ pub fn spawn_sync_loop(
     tokio::spawn(async move {
         // Delay first sync so the server has time to start.
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+        // Register this device's label with the relay so the team roster
+        // can show who is who (best-effort; pre-1.2 relays just 404).
+        let device_label = std::fs::read_to_string(vault_path.join("device.json"))
+            .ok()
+            .and_then(|data| serde_json::from_str::<serde_json::Value>(&data).ok())
+            .and_then(|json| {
+                json.get("label")
+                    .and_then(|v| v.as_str())
+                    .map(|l| l.trim().to_string())
+            })
+            .filter(|l| !l.is_empty())
+            .unwrap_or_else(|| "unknown".into());
+        client.register_device_label(&device_label).await;
 
         // Load persisted state so restarts don't lose sync progress.
         let last_push_path = vault_path.join("sync_state.json");
@@ -715,7 +763,7 @@ pub fn spawn_sync_loop(
             }
 
             // ── Push local changes ───────────────────────────────────────
-            match push_local_changes(&client, &vault, last_push.as_deref()).await {
+            match push_local_changes(&client, &vault, &vault_path, last_push.as_deref()).await {
                 Ok((clocks, new_last_push)) => {
                     for (id, clock) in clocks {
                         let entry = known_clocks.entry(id).or_insert(0);
@@ -772,6 +820,30 @@ pub fn spawn_sync_loop(
     })
 }
 
+/// Persist (or clear) `last_push_error` in sync_state.json. The vault UI
+/// surfaces it in the sync panel so a stuck team sync (e.g. quota 402) is
+/// visible without reading daemon logs. Written from the sync-loop task,
+/// which is also the only other writer of the file, so no lock is needed.
+fn persist_last_push_error(vault_path: &std::path::Path, error: Option<&str>) {
+    let path = vault_path.join("sync_state.json");
+    let mut json = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .unwrap_or(serde_json::json!({}));
+    match error {
+        Some(e) => json["last_push_error"] = serde_json::json!(e),
+        None => {
+            if let Some(obj) = json.as_object_mut() {
+                obj.remove("last_push_error");
+            }
+        }
+    }
+    if let Err(e) = std::fs::write(&path, serde_json::to_string_pretty(&json).unwrap_or_default())
+    {
+        tracing::warn!(error = %e, "Failed to persist last_push_error");
+    }
+}
+
 /// Push locally-modified memories that haven't been synced yet.
 ///
 /// Uses the per-memory sync cursor (`synced_at IS NULL OR modified_at >
@@ -790,6 +862,7 @@ pub fn spawn_sync_loop(
 async fn push_local_changes(
     client: &SyncClient,
     vault: &Arc<Mutex<axiom_engram::EngramStore>>,
+    vault_path: &std::path::Path,
     last_push: Option<&str>,
 ) -> Result<(std::collections::HashMap<String, u64>, Option<String>), String> {
     // Collect fresh memories under the vault lock, then drop it before I/O.
@@ -893,6 +966,8 @@ async fn push_local_changes(
 
     match client.push(blobs).await {
         Ok(resp) => {
+            // A real push round-trip succeeded: the channel is healthy.
+            persist_last_push_error(vault_path, None);
             tracing::info!(
                 "sync: pushed {}/{} blobs ({} rejected)",
                 resp.accepted,
@@ -921,6 +996,7 @@ async fn push_local_changes(
             }
         }
         Err(e) => {
+            persist_last_push_error(vault_path, Some(&e));
             return Err(format!("push failed: {e}"));
         }
     }
@@ -1076,6 +1152,7 @@ async fn push_tombstones(
             clear_tombstones(vault_path, &accepted_ids);
         }
         Err(e) => {
+            persist_last_push_error(vault_path, Some(&e));
             tracing::warn!("sync: tombstone push failed: {e}");
         }
     }
