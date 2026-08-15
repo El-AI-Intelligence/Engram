@@ -138,10 +138,11 @@ if that record is ever added.
 
 ## Verification checklist (milestone 1.2) — 2026-08-15
 
-- [ ] `https://sync.ellmstack.dev/health` green with the 1.2 binary + unit flags
-- [ ] Static-key regression: existing routes (push/pull/stats/devices) still green
-      with the operator key
-- [ ] Schema on box: `sqlite3 /var/lib/engram-sync/sync.db '.tables'` lists
+- [x] `https://sync.ellmstack.dev/health` green with the 1.2 binary + unit flags
+- [x] Static-key regression: existing routes (push/pull/stats/devices) still green
+      with the operator key — plus the new label-register route (vault
+      `deploycheck-12`, device `d12`, 1 blob)
+- [x] Schema on box: `sqlite3 /var/lib/engram-sync/sync.db '.tables'` lists
       `accounts passkeys sessions api_keys device_labels`; aggregates (0
       accounts / 0 keys) match `/account` 401-until-registered
 - [ ] Browser e2e (human): register → sign out → sign in → mint key → connect
