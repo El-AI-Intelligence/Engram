@@ -165,17 +165,11 @@ async fn status(
         }
     };
 
-    // Count pending pushes: memories modified after last_push (same cursor
-    // semantics as the push filter itself).
-    let pending_push_count = if let Some(ref lp) = last_push {
+    // Count pending pushes: same per-memory cursor semantics as the actual
+    // push filter (list_unsynced), so the status matches what will be pushed.
+    let pending_push_count = {
         let vault = state.vault.lock().await;
-        vault
-            .list_modified_since(lp, 1000)
-            .await
-            .unwrap_or_default()
-            .len()
-    } else {
-        0
+        vault.list_unsynced(1000).await.unwrap_or_default().len()
     };
 
     // Device identity from device.json
