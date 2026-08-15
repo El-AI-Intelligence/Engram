@@ -121,6 +121,9 @@ async fn dispatch_cli(cmd: cli::Commands) -> anyhow::Result<()> {
         cli::Commands::Mcp { command, url } => {
             cli::handle_mcp(command, url).await
         }
+        cli::Commands::Onboarding { bind } => {
+            cli::handle_onboarding(bind).await
+        }
     }
 }
 

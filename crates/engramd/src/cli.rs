@@ -7,6 +7,7 @@
 use anyhow::Result;
 use axiom_engram::{EngramStore, EngramLayer, EngramSource, Engram};
 use clap::Subcommand;
+use std::io::Write;
 use std::path::PathBuf;
 
 // ── CLI definition ─────────────────────────────────────────────────────────
@@ -30,6 +31,12 @@ pub enum Commands {
     },
     /// Interactive setup wizard — configure your vault
     Init,
+    /// Guided 5-minute setup: vault → first memory → running daemon
+    Onboarding {
+        /// Daemon listen address for the onboarding flow
+        #[arg(long, default_value = "127.0.0.1:8787")]
+        bind: String,
+    },
     /// Join an existing team vault — fresh vault + sync preset
     Join {
         /// Vault directory (defaults to ~/.engram/vault)
@@ -1008,6 +1015,158 @@ pub async fn handle_mcp(command: String, engramd_url: String) -> Result<()> {
             anyhow::bail!("Unknown MCP command: {other}. Usage: engram mcp [install|status] [--url URL]")
         }
     }
+}
+
+/// `engram onboarding` — the consumer 5-minute path: create the vault
+/// (passphrase or machine-key), capture the first memory, and start the
+/// daemon. Existing vaults skip creation and go straight to capture.
+///
+/// Unlike `init` + `daemon` run separately, this keeps the passphrase in
+/// hand long enough to hand it to the daemon via ENGRAM_PASSPHRASE (env,
+/// never argv — argv is visible in `ps`).
+pub async fn handle_onboarding(bind: String) -> Result<()> {
+    println!();
+    println!("  ╔══════════════════════════════════════════════╗");
+    println!("  ║   Engram — 5-minute onboarding               ║");
+    println!("  ║   Your AI deserves a memory.                 ║");
+    println!("  ╚══════════════════════════════════════════════╝");
+    println!();
+
+    let vault_path = home_dir().join(".engram").join("vault");
+    let fresh = !vault_path.join("engrams.db").exists();
+
+    // ── Step 1: vault ──────────────────────────────────────────────────
+    let mut passphrase = String::new();
+    if fresh {
+        std::fs::create_dir_all(&vault_path)?;
+        println!("Encryption passphrase (leave empty for a machine-keyed vault):");
+        print!("> ");
+        std::io::stdout().flush()?;
+        std::io::stdin().read_line(&mut passphrase)?;
+        passphrase = passphrase.trim().to_string();
+
+        if !passphrase.is_empty() {
+            println!("Confirm passphrase:");
+            print!("> ");
+            std::io::stdout().flush()?;
+            let mut confirm = String::new();
+            std::io::stdin().read_line(&mut confirm)?;
+            if confirm.trim() != passphrase {
+                anyhow::bail!("Passphrases do not match. Run `engram onboarding` again.");
+            }
+            if passphrase.len() < 8 {
+                println!("  ⚠️  Short passphrase (< 8 chars) — a password manager is safer.");
+            }
+        }
+        let _store = if passphrase.is_empty() {
+            EngramStore::open(&vault_path).await?
+        } else {
+            EngramStore::open_with_passphrase(&vault_path, &passphrase).await?
+        };
+        println!("  ✅ Vault created at {}", vault_path.display());
+    } else {
+        println!("Vault found at {} — using it.", vault_path.display());
+        // Machine-key open first; a passphrase vault fails that, so ask.
+        match EngramStore::open(&vault_path).await {
+            Ok(_) => {}
+            Err(_) => {
+                println!("Passphrase for this vault:");
+                print!("> ");
+                std::io::stdout().flush()?;
+                std::io::stdin().read_line(&mut passphrase)?;
+                passphrase = passphrase.trim().to_string();
+                EngramStore::open_with_passphrase(&vault_path, &passphrase).await?;
+            }
+        }
+    }
+
+    // ── Step 2: first memory ───────────────────────────────────────────
+    let store = if passphrase.is_empty() {
+        EngramStore::open(&vault_path).await?
+    } else {
+        EngramStore::open_with_passphrase(&vault_path, &passphrase).await?
+    };
+    println!();
+    println!("What's one thing your AI should remember about you?");
+    print!("> ");
+    std::io::stdout().flush()?;
+    let mut content = String::new();
+    std::io::stdin().read_line(&mut content)?;
+    let content = content.trim().to_string();
+    let content = if content.is_empty() {
+        "I just set up Engram — my AI memory vault.".to_string()
+    } else {
+        content
+    };
+    let mut engram = Engram::new_episodic(content, EngramSource::Interaction, serde_json::json!({}));
+    engram.layer = EngramLayer::Semantic;
+    engram.tags = vec!["onboarding".to_string()];
+    match store.write(&engram).await? {
+        axiom_engram::WriteOutcome::Inserted => println!("  ✅ First memory stored."),
+        axiom_engram::WriteOutcome::Duplicate { matched_id } => {
+            println!("  ℹ️  Already remembered (matches {matched_id}) — kept the original.")
+        }
+        axiom_engram::WriteOutcome::NoiseSkipped { reason } => {
+            println!("  ⚠️  Skipped as noise ({reason}) — capture something more specific later.")
+        }
+    }
+
+    // ── Step 3: daemon ─────────────────────────────────────────────────
+    let exe = std::env::current_exe()?;
+    let log_path = home_dir().join(".engram").join("daemon.log");
+    let logfile = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.arg("daemon")
+        .arg("--vault")
+        .arg(&vault_path)
+        .arg("--bind")
+        .arg(&bind)
+        .stdout(logfile.try_clone()?)
+        .stderr(logfile);
+    if !passphrase.is_empty() {
+        cmd.env("ENGRAM_PASSPHRASE", &passphrase);
+    }
+    cmd.spawn()?;
+    println!("  ✅ Daemon starting (logs: {})", log_path.display());
+
+    // Wait for the daemon to answer /health (15s budget)
+    let url = format!("http://{bind}");
+    let client = reqwest::Client::new();
+    let mut up = false;
+    for _ in 0..30 {
+        up = client
+            .get(format!("{url}/health"))
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false);
+        if up {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
+    // ── Step 4: summary ────────────────────────────────────────────────
+    let total = store.count().await?;
+    println!();
+    if up {
+        println!("  ✅ Engram is running at {url}");
+        println!("     Open the vault: {url}");
+    } else {
+        println!("  ⚠️  Daemon didn't answer /health within 15s — check {}", log_path.display());
+        println!("     Start it manually: engram daemon --vault {} --bind {bind}", vault_path.display());
+    }
+    println!("     Memories: {total}");
+    println!();
+    println!("  Next steps:");
+    println!("    1. Connect your AI tools:      engram mcp install");
+    println!("    2. Sync across devices:        engram join --server-url https://<your-relay>");
+    println!("    3. Revisit the setup anytime:  engram init");
+    println!();
+    Ok(())
 }
 
 #[cfg(test)]
