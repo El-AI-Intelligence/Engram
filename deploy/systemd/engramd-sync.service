@@ -8,9 +8,25 @@ Type=simple
 User=engram-sync
 Group=engram-sync
 # Bind loopback-only: TLS terminates at Caddy (sync.engram.ellmstack.dev).
-ExecStart=/usr/local/bin/engramd-sync --data-dir /var/lib/engram-sync --bind 127.0.0.1:8788
+#
+# Managed-relay flags (milestone 1.2, 2026-08-15):
+#   --rp-id ellmstack.dev           WebAuthn RP ID — a registrable domain
+#                                   suffix of the vault UI origin. Passkeys
+#                                   bind to it: changing it orphans them.
+#   --origin https://engram.ellmstack.dev
+#                                   Browser origins allowed to run passkey
+#                                   ceremonies (the vault UI origin).
+#   --quota-devices 1               Default per-account device quota for
+#                                   keys minted via /account/keys (0 =
+#                                   unlimited). Free tier = 1 device.
+#   --quota-bytes 1073741824        Default per-account stored-bytes quota
+#                                   (1 GiB). Static SYNC_API_KEYS entries
+#                                   are always exempt.
+ExecStart=/usr/local/bin/engramd-sync --data-dir /var/lib/engram-sync --bind 127.0.0.1:8788 \
+  --rp-id ellmstack.dev --origin https://engram.ellmstack.dev \
+  --quota-devices 1 --quota-bytes 1073741824
 Environment=RUST_LOG=info
-# Optional env file: SYNC_API_KEYS (REQUIRED — non-loopback auth; see main.rs)
+# Optional env file: SYNC_API_KEYS (operator/static keys; account keys live in the DB)
 EnvironmentFile=-/etc/engram-sync/engramd-sync.env
 Restart=always
 RestartSec=5

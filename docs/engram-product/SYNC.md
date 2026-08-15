@@ -88,10 +88,12 @@ SYNC_API_KEYS="my-secret-key-32chars:100" engramd-sync \
 
 A managed relay runs at **https://sync.ellmstack.dev** — same dumb-pipe
 binary, same zero-knowledge properties (deployed 2026-08-15; operational
-runbook in [`deploy/sync-relay.md`](../../deploy/sync-relay.md)). API keys are
-issued manually for now; self-service keys arrive with accounts (revenue
-roadmap 1.2). Set `server_url` to the URL above and `api_key` to your issued
-key — everything else in this document applies unchanged.
+runbook in [`deploy/sync-relay.md`](../../deploy/sync-relay.md)). Create an
+account in the vault UI (Settings → Account, passkey sign-in), mint an API
+key there, and connect this device in one click. Set `server_url` to the URL
+above and `api_key` to your key — everything else in this document applies
+unchanged. See [Accounts & Passkeys](#accounts--passkeys) for the account
+model.
 
 ### 2. Configure your vault
 
@@ -272,12 +274,91 @@ them to push.
 - `GET /v1/vaults/{vault_id}/devices` on the sync server lists devices that
   have pushed blobs to that vault.
 
+## Accounts & Passkeys
+
+The relay has **standalone passkey accounts** (shipped 2026-08-15, milestone
+1.2). They are deliberately minimal and pseudonymous:
+
+- **Registration IS sign-up.** There is no email, name, or PII — an account
+  is an opaque UUID plus its passkeys. (Billing, which needs an email,
+  arrives in roadmap 1.3 as a separate private service that keys accounts by
+  the opaque id.)
+- **Login is the same ceremony.** The browser offers its passkeys for the
+  relay's RP ID; with none registered, login returns 409 `no_passkeys` and
+  the UI prompts to register.
+- **Sessions are Bearer tokens in `localStorage`** (key
+  `engram-sync-session`). Cross-site cookies won't stick between the vault
+  UI origin and the relay origin, so the SPA calls the relay directly (CORS
+  allows GET/POST/DELETE + `Content-Type`/`Authorization`). Tokens expire
+  after 7 days; the relay stores only their sha256, and logout revokes them.
+
+The account panel lives in the vault SPA: **Settings → Account** (passkey
+register/sign-in, quota bars, API key list, "Connect this device").
+
+### Account API keys
+
+Minted at `POST /account/keys` (optionally scoped to one `vault_id`):
+
+- Format `en_` + 43 base64url chars. The **full key is returned exactly
+  once**; the relay stores only `sha256(full_key)` and a prefix, so keys
+  cannot be recovered from a DB leak.
+- Revocation is soft (`DELETE /account/keys/{key_id}`) — the row stays as
+  an audit trail, the hash stops authenticating.
+- Keys authenticate exactly like static keys (`Authorization: Bearer
+  <key>`). An account key scoped to a vault also administers that vault
+  (device revocation).
+
+### Quota semantics
+
+Accounts have two quota flags — **devices** and **stored bytes** — enforced
+on push:
+
+- **0 = unlimited.** New accounts inherit the relay's defaults
+  (`--quota-devices` / `--quota-bytes`); per-account overrides live in the
+  `accounts` table and will be set by billing (1.3).
+- **Usage is measured pre-insert** over the account's vaults: distinct
+  active device ids, and the sum of stored ciphertext bytes. Devices count
+  **active devices only** — a revoked device drops out.
+- **The whole push batch is rejected with 402** before anything is written
+  when a projected write would exceed a limit:
+  `{"error":{"code":"quota_exceeded","detail":"devices"|"bytes","limit":N,"used":N}}`.
+  Projection is REPLACE-aware: overwriting a blob with a smaller one frees
+  space (accepted), with a larger one can be rejected.
+- **Static `SYNC_API_KEYS` entries are exempt** — quotas apply to account
+  keys only.
+- A 402 surfaces in the daemon as `last_push_error` in `sync_state.json`,
+  visible in the Settings → Sync & Team panel — sync otherwise stays silent.
+
+### RP ID and origins
+
+WebAuthn credentials bind to a **Relying Party ID**, not a URL. The relay
+serves passkeys for `--rp-id`, and only accepts ceremonies whose browser
+`origin` (the vault UI's `window.location.origin`) is in its `--origin`
+allow-list.
+
+- Local dev defaults: `--rp-id localhost --origin http://localhost:8787`.
+- Managed relay: `--rp-id ellmstack.dev --origin https://engram.ellmstack.dev`
+  (a registrable domain suffix of the UI origin).
+- **Changing `--rp-id` orphans every existing passkey** — pick it once.
+  A self-hoster serving the vault UI on another domain needs a different
+  passkey for that domain, even against the same relay.
+
+### Wildcard loopback
+
+For quick local starts, the relay historically treated **keyless loopback
+requests as a superuser**. That wildcard is now narrow: it applies only
+while there are no static keys **and** no unrevoked account keys. **The
+first minted account key flips the relay to require Bearer auth on
+loopback too** (default-secure). Static env keys are unaffected.
+
 ## Self-Hosting
 
 The sync server is designed to be self-hosted:
 
 - **No external dependencies:** Just SQLite + HTTP
-- **Stateless:** No user accounts, no sessions — just API keys
+- **Accounts are optional:** run with only `SYNC_API_KEYS` for the original
+  key-only behavior — passkey accounts, sessions, and quota enforcement
+  activate on top of it without changing anything for static keys
 - **Resource-light:** ~20 MB RAM, minimal CPU
 - **Docker:** `docker run -v ./data:/data -p 8788:8788 -e SYNC_API_KEYS=... ghcr.io/pixelphantomai/engramd-sync:latest`
 
@@ -364,6 +445,23 @@ between devices. Verify:
   (should be > 0 after first pull)
 - First sync may take up to `interval_secs` (default 60s)
 
+### Pushes stopped with 402
+
+A quota rejection: `Settings → Sync & Team` shows the exact
+`last_push_error` (devices or bytes, limit and used). Delete blobs or
+revoke a device to go back under the limit — the next successful push
+clears the error. Static `SYNC_API_KEYS` entries are never quota-limited.
+
+### Passkey registration fails in the browser
+
+- The relay validates the browser's origin against its `--origin` list;
+  a mismatch surfaces as "RP ID/origin mismatch" in the UI. The vault UI
+  must be served from an origin on the relay's allow-list (self-hosters:
+  restart the relay with your origin in `--origin`).
+- Passkeys bind to the relay's `--rp-id` — an account's passkey works
+  from any origin allow-listed for that RP ID, and never from a
+  different RP ID.
+
 ## API Reference
 
 ### `GET /sync/status`
@@ -397,6 +495,24 @@ Team roster + reachability, aggregated server-side (see Shared Vaults).
 ### `GET /v1/vaults/{vault_id}/devices` (sync server)
 
 Device roster for a vault. Requires `Authorization: Bearer <api_key>`.
+Each device carries `device_id`, `last_seen`, `blob_count`, `revoked`, and
+`label` (null until the device registers one).
+
+### `POST /v1/vaults/{vault_id}/devices/register` (sync server)
+
+Upsert this device's label — `{"device_id": "...", "label": "..."}`,
+label ≤ 128 chars. Requires an API key scoped to (or superseding) the
+vault. The daemon calls this automatically at sync-loop start using the
+`label` field in `device.json` (falls back to `"unknown"`, and stays
+silent when the relay is older than 1.2). Registering makes a device
+appear in the roster even before its first push.
+
+### Account endpoints (sync server)
+
+`POST /auth/register/start|finish`, `POST /auth/login/start|finish`,
+`POST /auth/logout`, `GET /account`, `POST /account/keys`,
+`DELETE /account/keys/{key_id}` — contracts in API_SURFACE.md, section
+3.9.
 
 ## Migration from Other Memory Systems
 
@@ -425,7 +541,8 @@ If you're migrating from another memory system:
 - **Machine-keyed vaults cannot sync:** a passphrase is required at daemon
   startup.
 - **Device roster counts pushes only:** a teammate who has only pulled
-  appears in the roster after their first push.
+  appears in the roster after their first push. Registering a device label
+  makes it appear immediately (see below).
 - **Hygiene/consolidation deltas don't re-push:** hygiene deletes and weekly
   consolidation promotions change rows without bumping `modified_at`, so
   those specific deltas don't propagate until the row changes again

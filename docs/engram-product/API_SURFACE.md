@@ -530,27 +530,49 @@ Aggregated server-side so the sync `api_key` never reaches the browser.
   "server_url": "https://sync.example.com",
   "remote_reachable": true,
   "devices": [
-    { "device_id": "d1…", "last_seen": "2026-08-14T09:00:00Z", "blob_count": 12, "is_self": true },
-    { "device_id": "d2…", "last_seen": "2026-08-14T08:55:00Z", "blob_count": 9, "is_self": false }
+    { "device_id": "d1…", "last_seen": "2026-08-14T09:00:00Z", "blob_count": 12, "label": "my-laptop", "is_self": true },
+    { "device_id": "d2…", "last_seen": "2026-08-14T08:55:00Z", "blob_count": 9, "label": null, "is_self": false }
   ],
   "last_push": "2026-08-14T09:00:00Z",
-  "last_pull": "2026-08-14T09:00:00Z"
+  "last_pull": "2026-08-14T09:00:00Z",
+  "last_push_error": null
 }
 ```
 
+`last_push_error` carries the relay's rejection text from the most recent
+failed push (e.g. a 402 quota rejection) and is cleared by the next
+successful push — see SYNC.md quota semantics.
+
 #### `GET /v1/vaults/{vault_id}/devices` — Device roster (engramd-sync)
 
-Requires `Authorization: Bearer <api_key>`. Counts **pushes** — a device
-appears only after its first push to that vault.
+Requires `Authorization: Bearer <api_key>`. A device appears after its
+first push **or** after registering a label.
 
 ```json
 // Response 200
 {
   "vault_id": "team-acme",
   "devices": [
-    { "device_id": "d1…", "last_seen": "2026-08-14T09:00:00Z", "blob_count": 12 }
+    { "device_id": "d1…", "last_seen": "2026-08-14T09:00:00Z", "blob_count": 12, "revoked": false, "label": "my-laptop" }
   ]
 }
+```
+
+#### `POST /v1/vaults/{vault_id}/devices/register` — Register device label (engramd-sync)
+
+Upserts the calling device's label. Requires an API key scoped to (or
+superseding) the vault. The daemon calls this automatically at sync-loop
+start; older relays answer 404 and the daemon stays silent.
+
+```json
+// Request
+{ "device_id": "a1b2c3d4-…", "label": "my-laptop" }   // label ≤ 128 chars, non-empty
+
+// Response 200
+{ "vault_id": "team-acme", "device_id": "a1b2c3d4-…", "label": "my-laptop", "registered": true }
+
+// Errors: 400 (empty/oversized device_id or label), 401 (bad key),
+//         403 (key not scoped to this vault)
 ```
 
 ### 3.8 Weekly Digest
@@ -628,6 +650,167 @@ returns `502 {"error":{"code":"llm_error",...}}`. `llm.api_key` is masked
 (`••••••••`) in `/config` responses and never persisted on masked
 round-trips. The LLM only phrases a deterministic prompt built from the
 digest data — it never fabricates the numbers.
+
+### 3.9 Accounts (engramd-sync)
+
+Standalone passkey accounts, shipped 2026-08-15 (milestone 1.2). The
+relay stores no PII: an account is an opaque UUID plus passkeys, session
+tokens and API keys are stored only as sha256 hashes. The vault SPA
+calls these endpoints directly with `Content-Type: application/json`
+(CORS on the relay allows GET/POST/DELETE from any origin). Errors use
+`{"error": {"code": ..., "error": msg}}`; successful auth calls use the
+shapes below.
+
+#### `POST /auth/register/start` — Begin passkey registration
+
+```json
+// Request
+{ "origin": "http://localhost:8787" }   // must be in the relay's --origin allow-list
+
+// Response 200 — challenge.publicKey is browser-API-compatible
+// (camelCase options); challenge/user.id/excludeCredentials[].id are
+// base64url-no-pad and must be decoded to ArrayBuffers client-side.
+{
+  "challenge_id": "7f4c…",
+  "challenge": {
+    "publicKey": {
+      "rp": { "name": "Engram Sync" },
+      "user": { "id": "…base64url…", "name": "engram-account", "displayName": "Engram Account" },
+      "challenge": "…base64url…",
+      "pubKeyCredParams": [ { "type": "public-key", "alg": -7 }, … ],
+      "timeout": 60000,
+      "excludeCredentials": [],
+      "authenticatorSelection": { "residentKey": "required", "requireResidentKey": true, "userVerification": "required" },
+      "attestation": "none",
+      "extensions": {}
+    }
+  }
+}
+
+// Errors: 401 {"code":"origin_not_allowed"} for origins outside the allow-list
+```
+
+A valid session on the request attaches the new passkey to that account;
+without one, the ceremony creates a brand-new account.
+
+#### `POST /auth/register/finish` — Complete registration
+
+```json
+// Request — registration is the browser's PublicKeyCredential JSON
+// (id/rawId base64url, clientDataJSON/attestationObject base64).
+{
+  "origin": "http://localhost:8787",
+  "challenge_id": "7f4c…",
+  "registration": {
+    "id": "…base64url…", "rawId": "…base64url…", "type": "public-key",
+    "response": { "clientDataJSON": "…", "attestationObject": "…" }
+  }
+}
+
+// Response 200 — session_token is the Bearer token for /account*
+{
+  "account_id": "5c1f…",
+  "session_token": "…",
+  "already_registered": true   // only when the same passkey was submitted twice
+}
+
+// Errors: 400 invalid_challenge | bad_registration | registration_failed
+```
+
+#### `POST /auth/login/start` — Begin passkey login
+
+```json
+// Request
+{ "origin": "http://localhost:8787" }
+
+// Response 200
+{
+  "challenge_id": "9a2e…",
+  "challenge": {
+    "challenge": "…base64url…", "timeout": 60000,
+    "rpId": "localhost",
+    "allowCredentials": [ { "type": "public-key", "id": "…base64url…" } ],
+    "userVerification": "required"
+  }
+}
+
+// Errors: 409 {"code":"no_passkeys"} — no passkeys registered yet
+```
+
+#### `POST /auth/login/finish` — Complete login
+
+```json
+// Request — credential is the browser's PublicKeyCredential JSON.
+{
+  "origin": "http://localhost:8787",
+  "challenge_id": "9a2e…",
+  "credential": {
+    "id": "…base64url…", "rawId": "…base64url…", "type": "public-key",
+    "response": { "clientDataJSON": "…", "authenticatorData": "…", "signature": "…", "userHandle": "…base64url…" }
+  }
+}
+
+// Response 200
+{ "account_id": "5c1f…", "session_token": "…" }
+
+// Errors: 400 invalid_challenge | bad_credential | unknown_credential,
+//         401 auth_failed
+```
+
+#### `POST /auth/logout` — End a session
+
+```json
+// Request — Bearer session token.
+// Response 200: { "logged_out": true }   (false when the token was already dead)
+```
+
+#### `GET /account` — Account + quotas + keys (Bearer session)
+
+```json
+// Response 200 — 401 {"code":"invalid_session"} when signed out
+{
+  "account_id": "5c1f…",
+  "quota": {
+    "devices": 1,        // 0 = unlimited; server default unless overridden
+    "bytes": 1073741824, // per account, set by billing (1.3)
+    "devices_used": 1,
+    "bytes_used": 12345
+  },
+  "keys": [
+    { "id": "…", "key_prefix": "en_", "rate": 100.0, "vault_id": "team-acme",
+      "created_at": "2026-08-15T09:00:00Z", "revoked": false }
+  ],
+  "vaults": ["team-acme"]
+}
+```
+
+`quota.*_used` is measured over all vaults the account's unrevoked keys
+reach: distinct active devices and stored ciphertext bytes (see SYNC.md).
+
+#### `POST /account/keys` — Mint an API key (Bearer session)
+
+```json
+// Request — vault_id optional; omitted/null = every vault the account reaches
+{ "vault_id": "team-acme" }
+
+// Response 200 — api_key is shown exactly once; the relay stores sha256 only
+{
+  "key_id": "…",
+  "api_key": "en_…43 base64url chars…",
+  "key_prefix": "en_",
+  "rate": 100.0,
+  "vault_id": "team-acme",
+  "created_at": "2026-08-15T09:00:00Z"
+}
+```
+
+#### `DELETE /account/keys/{key_id}` — Revoke an API key (Bearer session)
+
+```json
+// Response 200: { "key_id": "…", "revoked": true }
+// Errors: 404 {"code":"key_not_found"} — not-found and not-yours are
+// identical so key ids can't be enumerated across accounts.
+```
 
 ---
 

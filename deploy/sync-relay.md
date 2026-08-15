@@ -16,8 +16,8 @@ upgrading, and recovering the relay. Secrets: `SYNC_API_KEYS` lives ONLY in
 |---|---|
 | `/usr/local/bin/engramd-sync` | release binary (scp from `target/release/engramd-sync`) |
 | `/var/lib/engram-sync/` | data dir (sync.db + WAL), owned by `engram-sync` |
-| `/etc/engram-sync/engramd-sync.env` | `SYNC_API_KEYS=...` (0600 root) |
-| `/etc/systemd/system/engramd-sync.service` | unit (from `deploy/systemd/`) — loopback bind, sandboxed |
+| `/etc/engram-sync/engramd-sync.env` | `SYNC_API_KEYS=...` (0600 root) — operator/static keys only |
+| `/etc/systemd/system/engramd-sync.service` | unit (from `deploy/systemd/`) — loopback bind, sandboxed, managed-relay flags (`--rp-id ellmstack.dev --origin https://engram.ellmstack.dev --quota-devices 1 --quota-bytes 1 GiB`) |
 | `/etc/caddy/sync.Caddyfile` | site (from `deploy/caddy/`), imported by `/etc/caddy/Caddyfile` |
 | `/usr/local/sbin/engram-sync-backup.sh` | nightly WAL-safe snapshot → `/var/backups/engram-sync` (7-day retention; timer 03:17 UTC) |
 
@@ -29,11 +29,48 @@ Firewall: ufw, only 22/80/443 open. sshd: key-only (`PasswordAuthentication no`,
 
 ```bash
 cargo build --release -p engramd-sync          # locally
-ssh hetzner-sync 'systemctl stop engramd-sync'
+scp deploy/systemd/engramd-sync.service hetzner-sync:/etc/systemd/system/
+ssh hetzner-sync 'systemctl daemon-reload && systemctl stop engramd-sync'
 scp target/release/engramd-sync hetzner-sync:/usr/local/bin/engramd-sync
 ssh hetzner-sync 'systemctl start engramd-sync && curl -s 127.0.0.1:8788/health'
-curl -s https://sync.engram.ellmstack.dev/health
+curl -s https://sync.ellmstack.dev/health
 ```
+
+The unit on the box must match `deploy/systemd/engramd-sync.service` — it
+carries the managed-relay flags (`--rp-id`, `--origin`, `--quota-*`).
+Schema migrations are automatic on startup (new tables only, no ALTERs);
+the DB is safe to open on an older binary, which just ignores the extra
+tables. A DB restore (backup snapshot) is therefore compatible with both
+old and new binaries.
+
+## Accounts (milestone 1.2, shipped 2026-08-15)
+
+- **Passkeys:** registration IS sign-up; sessions are Bearer tokens in the
+  browser's localStorage (7-day TTL, sha256 at rest). Ceremony state is an
+  in-memory store with a 300s TTL — a relay **restart drops in-flight
+  ceremonies**, users just start over. This also means passkey auth needs a
+  **single-instance** relay (the managed relay is one process; a HA
+  deployment would need shared ceremony state).
+- **RP ID is `ellmstack.dev`** — a registrable domain suffix of the vault
+  UI origin (`https://engram.ellmstack.dev`). Passkeys bind to the RP ID:
+  **do not change `--rp-id`** unless you accept orphaning every passkey.
+  Adding a new UI origin to `--origin` (comma-separated) is safe.
+- **Quotas** apply to account-minted keys only: default 1 device + 1 GiB
+  per account (server defaults from the unit flags; per-account overrides
+  in the `accounts` table await billing, 1.3). Exceeding them rejects the
+  whole push batch with 402 and surfaces in the user's Sync & Team panel as
+  `last_push_error`. Static `SYNC_API_KEYS` entries are exempt.
+- **Loopback wildcard:** keyless loopback requests are superuser only while
+  no unrevoked account keys exist; the first `/account/keys` mint flips the
+  relay to require Bearer auth everywhere. On this box the relay binds
+  loopback anyway, so the wildcard was never remotely reachable.
+- **Key hygiene:** `/account/keys` shows the full key once; the DB stores
+  only `sha256(key)` — a DB leak cannot recover account keys. Revocation is
+  soft (row kept as audit trail).
+- **Browser e2e** (human step, on this box): open
+  https://engram.ellmstack.dev (basic auth), Settings → Account → Register
+  passkey → Sign out → Sign in → mint a key → "Connect this device" →
+  restart engramd → Sync & Team shows this device's label and a green push.
 
 ## Add / rotate an API key
 
@@ -98,3 +135,20 @@ if that record is ever added.
 - [x] Server-side only sees ciphertext: relay DB rows contain no plaintext
       (spot-check `sqlite3 /var/lib/engram-sync/sync.db 'select * from sync_blobs limit 3'`)
 - [x] Snapshot timer ran (`/var/backups/engram-sync` has a db snapshot)
+
+## Verification checklist (milestone 1.2) — 2026-08-15
+
+- [ ] `https://sync.ellmstack.dev/health` green with the 1.2 binary + unit flags
+- [ ] Static-key regression: existing routes (push/pull/stats/devices) still green
+      with the operator key
+- [ ] Schema on box: `sqlite3 /var/lib/engram-sync/sync.db '.tables'` lists
+      `accounts passkeys sessions api_keys device_labels`; aggregates (0
+      accounts / 0 keys) match `/account` 401-until-registered
+- [ ] Browser e2e (human): register → sign out → sign in → mint key → connect
+      device → restart daemon → push/pull green + device label in panel
+- [ ] Quota: second device on an account key gets 402, visible as
+      `last_push_error` in Sync & Team; static key unaffected
+
+Caddy: **no changes** — the relay stays behind the existing TLS site; the
+account flow is browser→relay CORS calls with a Bearer token in
+localStorage, nothing new terminates at Caddy.

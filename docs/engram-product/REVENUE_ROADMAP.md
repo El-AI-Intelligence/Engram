@@ -8,13 +8,13 @@
 1. **Local-first + E2E stays.** Zero-knowledge encryption is the moat. Every paid layer is optional — a self-hoster gets the full product forever.
 2. **Flat pricing, no seats, no metering.** Customers pay one price per plan. No per-seat or per-request economics, for us or for them.
 3. **Flat infra costs.** No per-request third-party APIs in any hot path. Embeddings stay local (ONNX/candle). Any cloud LLM use is BYO-key or local-model.
-4. **The core never closes.** Only the control plane (accounts, billing, team admin) is proprietary — and it's thin enough that it lives outside this repo anyway.
+4. **The core never closes.** Only billing and team admin are proprietary — and they're thin enough to live outside this repo anyway. (Accounts moved into the MIT relay in 1.2: passkey-only accounts hold no PII, so there was nothing private to protect — the self-hosting escape hatch is the real privacy feature.)
 
 ## What exists today (verified 2026-08-12)
 
 - `engramd` — local daemon with ONNX embeddings, FTS5 + vector + QEM holographic memory, REST + WebSocket API, MCP server (`engramd-mcp`), privacy controls (audit/purge/retention)
 - E2E sync **client** in `engramd` (`/sync/status`, `sync_server_url` config) — edit propagation via `modified_at` push cursor (2026-08-14)
-- `engramd-sync` — sync **relay server**: stateless "dumb pipe" for encrypted blobs, HMAC verification, token-bucket rate limiting, tombstones with 30-day retention, API-key auth. *Built; running locally, public deploy pending.*
+- `engramd-sync` — sync **relay server**: "dumb pipe" for encrypted blobs, HMAC verification, token-bucket rate limiting, tombstones with 30-day retention, API-key auth, plus (1.2) passkey accounts, per-account keys, device labels, and quota enforcement. Live at `sync.ellmstack.dev`.
 - **Shared-vault v0 (teams) shipped 2026-08-14:** `vault_id` + passphrase multi-device sync, device roster endpoint, `/teams/status`, Settings "Sync & Team" panel. Zero-knowledge core untouched — the server still only sees device IDs and blob counts.
 - Live site: landing + vault UI + API behind Caddy basic auth
 - Guardrail platform experience (WebAuthn accounts, admin dashboard, roles) to reuse for the control plane
@@ -30,7 +30,7 @@ The Obsidian play: sell the cloud layer of a local-first product. The relay alre
 | Milestone | Work | Est. |
 |---|---|---|
 | 1.1 Deploy relay | **Shipped 2026-08-15:** `engramd-sync` live at `sync.ellmstack.dev` (Hetzner, Caddy + LE TLS, systemd + sandbox, nightly snapshots). Verified two-device bidirectional E2E round trip through the public URL; relay DB audit shows only IDs/vector clocks/ciphertext/HMAC — zero plaintext. Runbook: `deploy/sync-relay.md`. | done |
-| 1.2 Accounts + devices | WebAuthn accounts (reuse guardrail's auth), per-account API keys, device registry in the vault UI, quota flags (devices, bytes) | 2–3 wks |
+| 1.2 Accounts + devices | **Shipped 2026-08-15:** standalone passkey accounts in `engramd-sync` (MIT, in-repo — fresh WebAuthn code, same crates as guardrail but no shared code), per-account API keys (`en_` prefix, sha256 at rest, shown once, soft revoke), device registry with labels in the vault UI, quota flags (devices + bytes, 0 = unlimited, whole-batch 402 with `last_push_error` surfacing, static keys exempt). Account panel in the vault SPA: passkey register/sign-in, quota bars, key list + "Connect this device". Managed relay runs with `--rp-id ellmstack.dev --quota-devices 1 --quota-bytes 1 GiB`; self-hosters get everything. Billing (1.3) only needs to set per-account quota overrides + email on Stripe. | done |
 | 1.3 Billing | Stripe flat plan **Solo $4/mo**; webhook → quota flags (relay was designed for this: "billing is handled by a separate service") | 1 wk |
 | 1.4 Restore points | Server-side snapshot markers; "restore from N days ago" in the vault UI | 1 wk |
 
@@ -89,8 +89,8 @@ Layer 1 pays for the infra and de-risks accounts/billing. Layer 2's control plan
 
 ## What stays MIT vs. what stays private
 
-- **MIT (this repo):** `axiom-engram`, `engramd`, `engramd-sync`, `engramd-mcp`, both UIs, deploy configs. Self-hosters get everything — that's the trust engine.
-- **Private services (never in this repo):** the control plane (accounts, billing, team admin), Stripe integration, digest delivery. Thin layers by design.
+- **MIT (this repo):** `axiom-engram`, `engramd`, `engramd-sync`, `engramd-mcp`, both UIs, deploy configs — including the 1.2 passkey accounts, API keys, and quota enforcement that live in `engramd-sync`. Self-hosters get everything — that's the trust engine.
+- **Private services (never in this repo):** billing + Stripe integration (1.3; also sets per-account quota overrides), team admin (Layer 2), digest email/push delivery. Thin layers by design — accounts moved into the MIT relay in 1.2 because they hold no PII (passkeys only).
 
 ## Open questions
 
