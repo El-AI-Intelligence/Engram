@@ -133,6 +133,9 @@ pub struct ApiKeyEntry {
     /// Vaults this key administers (can revoke devices). Only meaningful
     /// for scoped keys; unscoped keys are implicitly admin everywhere.
     pub admin_vaults: HashSet<String>,
+    /// Owning account for keys minted via /account/keys (None for static
+    /// env keys). Quota enforcement keys on this (Phase 4).
+    pub account_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -491,6 +494,7 @@ fn parse_api_keys(raw: &str) -> HashMap<String, Arc<ApiKeyEntry>> {
                 rate: rate.max(1.0),
                 vaults: None,
                 admin_vaults: HashSet::new(),
+                account_id: None,
             }),
             Some(scope) => {
                 let mut vaults = HashSet::new();
@@ -520,6 +524,7 @@ fn parse_api_keys(raw: &str) -> HashMap<String, Arc<ApiKeyEntry>> {
                     rate: rate.max(1.0),
                     vaults: Some(vaults),
                     admin_vaults,
+                    account_id: None,
                 })
             }
         };

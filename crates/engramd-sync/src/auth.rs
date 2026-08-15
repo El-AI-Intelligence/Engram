@@ -34,7 +34,6 @@ pub const CEREMONY_TTL: Duration = Duration::from_secs(300);
 /// Account API keys are self-describing: `en_` + 32 random bytes
 /// (base64url). Served keys are 43 chars, comfortably above the 16-char
 /// floor for the legacy static-key parser.
-#[allow(dead_code)] // consumed in Phase 3 (account keys)
 pub const API_KEY_PREFIX: &str = "en_";
 
 /// sha256 of arbitrary bytes — the one-way step before storing or looking
@@ -44,7 +43,6 @@ pub fn hash_bytes(bytes: &[u8]) -> [u8; 32] {
 }
 
 /// sha256 of an API key (used for at-rest storage and hash-indexed lookup).
-#[allow(dead_code)] // consumed in Phase 3 (account keys)
 pub fn hash_key(key: &str) -> [u8; 32] {
     hash_bytes(key.as_bytes())
 }
@@ -56,7 +54,6 @@ pub fn hash_token(token: &str) -> [u8; 32] {
 
 /// Stable base64url (no padding) of a key hash — used as the rate-limiter
 /// map key so plaintext keys never live in limiter state.
-#[allow(dead_code)] // consumed in Phase 3 (account keys)
 pub fn hash_b64(hash: &[u8; 32]) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash)
 }
@@ -70,7 +67,6 @@ fn random_base64url(n_bytes: usize) -> anyhow::Result<String> {
 }
 
 /// Mint a fresh account API key: `en_` + 32 random bytes (base64url).
-#[allow(dead_code)] // consumed in Phase 3 (account keys)
 pub fn generate_api_key() -> anyhow::Result<String> {
     Ok(format!("{API_KEY_PREFIX}{}", random_base64url(32)?))
 }
