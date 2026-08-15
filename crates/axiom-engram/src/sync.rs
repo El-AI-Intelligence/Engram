@@ -44,6 +44,12 @@ pub struct PushResponse {
     pub accepted: usize,
     /// Blob IDs that were rejected (stale vector clocks).
     pub rejected: Vec<String>,
+    /// Device IDs in this batch that the server has revoked. The client
+    /// surfaces these so a revoked device's operator knows to contact the
+    /// team admin (a zero-knowledge relay can block pushes, but only a
+    /// re-key removes the passphrase from the device).
+    #[serde(default)]
+    pub revoked_devices: Vec<String>,
 }
 
 /// Request: pull changes since a given point.

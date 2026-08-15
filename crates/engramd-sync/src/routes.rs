@@ -1,6 +1,6 @@
 // ── Sync server routes ─────────────────────────────────────────────────────
 
-use crate::SyncState;
+use crate::{ApiKeyEntry, SyncState};
 use axiom_engram::sync::{PullRequest, PullResponse, PushRequest, PushResponse, SyncBlob, SyncHealth};
 use axum::{
     extract::{Path, Query, State},
@@ -9,6 +9,8 @@ use axum::{
     Json, Router,
 };
 use serde_json::json;
+use std::collections::HashSet;
+use std::sync::Arc;
 
 pub fn router() -> Router<SyncState> {
     Router::new()
@@ -17,6 +19,10 @@ pub fn router() -> Router<SyncState> {
         .route("/v1/vaults/{vault_id}/pull", get(pull))
         .route("/v1/vaults/{vault_id}/stats", get(stats))
         .route("/v1/vaults/{vault_id}/devices", get(devices))
+        .route(
+            "/v1/vaults/{vault_id}/devices/{device_id}",
+            axum::routing::delete(revoke_device),
+        )
 }
 
 /// Server health. No auth required (public endpoint).
@@ -56,7 +62,8 @@ async fn health(State(state): State<SyncState>) -> Json<SyncHealth> {
     })
 }
 
-/// Push a batch of encrypted blobs. Rejects stale vector clocks.
+/// Push a batch of encrypted blobs. Rejects stale vector clocks and blobs
+/// from devices the team admin has revoked.
 async fn push(
     State(state): State<SyncState>,
     headers: HeaderMap,
@@ -64,7 +71,8 @@ async fn push(
     Json(req): Json<PushRequest>,
 ) -> Result<Json<PushResponse>, (StatusCode, Json<serde_json::Value>)> {
     // Auth + rate limit
-    authenticate(&state, &headers).await?;
+    let key = authenticate(&state, &headers).await?;
+    authorize_vault(&key, &vault_id)?;
 
     if req.blobs.is_empty() {
         return Err(err_json(400, "no blobs provided"));
@@ -78,6 +86,21 @@ async fn push(
     }
 
     let conn = state.conn.lock().await;
+
+    // Revoked devices for this vault (admin-added; blocks their pushes)
+    let revoked: HashSet<String> = {
+        let mut stmt = match conn.prepare(
+            "SELECT device_id FROM revoked_devices WHERE vault_id = ?1",
+        ) {
+            Ok(s) => s,
+            Err(e) => return Err(err_json(500, format!("Database error: {e}"))),
+        };
+        let rows = stmt.query_map(rusqlite::params![vault_id], |r| r.get::<_, String>(0));
+        rows.map(|rs| rs.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    };
+    let mut revoked_seen: HashSet<String> = HashSet::new();
+
     let mut accepted = 0usize;
     let mut rejected: Vec<String> = Vec::new();
 
@@ -91,6 +114,14 @@ async fn push(
         // Verify vault_id matches path
         if blob.vault_id != vault_id {
             rejected.push(blob.memory_id.clone());
+            continue;
+        }
+
+        // Reject blobs from revoked devices (a zero-knowledge relay can
+        // block pushes; removing the passphrase needs a re-key)
+        if revoked.contains(&blob.device_id) {
+            rejected.push(blob.memory_id.clone());
+            revoked_seen.insert(blob.device_id.clone());
             continue;
         }
 
@@ -133,7 +164,13 @@ async fn push(
         }
     }
 
-    Ok(Json(PushResponse { accepted, rejected }))
+    let mut revoked_devices: Vec<String> = revoked_seen.into_iter().collect();
+    revoked_devices.sort();
+    Ok(Json(PushResponse {
+        accepted,
+        rejected,
+        revoked_devices,
+    }))
 }
 
 /// Pull blobs updated since a given timestamp.
@@ -144,7 +181,8 @@ async fn pull(
     Query(req): Query<PullRequest>,
 ) -> Result<Json<PullResponse>, (StatusCode, Json<serde_json::Value>)> {
     // Auth + rate limit
-    authenticate(&state, &headers).await?;
+    let key = authenticate(&state, &headers).await?;
+    authorize_vault(&key, &vault_id)?;
 
     let conn = state.conn.lock().await;
     let limit = req.limit.min(1000);
@@ -239,7 +277,8 @@ async fn stats(
     Path(vault_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     // Auth + rate limit — hard error on failure (not soft like before)
-    authenticate(&state, &headers).await?;
+    let key = authenticate(&state, &headers).await?;
+    authorize_vault(&key, &vault_id)?;
 
     let conn = state.conn.lock().await;
     let count: u64 = conn
@@ -268,19 +307,27 @@ async fn stats(
 /// Devices that have pushed blobs to a vault — the team roster backing the
 /// shared-vault v0 UI. Auth required, same as `stats`. The server only knows
 /// device_ids (blobs carry no labels), so the aggregating daemon annotates
-/// `is_self` for its UI.
+/// `is_self` for its UI. Each entry also carries `revoked`, set by the team
+/// admin via `DELETE /v1/vaults/{vault_id}/devices/{device_id}`.
 async fn devices(
     State(state): State<SyncState>,
     headers: HeaderMap,
     Path(vault_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    authenticate(&state, &headers).await?;
+    let key = authenticate(&state, &headers).await?;
+    authorize_vault(&key, &vault_id)?;
 
     let conn = state.conn.lock().await;
     let mut stmt = conn
         .prepare(
-            "SELECT device_id, MAX(created_at) AS last_seen, COUNT(*) AS blob_count \
-             FROM sync_blobs WHERE vault_id = ?1 GROUP BY device_id ORDER BY last_seen DESC",
+            "SELECT s.device_id, MAX(s.created_at) AS last_seen, COUNT(*) AS blob_count, \
+                    (r.revoked_at IS NOT NULL) AS revoked \
+             FROM sync_blobs s \
+             LEFT JOIN revoked_devices r \
+                    ON r.vault_id = s.vault_id AND r.device_id = s.device_id \
+             WHERE s.vault_id = ?1 \
+             GROUP BY s.device_id, r.revoked_at \
+             ORDER BY last_seen DESC",
         )
         .map_err(|e| {
             (
@@ -294,6 +341,7 @@ async fn devices(
                 r.get::<_, String>(0)?,
                 r.get::<_, Option<String>>(1)?,
                 r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)? != 0,
             ))
         })
         .map_err(|e| {
@@ -305,7 +353,7 @@ async fn devices(
 
     let mut device_list = Vec::new();
     for row in rows {
-        let (device_id, last_seen, blob_count) = row.map_err(|e| {
+        let (device_id, last_seen, blob_count, revoked) = row.map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": e.to_string()})),
@@ -315,6 +363,7 @@ async fn devices(
             "device_id": device_id,
             "last_seen": last_seen,
             "blob_count": blob_count,
+            "revoked": revoked,
         }));
     }
 
@@ -324,7 +373,50 @@ async fn devices(
     })))
 }
 
+/// Revoke a device: the relay stops accepting its pushes (the roster marks
+/// it revoked). Requires a key that administers this vault (`+admin` scope
+/// on a scoped key, or any unscoped superuser key).
+///
+/// Honest zero-knowledge boundary: pulls are vault-scoped, not
+/// device-scoped, so the relay cannot stop the device from reading blobs
+/// or decrypting what it already holds. Full removal means re-keying the
+/// vault (new passphrase) or per-member key revocation — the control-plane
+/// layer's job.
+async fn revoke_device(
+    State(state): State<SyncState>,
+    headers: HeaderMap,
+    Path((vault_id, device_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let key = authenticate(&state, &headers).await?;
+    authorize_vault(&key, &vault_id)?;
+    if !vault_admin(&key, &vault_id) {
+        return Err(err_json(
+            403,
+            "key is not an admin for this vault (needs `vault+admin` scope)",
+        ));
+    }
+
+    let conn = state.conn.lock().await;
+    conn.execute(
+        "INSERT OR REPLACE INTO revoked_devices (vault_id, device_id, revoked_at) \
+         VALUES (?1, ?2, ?3)",
+        rusqlite::params![vault_id, device_id, chrono::Utc::now().to_rfc3339()],
+    )
+    .map_err(|e| err_json(500, format!("Database error: {e}")))?;
+
+    Ok(Json(json!({
+        "vault_id": vault_id,
+        "device_id": device_id,
+        "revoked": true,
+    })))
+}
+
 // ── Auth ────────────────────────────────────────────────────────────────────
+
+/// The key that authenticated this request (rate-limited).
+struct AuthenticatedKey {
+    entry: Arc<ApiKeyEntry>,
+}
 
 /// Authenticate a request using the `Authorization: Bearer <key>` header.
 ///
@@ -333,10 +425,16 @@ async fn devices(
 async fn authenticate(
     state: &SyncState,
     headers: &HeaderMap,
-) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
-    // No keys configured + loopback → auth is optional
+) -> Result<AuthenticatedKey, (StatusCode, Json<serde_json::Value>)> {
+    // No keys configured + loopback → auth is optional (wildcard superuser)
     if state.api_keys.is_empty() && state.is_loopback {
-        return Ok(());
+        return Ok(AuthenticatedKey {
+            entry: Arc::new(ApiKeyEntry {
+                rate: f64::MAX,
+                vaults: None,
+                admin_vaults: HashSet::new(),
+            }),
+        });
     }
 
     // Extract Bearer token
@@ -354,23 +452,47 @@ async fn authenticate(
     }
 
     // Constant-time key lookup
-    let (key, rate) = state
+    let (key, entry) = state
         .api_keys
         .iter()
         .find(|(k, _)| constant_time_eq(k.as_bytes(), token.as_bytes()))
-        .map(|(k, r)| (k.clone(), *r))
+        .map(|(k, e)| (k.clone(), e.clone()))
         .ok_or_else(|| err_json(401, "invalid API key"))?;
 
     // Rate limit check
     let mut limiters = state.rate_limiters.lock().await;
     let limiter = limiters
         .entry(key)
-        .or_insert_with(|| crate::RateLimiter::new(rate));
+        .or_insert_with(|| crate::RateLimiter::new(entry.rate));
     if !limiter.allow() {
         return Err(err_json(429, "rate limit exceeded"));
     }
 
-    Ok(())
+    Ok(AuthenticatedKey { entry })
+}
+
+/// Scope check: can this key touch `vault_id` at all?
+fn authorize_vault(
+    key: &AuthenticatedKey,
+    vault_id: &str,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    match &key.entry.vaults {
+        None => Ok(()),
+        Some(vaults) if vaults.contains(vault_id) => Ok(()),
+        Some(_) => Err(err_json(
+            403,
+            "API key is not authorized for this vault",
+        )),
+    }
+}
+
+/// Admin check: unscoped keys are the legacy superuser; scoped keys must
+/// carry the `+admin` suffix for this vault.
+fn vault_admin(key: &AuthenticatedKey, vault_id: &str) -> bool {
+    match &key.entry.vaults {
+        None => true,
+        Some(_) => key.entry.admin_vaults.contains(vault_id),
+    }
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────

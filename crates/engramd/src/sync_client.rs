@@ -899,6 +899,16 @@ async fn push_local_changes(
                 count,
                 resp.rejected.len()
             );
+            if !resp.revoked_devices.is_empty() {
+                // The relay blocked our pushes: a team admin revoked this
+                // device. Surfaces in the daemon log; full removal needs a
+                // re-key (the passphrase is still on this device).
+                tracing::warn!(
+                    "sync: this device has been REVOKED from vault on the sync server \
+                     (device_id {}). Pushes are blocked — contact the team admin.",
+                    resp.revoked_devices.join(", ")
+                );
+            }
             // Only record clocks for accepted blobs (not rejected ones).
             // Rejected blobs had a lower-or-equal clock than what the server
             // already has, so recording an inflated clock would mask remote updates.

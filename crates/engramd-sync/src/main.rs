@@ -7,20 +7,33 @@
 //!   - Billing is handled by a separate service (Stripe webhooks)
 //!
 //! API:
-//!   GET  /health                                    — server health
-//!   POST /v1/vaults/{vault_id}/push                 — push encrypted blobs
-//!   GET  /v1/vaults/{vault_id}/pull?since=&limit=   — pull changes
-//!   GET  /v1/vaults/{vault_id}/stats                — vault statistics
+//!   GET    /health                                       — server health
+//!   POST   /v1/vaults/{vault_id}/push                    — push encrypted blobs
+//!   GET    /v1/vaults/{vault_id}/pull?since=&limit=      — pull changes
+//!   GET    /v1/vaults/{vault_id}/stats                   — vault statistics
+//!   GET    /v1/vaults/{vault_id}/devices                 — device roster
+//!   DELETE /v1/vaults/{vault_id}/devices/{device_id}     — revoke a device
 //!
 //! Auth:
-//!   Set SYNC_API_KEYS=key1,key2 in env. Clients send
+//!   Set SYNC_API_KEYS in env. Clients send
 //!   Authorization: Bearer <key>. Auth is optional on loopback,
 //!   required on non-loopback (matches Guardrail's default-secure pattern).
+//!
+//!   Key format (comma-separated entries):
+//!     key                        — all vaults, rate limit 100 req/s
+//!     key:rate                   — all vaults, custom rate limit
+//!     key:rate:vault1;vault2     — scoped to the listed vaults only
+//!     key:rate:vault1+admin      — scoped, and administers vault1
+//!   Unscoped keys keep the original all-vaults behavior (and are the
+//!   superuser: they may revoke devices on any vault). Scoped keys can
+//!   only touch their own vaults; +admin also lets a key revoke devices
+//!   on that vault — the substrate a hosted control plane mints
+//!   per-member keys against.
 
 mod routes;
 
 use clap::Parser;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -79,14 +92,26 @@ impl RateLimiter {
     }
 }
 
+/// One API key entry: rate limit + optional per-vault scoping.
+#[derive(Clone, Debug)]
+pub struct ApiKeyEntry {
+    pub rate: f64,
+    /// `None` = unscoped: the key reaches every vault (original behavior,
+    /// and the legacy superuser). `Some(vaults)` = restricted to those.
+    pub vaults: Option<HashSet<String>>,
+    /// Vaults this key administers (can revoke devices). Only meaningful
+    /// for scoped keys; unscoped keys are implicitly admin everywhere.
+    pub admin_vaults: HashSet<String>,
+}
+
 #[derive(Clone)]
 pub struct SyncState {
     pub conn: Arc<Mutex<rusqlite::Connection>>,
     pub start_time: chrono::DateTime<chrono::Utc>,
     pub data_dir: PathBuf,
-    /// Known API keys: key string → requests-per-second rate limit.
+    /// Known API keys: key string → entry (rate limit + scope).
     /// Empty map → auth disabled (loopback mode).
-    pub api_keys: Arc<HashMap<String, f64>>,
+    pub api_keys: Arc<HashMap<String, Arc<ApiKeyEntry>>>,
     /// Rate limiter state per key.
     pub rate_limiters: Arc<Mutex<HashMap<String, RateLimiter>>>,
     /// Whether the server is bound to loopback (affects auth strictness).
@@ -146,7 +171,13 @@ async fn main() -> anyhow::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_sync_vault_created
             ON sync_blobs(vault_id, created_at);
         CREATE INDEX IF NOT EXISTS idx_sync_vault_memory
-            ON sync_blobs(vault_id, memory_id);",
+            ON sync_blobs(vault_id, memory_id);
+        CREATE TABLE IF NOT EXISTS revoked_devices (
+            vault_id   TEXT NOT NULL,
+            device_id  TEXT NOT NULL,
+            revoked_at TEXT NOT NULL,
+            PRIMARY KEY (vault_id, device_id)
+        );",
     )?;
 
     // ── Run tombstone cleanup on startup ───────────────────────────────
@@ -226,7 +257,11 @@ async fn main() -> anyhow::Result<()> {
         .with_state(state)
         .layer(
             CorsLayer::new()
-                .allow_methods([axum::http::Method::GET, axum::http::Method::POST])
+                .allow_methods([
+                    axum::http::Method::GET,
+                    axum::http::Method::POST,
+                    axum::http::Method::DELETE,
+                ])
                 .allow_headers([
                     axum::http::header::CONTENT_TYPE,
                     axum::http::header::AUTHORIZATION,
@@ -275,24 +310,32 @@ async fn shutdown_signal() {
 }
 
 /// Load API keys from the SYNC_API_KEYS environment variable.
-/// Format: "key1:10,key2:50" where the number after `:` is the
-/// per-second rate limit (default 100). Keys shorter than 16 chars
-/// are rejected.
-fn load_api_keys() -> HashMap<String, f64> {
-    let raw = match std::env::var("SYNC_API_KEYS") {
-        Ok(v) => v,
-        Err(_) => return HashMap::new(),
-    };
+fn load_api_keys() -> HashMap<String, Arc<ApiKeyEntry>> {
+    match std::env::var("SYNC_API_KEYS") {
+        Ok(v) => parse_api_keys(&v),
+        Err(_) => HashMap::new(),
+    }
+}
 
+/// Parse a SYNC_API_KEYS value. Entry formats:
+///   key                          — all vaults, rate limit 100 req/s
+///   key:rate                     — all vaults, custom rate limit
+///   key:rate:vault1;vault2       — scoped to the listed vaults only
+///   key:rate:vault1+admin        — scoped, administers vault1
+/// The scope list is `;`-separated (`,` already separates entries).
+/// Keys shorter than 16 chars are skipped with a warning.
+fn parse_api_keys(raw: &str) -> HashMap<String, Arc<ApiKeyEntry>> {
     let mut keys = HashMap::new();
     for entry in raw.split(',') {
         let entry = entry.trim();
         if entry.is_empty() {
             continue;
         }
-        let (key, rate) = match entry.split_once(':') {
-            Some((k, r)) => (k.to_string(), r.parse::<f64>().unwrap_or(100.0)),
-            None => (entry.to_string(), 100.0),
+        let (key, rate, scope) = match entry.splitn(3, ':').collect::<Vec<_>>().as_slice() {
+            [k] => (k.to_string(), 100.0, None),
+            [k, r] => (k.to_string(), r.parse::<f64>().unwrap_or(100.0), None),
+            [k, r, s] => (k.to_string(), r.parse::<f64>().unwrap_or(100.0), Some(s.to_string())),
+            _ => unreachable!(),
         };
         if key.len() < 16 {
             tracing::warn!(
@@ -302,7 +345,107 @@ fn load_api_keys() -> HashMap<String, f64> {
             );
             continue;
         }
-        keys.insert(key, rate.max(1.0));
+
+        let scope = match scope {
+            None => None,
+            Some(s) if s.trim().is_empty() => {
+                tracing::warn!(
+                    "API key '{}...' has an empty vault scope. Skipping — use `key:rate` for unscoped.",
+                    &key[..key.len().min(8)]
+                );
+                continue;
+            }
+            Some(s) => Some(s),
+        };
+
+        let entry = match scope {
+            None => Arc::new(ApiKeyEntry {
+                rate: rate.max(1.0),
+                vaults: None,
+                admin_vaults: HashSet::new(),
+            }),
+            Some(scope) => {
+                let mut vaults = HashSet::new();
+                let mut admin_vaults = HashSet::new();
+                for item in scope.split(';') {
+                    let item = item.trim();
+                    if item.is_empty() {
+                        continue;
+                    }
+                    if let Some(v) = item.strip_suffix("+admin") {
+                        if !v.is_empty() {
+                            vaults.insert(v.to_string());
+                            admin_vaults.insert(v.to_string());
+                        }
+                    } else {
+                        vaults.insert(item.to_string());
+                    }
+                }
+                if vaults.is_empty() {
+                    tracing::warn!(
+                        "API key '{}...' has no valid vaults in its scope. Skipping.",
+                        &key[..key.len().min(8)]
+                    );
+                    continue;
+                }
+                Arc::new(ApiKeyEntry {
+                    rate: rate.max(1.0),
+                    vaults: Some(vaults),
+                    admin_vaults,
+                })
+            }
+        };
+        keys.insert(key, entry);
     }
     keys
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const K1: &str = "key-one-000000001";
+    const K2: &str = "key-two-000000002";
+
+    #[test]
+    fn unscoped_key_keeps_original_behavior() {
+        let keys = parse_api_keys(K1);
+        let entry = keys.get(K1).expect("key present");
+        assert!(entry.vaults.is_none(), "no scope → all vaults");
+        assert_eq!(entry.rate, 100.0);
+        assert!(entry.admin_vaults.is_empty());
+    }
+
+    #[test]
+    fn rate_limit_parses_and_defaults() {
+        let keys = parse_api_keys(&format!("{K1}:50"));
+        assert_eq!(keys.get(K1).unwrap().rate, 50.0);
+        assert_eq!(parse_api_keys(K2).get(K2).unwrap().rate, 100.0);
+        // Garbage rate falls back to default
+        assert_eq!(parse_api_keys(&format!("{K1}:fast")).get(K1).unwrap().rate, 100.0);
+    }
+
+    #[test]
+    fn scoped_key_lists_vaults_and_admins() {
+        let keys = parse_api_keys(&format!("{K1}:10:vault-a;vault-b+admin"));
+        let entry = keys.get(K1).unwrap();
+        let vaults = entry.vaults.as_ref().expect("scoped");
+        assert!(vaults.contains("vault-a"));
+        assert!(vaults.contains("vault-b"), "admin implies access");
+        assert!(entry.admin_vaults.contains("vault-b"));
+        assert!(!entry.admin_vaults.contains("vault-a"));
+    }
+
+    #[test]
+    fn invalid_entries_are_skipped() {
+        // Too short
+        assert!(parse_api_keys("short").is_empty());
+        // Empty scope
+        assert!(parse_api_keys(&format!("{K1}:10:")).is_empty());
+        // Scope with only empty items
+        assert!(parse_api_keys(&format!("{K1}:10:,")).is_empty());
+        // Empty whole value
+        assert!(parse_api_keys("").is_empty());
+        assert!(parse_api_keys(" , ").is_empty());
+    }
 }
