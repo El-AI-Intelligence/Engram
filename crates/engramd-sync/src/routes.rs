@@ -20,6 +20,10 @@ pub fn router() -> Router<SyncState> {
         .route("/v1/vaults/{vault_id}/stats", get(stats))
         .route("/v1/vaults/{vault_id}/devices", get(devices))
         .route(
+            "/v1/vaults/{vault_id}/devices/register",
+            axum::routing::post(register_device),
+        )
+        .route(
             "/v1/vaults/{vault_id}/devices/{device_id}",
             axum::routing::delete(revoke_device),
         )
@@ -372,10 +376,12 @@ async fn stats(
 }
 
 /// Devices that have pushed blobs to a vault — the team roster backing the
-/// shared-vault v0 UI. Auth required, same as `stats`. The server only knows
-/// device_ids (blobs carry no labels), so the aggregating daemon annotates
-/// `is_self` for its UI. Each entry also carries `revoked`, set by the team
-/// admin via `DELETE /v1/vaults/{vault_id}/devices/{device_id}`.
+/// shared-vault v0 UI. Auth required, same as `stats`. Labels come from the
+/// `device_labels` registry (daemons register their device.json label via
+/// `POST .../devices/register`); unregistered devices show `label: null`.
+/// The aggregating daemon annotates `is_self` for its UI. Each entry also
+/// carries `revoked`, set by the team admin via
+/// `DELETE /v1/vaults/{vault_id}/devices/{device_id}`.
 async fn devices(
     State(state): State<SyncState>,
     headers: HeaderMap,
@@ -388,12 +394,14 @@ async fn devices(
     let mut stmt = conn
         .prepare(
             "SELECT s.device_id, MAX(s.created_at) AS last_seen, COUNT(*) AS blob_count, \
-                    (r.revoked_at IS NOT NULL) AS revoked \
+                    (r.revoked_at IS NOT NULL) AS revoked, l.label \
              FROM sync_blobs s \
              LEFT JOIN revoked_devices r \
                     ON r.vault_id = s.vault_id AND r.device_id = s.device_id \
+             LEFT JOIN device_labels l \
+                    ON l.vault_id = s.vault_id AND l.device_id = s.device_id \
              WHERE s.vault_id = ?1 \
-             GROUP BY s.device_id, r.revoked_at \
+             GROUP BY s.device_id, r.revoked_at, l.label \
              ORDER BY last_seen DESC",
         )
         .map_err(|e| {
@@ -409,6 +417,7 @@ async fn devices(
                 r.get::<_, Option<String>>(1)?,
                 r.get::<_, i64>(2)?,
                 r.get::<_, i64>(3)? != 0,
+                r.get::<_, Option<String>>(4)?,
             ))
         })
         .map_err(|e| {
@@ -420,7 +429,7 @@ async fn devices(
 
     let mut device_list = Vec::new();
     for row in rows {
-        let (device_id, last_seen, blob_count, revoked) = row.map_err(|e| {
+        let (device_id, last_seen, blob_count, revoked, label) = row.map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": e.to_string()})),
@@ -431,6 +440,7 @@ async fn devices(
             "last_seen": last_seen,
             "blob_count": blob_count,
             "revoked": revoked,
+            "label": label,
         }));
     }
 
@@ -475,6 +485,60 @@ async fn revoke_device(
         "vault_id": vault_id,
         "device_id": device_id,
         "revoked": true,
+    })))
+}
+
+/// Register (or update) a device's human-readable label in a vault. The
+/// daemon calls this at sync-loop start so the roster can show who is who;
+/// `label` comes from the device's device.json (≤128 chars). Pure upsert —
+/// the device does not need to have pushed a blob yet, because the first
+/// register happens before the first push. Auth required; any key scoped
+/// to the vault may label devices in it.
+#[derive(serde::Deserialize)]
+struct DeviceLabelRequest {
+    device_id: String,
+    label: String,
+}
+
+async fn register_device(
+    State(state): State<SyncState>,
+    headers: HeaderMap,
+    Path(vault_id): Path<String>,
+    Json(body): Json<DeviceLabelRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let key = authenticate(&state, &headers).await?;
+    authorize_vault(&key, &vault_id)?;
+
+    if body.device_id.trim().is_empty() {
+        return Err(err_json(400, "device_id must be non-empty"));
+    }
+    if body.label.trim().is_empty() {
+        return Err(err_json(400, "label must be non-empty"));
+    }
+    if body.label.chars().count() > 128 {
+        return Err(err_json(400, "label must be at most 128 characters"));
+    }
+
+    let conn = state.conn.lock().await;
+    conn.execute(
+        "INSERT INTO device_labels (vault_id, device_id, label, updated_at) \
+         VALUES (?1, ?2, ?3, ?4) \
+         ON CONFLICT(vault_id, device_id) DO UPDATE SET \
+             label = excluded.label, updated_at = excluded.updated_at",
+        rusqlite::params![
+            vault_id,
+            body.device_id,
+            body.label,
+            chrono::Utc::now().to_rfc3339()
+        ],
+    )
+    .map_err(|e| err_json(500, format!("Database error: {e}")))?;
+
+    Ok(Json(json!({
+        "vault_id": vault_id,
+        "device_id": body.device_id,
+        "label": body.label,
+        "registered": true,
     })))
 }
 
@@ -671,6 +735,10 @@ mod tests {
              CREATE TABLE revoked_devices (
                  vault_id TEXT NOT NULL, device_id TEXT NOT NULL, revoked_at TEXT NOT NULL,
                  PRIMARY KEY (vault_id, device_id)
+             );
+             CREATE TABLE device_labels (
+                 vault_id TEXT NOT NULL, device_id TEXT NOT NULL, label TEXT NOT NULL,
+                 updated_at TEXT NOT NULL, PRIMARY KEY (vault_id, device_id)
              );",
         )
         .unwrap();
@@ -999,5 +1067,134 @@ mod tests {
         .await
         .expect("static keys exempt");
         assert_eq!(res.accepted, 1);
+    }
+
+    // ── Device registry (Phase 5) ────────────────────────────────────────
+
+    async fn do_register(
+        state: &SyncState,
+        token: &str,
+        vault: &str,
+        device_id: &str,
+        label: &str,
+    ) -> Result<axum::Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+        register_device(
+            State(state.clone()),
+            bearer(token),
+            Path(vault.to_string()),
+            Json(DeviceLabelRequest {
+                device_id: device_id.into(),
+                label: label.into(),
+            }),
+        )
+        .await
+    }
+
+    async fn do_devices(
+        state: &SyncState,
+        token: &str,
+        vault: &str,
+    ) -> Result<axum::Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+        devices(State(state.clone()), bearer(token), Path(vault.to_string())).await
+    }
+
+    #[tokio::test]
+    async fn register_device_upserts_label_and_roster_shows_it() {
+        let state = test_state();
+        seed_account_key(&state, "acct-1", Some("vault-a"), "en_devreg").await;
+
+        // First register, then re-register with a new label → upsert.
+        let res = do_register(&state, "en_devreg", "vault-a", "dev-1", "Laptop")
+            .await
+            .expect("register works");
+        assert_eq!(res["registered"], true);
+        let res = do_register(&state, "en_devreg", "vault-a", "dev-1", "Work laptop")
+            .await
+            .expect("re-register upserts");
+        assert_eq!(res["label"], "Work laptop");
+
+        // Blobs from dev-1 (labeled) and dev-2 (never registered).
+        {
+            let conn = state.conn.lock().await;
+            for (mid, dev) in [("m1", "dev-1"), ("m2", "dev-2")] {
+                conn.execute(
+                    "INSERT INTO sync_blobs (vault_id, memory_id, device_id, vector_clock, ciphertext, hmac, created_at, deleted) \
+                     VALUES ('vault-a', ?1, ?2, 1, 'x', 'h', 'now', 0)",
+                    rusqlite::params![mid, dev],
+                )
+                .unwrap();
+            }
+        }
+
+        let roster = do_devices(&state, "en_devreg", "vault-a")
+            .await
+            .expect("roster works");
+        let devices = roster["devices"].as_array().unwrap();
+        assert_eq!(devices.len(), 2);
+        let labeled = devices.iter().find(|d| d["device_id"] == "dev-1").unwrap();
+        assert_eq!(labeled["label"], "Work laptop");
+        let unlabeled = devices.iter().find(|d| d["device_id"] == "dev-2").unwrap();
+        assert_eq!(unlabeled["label"], serde_json::Value::Null);
+
+        // Upsert, not insert: exactly one label row for dev-1.
+        let conn = state.conn.lock().await;
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM device_labels WHERE vault_id = 'vault-a' AND device_id = 'dev-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    #[tokio::test]
+    async fn register_device_rejects_bad_labels() {
+        let state = test_state();
+        seed_account_key(&state, "acct-1", Some("vault-a"), "en_badlabel").await;
+
+        let err = do_register(&state, "en_badlabel", "vault-a", "dev-1", "")
+            .await
+            .expect_err("empty label");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+
+        let err = do_register(&state, "en_badlabel", "vault-a", "dev-1", &"x".repeat(129))
+            .await
+            .expect_err("label too long");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+
+        let err = do_register(&state, "en_badlabel", "vault-a", "  ", "Label")
+            .await
+            .expect_err("empty device id");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+
+        // The 128-char boundary itself is accepted.
+        let res = do_register(&state, "en_badlabel", "vault-a", "dev-1", &"x".repeat(128))
+            .await
+            .expect("128 chars is the limit, inclusive");
+        assert_eq!(res["registered"], true);
+    }
+
+    #[tokio::test]
+    async fn register_device_requires_auth_and_vault_scope() {
+        let state = test_state();
+        // Key scoped to vault-b: turns the loopback wildcard off and
+        // authorizes only vault-b.
+        seed_account_key(&state, "acct-1", Some("vault-b"), "en_scoped").await;
+
+        let err = do_register(&state, "en_scoped", "vault-a", "dev-1", "Laptop")
+            .await
+            .expect_err("out of scope");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+
+        let err = do_register(&state, "en_wrong", "vault-a", "dev-1", "Laptop")
+            .await
+            .expect_err("bad key");
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+
+        let res = do_register(&state, "en_scoped", "vault-b", "dev-1", "Laptop")
+            .await
+            .expect("scoped key registers in its vault");
+        assert_eq!(res["vault_id"], "vault-b");
     }
 }
