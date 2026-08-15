@@ -170,6 +170,12 @@ next cycle, and the receiving device preserves the original `modified_at`
 so it doesn't echo the blob back. Reading a memory (retrievals) and vault
 hygiene/consolidation do **not** re-push.
 
+The cursor is **per-memory** (schema v6): each row carries a `synced_at`
+stamp and re-pushes whenever `modified_at` moves past it. Pulling a blob
+stamps `synced_at` on the local row at apply time, and the pull path never
+touches the push filter — so pulled blobs can't strand older local edits
+(a failure mode of the previous global `last_push` cursor).
+
 ## Shared Vaults (Teams v0)
 
 A **team** in Engram v0 is just a set of devices that share two things:
@@ -368,10 +374,9 @@ If you're migrating from another memory system:
   consolidation promotions change rows without bumping `modified_at`, so
   those specific deltas don't propagate until the row changes again
   (deliberate — avoids bulk re-push storms).
-- **Global push cursor can strand older edits:** push selects memories
-  strictly after a single `last_push` timestamp, and pull advances that
-  cursor past the newest pulled blob. If an older un-pushed memory sits
-  behind a pulled blob's `modified_at` (e.g. after a cursor rewind or a
-  re-configured vault), it is skipped on the next cycle and stays local.
-  A per-memory push cursor (or push retry) is the proper fix — see
-  `engramd/sync_client.rs`.
+- **Deleting `sync_state.json` re-pushes everything:** the per-memory
+  cursor resets when no persisted push state exists, so removing the state
+  file (or a fresh device joining) re-pushes the full vault on the next
+  cycle. Harmless — the first pull bumps the local clock above the remote
+  max, so the server accepts — but it is a burst of traffic on large
+  vaults.
