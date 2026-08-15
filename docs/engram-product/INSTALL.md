@@ -28,6 +28,17 @@ docker run -v ./vault:/vault -p 8787:8787 ghcr.io/pixelphantomai/engramd:latest
 
 ## Post-install
 
+**Fastest path — one command does all three steps below:**
+
+```bash
+engram onboarding
+```
+
+It creates the vault, captures your first memory, and starts the daemon,
+then prints the dashboard URL and next steps (MCP, sync).
+
+Or step through it manually:
+
 1. **Initialize your vault** (interactive wizard):
    ```bash
    engram init

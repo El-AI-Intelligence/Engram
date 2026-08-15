@@ -21,8 +21,7 @@ AI agents forget everything between sessions. Engram fixes that:
 
 ```bash
 curl -fsSL https://engram.ellmstack.dev/install.sh | bash
-engram init          # create a vault
-engram daemon        # starts on http://localhost:8787
+engram onboarding    # 5-minute setup: vault, first memory, running daemon
 ```
 
 Open `http://localhost:8787` — the vault UI walks you through onboarding.
