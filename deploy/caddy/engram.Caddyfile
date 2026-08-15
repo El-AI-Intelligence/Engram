@@ -41,7 +41,7 @@ engram.ellmstack.dev {
 	# ── Authentication ──────────────────────────────────────────────────────
 	# Everything except the public landing page sits behind HTTP basic auth.
 	# Path prefixes mirror engramd's routers (crates/engramd/src/routes/*.rs).
-	@protected path /app /app/* /health /memories* /context* /consolidate* /analytics* /config /export /import /ws* /annotations* /searches* /privacy* /sync*
+	@protected path /app /app/* /health /memories* /context* /consolidate* /analytics* /config /export /import /ws* /annotations* /searches* /privacy* /sync* /teams* /digest*
 	basic_auth @protected {
 		{$ENGRAM_UI_USER} {$ENGRAM_UI_PASS_HASH}
 	}
@@ -58,7 +58,7 @@ engram.ellmstack.dev {
 
 	# ── JSON REST API → engramd on 127.0.0.1:8787 ──────────────────────────
 	# (/ws/events upgrades to WebSocket transparently through this proxy.)
-	@api path /health /memories* /context* /consolidate* /analytics* /config /export /import /ws* /annotations* /searches* /privacy* /sync*
+	@api path /health /memories* /context* /consolidate* /analytics* /config /export /import /ws* /annotations* /searches* /privacy* /sync* /teams* /digest*
 	handle @api {
 		reverse_proxy 127.0.0.1:8787 {
 			header_up Authorization "Bearer {$ENGRAMD_API_KEY}"

@@ -99,6 +99,19 @@ const api = {
   sync: {
     now: () => post('/sync/now'),
   },
+  digest: {
+    // Structured daemon errors (409 digest_disabled / llm_not_configured)
+    // carry a readable message — surface it instead of "409 Conflict".
+    weekly: async (days = 7, prose = false) => {
+      const r = await fetch(API + '/digest/weekly?days=' + days + (prose ? '&prose=1' : ''));
+      if (!r.ok) {
+        let msg = `${r.status} ${r.statusText}`;
+        try { const b = await r.json(); if (b?.error?.message) msg = b.error.message; } catch {}
+        throw new Error(msg);
+      }
+      return r.json();
+    },
+  },
 };
 
 // ── Router ────────────────────────────────────────────────────────────────
@@ -772,6 +785,123 @@ route('/stats', async () => {
     </div>
   `;
 
+  updateStatus();
+});
+
+// ── Weekly digest ─────────────────────────────────────────────────────────
+
+route('/digest', async () => {
+  const app = document.getElementById('app');
+  let days = 7;
+  let lastData = null;
+
+  const render = (d) => {
+    lastData = d;
+    const s = d.stats || {};
+    const memList = (items) => (items || []).map(m => `
+      <li class="digest-mem">
+        <span class="digest-mem-head">
+          <span class="digest-tag">${esc(m.layer || '')}</span>
+          ${m.tags && m.tags.length ? `<span class="digest-tags">${m.tags.map(esc).join(' · ')}</span>` : ''}
+        </span>
+        <span class="digest-content">${esc(m.content)}</span>
+      </li>`).join('');
+    const themes = (d.themes || []).map(t => `
+      <div class="digest-theme">
+        <div class="digest-theme-head">
+          <strong>${esc(t.label)}</strong>
+          <span class="digest-count">${t.count} memories</span>
+        </div>
+        <ul>${(t.examples || []).map(e => `<li>${esc(e)}</li>`).join('')}</ul>
+      </div>`).join('');
+
+    app.innerHTML = `
+      <div class="page digest-page">
+        <h2>Weekly Digest</h2>
+        <p class="digest-sub">What your AI learned about you — assembled locally, nothing leaves your machine.</p>
+
+        <div class="digest-controls">
+          <div class="btn-group">
+            ${[7, 30].map(n => `<button class="btn btn-sm ${n === days ? 'btn-primary' : ''}" data-days="${n}">${n} days</button>`).join('')}
+          </div>
+          <span class="digest-window">${esc((d.window_start || '').slice(0, 10))} → ${esc((d.window_end || '').slice(0, 10))}</span>
+        </div>
+
+        <div class="stat-grid" style="grid-template-columns:repeat(3,1fr);margin-bottom:1rem;">
+          <div class="stat-card"><div class="stat-num">${s.live_total ?? 0}</div><div class="stat-label">Live memories</div></div>
+          <div class="stat-card"><div class="stat-num">${s.new ?? 0}</div><div class="stat-label">New this week</div></div>
+          <div class="stat-card"><div class="stat-num">${s.reinforced ?? 0}</div><div class="stat-label">Reinforced by use</div></div>
+          <div class="stat-card"><div class="stat-num">${s.fading ?? 0}</div><div class="stat-label">Fading</div></div>
+          <div class="stat-card"><div class="stat-num">${s.quarantined ?? 0}</div><div class="stat-label">Quarantined</div></div>
+          <div class="stat-card"><div class="stat-num">${s.quarantined_new ?? 0}</div><div class="stat-label">Noise filtered</div></div>
+        </div>
+
+        ${themes ? `<div class="panel" style="margin-bottom:1rem;"><div class="panel-header">Themes</div><div class="digest-themes">${themes}</div></div>` : ''}
+
+        <div class="panel-grid">
+          <div class="panel">
+            <div class="panel-header">New memories</div>
+            ${(d.new_memories || []).length ? `<ul class="digest-list">${memList(d.new_memories)}</ul>` : '<div class="empty-state">Nothing new this window.</div>'}
+          </div>
+          <div class="panel">
+            <div class="panel-header">Reinforced (used this week)</div>
+            ${(d.reinforced || []).length ? `<ul class="digest-list">${memList(d.reinforced)}</ul>` : '<div class="empty-state">Nothing re-used this window.</div>'}
+          </div>
+          <div class="panel">
+            <div class="panel-header">Fading (worth revisiting)</div>
+            ${(d.fading || []).length ? `<ul class="digest-list">${memList(d.fading)}</ul>` : '<div class="empty-state">Nothing fading this window.</div>'}
+          </div>
+        </div>
+
+        <div class="panel" style="margin-top:1rem;">
+          <div class="panel-header">Prose digest</div>
+          ${d.prose
+            ? `<div class="digest-prose">${d.prose.split('\n').filter(p => p.trim()).map(p => `<p>${esc(p)}</p>`).join('')}</div>`
+            : `<div class="digest-prose-cta">
+                 ${d.llm_configured
+                   ? '<p>Narrative summary written by your own LLM — the call uses your BYO key and bills you, so it runs only when you ask.</p><button class="btn btn-primary" id="digest-prose-btn">Generate prose</button>'
+                   : '<p>No LLM configured. Add a BYO-key endpoint (or a local Ollama) in <a href="#/settings">Settings</a> to get an AI-written narrative.</p>'}
+               </div>`}
+        </div>
+      </div>`;
+
+    app.querySelectorAll('[data-days]').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        days = parseInt(btn.dataset.days, 10);
+        app.innerHTML = '<div class="loading">Loading…</div>';
+        try {
+          render(await api.digest.weekly(days, false));
+        } catch (e) {
+          toast(e.message, 'warn');
+          if (lastData) render(lastData);
+        }
+      });
+    });
+    const proseBtn = app.querySelector('#digest-prose-btn');
+    if (proseBtn) {
+      proseBtn.addEventListener('click', async () => {
+        proseBtn.disabled = true;
+        proseBtn.textContent = 'Generating…';
+        try {
+          render(await api.digest.weekly(days, true));
+        } catch (e) {
+          toast(e.message, 'warn');
+          proseBtn.disabled = false;
+          proseBtn.textContent = 'Generate prose';
+        }
+      });
+    }
+  };
+
+  try {
+    render(await api.digest.weekly(days, false));
+  } catch (e) {
+    app.innerHTML = `
+      <div class="page">
+        <h2>Weekly Digest</h2>
+        <div class="panel"><div class="empty-state">Could not load the digest: ${esc(e.message)}</div></div>
+      </div>`;
+  }
   updateStatus();
 });
 

@@ -131,6 +131,18 @@ pub enum Commands {
         #[arg(long, default_value = "http://127.0.0.1:8787")]
         url: String,
     },
+    /// Show the weekly digest — what your AI learned about you this week
+    Digest {
+        /// Engramd API URL
+        #[arg(long, default_value = "http://127.0.0.1:8787")]
+        url: String,
+        /// Window length in days (1–90)
+        #[arg(short, long, default_value = "7")]
+        days: u32,
+        /// Generate LLM prose (requires digest.llm in the daemon's config.json)
+        #[arg(long)]
+        prose: bool,
+    },
 }
 
 // ── Vault path resolution ──────────────────────────────────────────────────
@@ -684,6 +696,110 @@ pub async fn handle_eco(vault_opt: Option<PathBuf>) -> Result<()> {
     println!("  Forgetting is green. 🌿");
     println!();
 
+    Ok(())
+}
+
+/// Fetch and pretty-print the weekly digest from a running daemon. The CLI is
+/// a thin client of `GET /digest/weekly` — all computation (and any BYO-key
+/// prose call) happens in the daemon.
+pub async fn handle_digest(url: String, days: u32, prose: bool) -> Result<()> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()?;
+    let mut req_url = format!("{}/digest/weekly?days={}", url.trim_end_matches('/'), days.clamp(1, 90));
+    if prose {
+        req_url.push_str("&prose=1");
+    }
+    let resp = match client.get(&req_url).send().await {
+        Ok(r) => r,
+        Err(e) => anyhow::bail!("could not reach engramd at {url}: {e}"),
+    };
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+    if !status.is_success() {
+        let msg = body
+            .pointer("/error/message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("unknown error");
+        anyhow::bail!("digest failed ({status}): {msg}");
+    }
+
+    let stats = &body["stats"];
+    println!();
+    println!("  🧠 Engram Weekly Digest");
+    println!("  ═══════════════════════");
+    let start = body["window_start"].as_str().unwrap_or("?");
+    let end = body["window_end"].as_str().unwrap_or("?");
+    println!("  Window:   {} → {}", start.chars().take(10).collect::<String>(), end.chars().take(10).collect::<String>());
+    println!(
+        "  Vault:    {} live memories ({} new, {} reinforced, {} fading)",
+        stats["live_total"].as_u64().unwrap_or(0),
+        stats["new"].as_u64().unwrap_or(0),
+        stats["reinforced"].as_u64().unwrap_or(0),
+        stats["fading"].as_u64().unwrap_or(0),
+    );
+    println!(
+        "  Hygiene:  {} quarantined ({} new this week)",
+        stats["quarantined"].as_u64().unwrap_or(0),
+        stats["quarantined_new"].as_u64().unwrap_or(0),
+    );
+
+    if let Some(themes) = body["themes"].as_array() {
+        if !themes.is_empty() {
+            println!();
+            println!("  Themes");
+            for t in themes {
+                println!(
+                    "    • {} ({})",
+                    t["label"].as_str().unwrap_or("?"),
+                    t["count"].as_u64().unwrap_or(0),
+                );
+            }
+        }
+    }
+
+    let section = |name: &str, key: &str| {
+        if let Some(items) = body[key].as_array() {
+            if !items.is_empty() {
+                println!();
+                println!("  {name}");
+                for m in items {
+                    let content: String = m["content"]
+                        .as_str()
+                        .unwrap_or("")
+                        .chars()
+                        .take(90)
+                        .collect();
+                    let tags = m["tags"]
+                        .as_array()
+                        .map(|t| t.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", "))
+                        .filter(|s| !s.is_empty());
+                    match tags {
+                        Some(t) => println!("    • {content}\n      [{}{}]", m["layer"].as_str().unwrap_or(""), t),
+                        None => println!("    • {content}\n      [{}]", m["layer"].as_str().unwrap_or("")),
+                    }
+                }
+            }
+        }
+    };
+    section("New memories", "new_memories");
+    section("Reinforced (used this week)", "reinforced");
+    section("Fading (revisit these)", "fading");
+
+    if let Some(prose_text) = body["prose"].as_str() {
+        println!();
+        println!("  Digest");
+        for line in prose_text.lines() {
+            println!("  {line}");
+        }
+    } else if prose {
+        println!();
+        println!("  (no prose returned — is digest.llm configured?)");
+    } else if body["llm_configured"].as_bool() == Some(true) {
+        println!();
+        println!("  Tip: engram digest --prose for an AI-written narrative (uses your BYO key).");
+    }
+    println!();
     Ok(())
 }
 

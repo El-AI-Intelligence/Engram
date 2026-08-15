@@ -2125,3 +2125,94 @@ body.mobile #capture-btn { display: none !important; }
   .mg-minimap { display: none; }
   .graph-pills { margin-left: 0; }
 }
+
+/* ── Weekly digest ────────────────────────────────────────────────────────── */
+
+.digest-sub {
+  color: var(--text-muted, #8a94a6);
+  margin-top: -8px;
+  margin-bottom: 1rem;
+}
+.digest-controls {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  margin-bottom: 1rem;
+  flex-wrap: wrap;
+}
+.digest-controls .btn { margin: 0; }
+.digest-window {
+  color: var(--text-muted, #8a94a6);
+  font-size: 12px;
+  font-family: var(--mono, ui-monospace, monospace);
+}
+.digest-themes {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+.digest-theme {
+  border-left: 3px solid var(--semantic, #7c5cff);
+  padding: 0.25rem 0 0.25rem 0.75rem;
+}
+.digest-theme-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 0.5rem;
+  margin-bottom: 0.25rem;
+}
+.digest-count {
+  color: var(--text-muted, #8a94a6);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.digest-theme ul { margin: 0; padding-left: 1.1rem; color: var(--text-muted, #8a94a6); font-size: 13px; }
+.digest-theme li { margin-bottom: 0.2rem; }
+.digest-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+.digest-mem {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  padding: 0.4rem 0;
+  border-bottom: 1px solid var(--border, rgba(255,255,255,0.06));
+}
+.digest-mem:last-child { border-bottom: none; }
+.digest-mem-head {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.digest-tag {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 1px 6px;
+  border-radius: 8px;
+  background: var(--panel, rgba(255,255,255,0.05));
+  color: var(--text-muted, #8a94a6);
+}
+.digest-tags {
+  font-size: 11px;
+  color: var(--text-muted, #8a94a6);
+}
+.digest-content { font-size: 13px; line-height: 1.45; }
+.digest-prose p {
+  margin: 0 0 0.75rem;
+  line-height: 1.6;
+  color: var(--text, #e6e9f0);
+}
+.digest-prose p:last-child { margin-bottom: 0; }
+.digest-prose-cta p {
+  color: var(--text-muted, #8a94a6);
+  margin: 0 0 0.75rem;
+  line-height: 1.5;
+}
+.digest-prose-cta a { color: var(--accent, #7c5cff); }

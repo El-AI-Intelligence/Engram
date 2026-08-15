@@ -72,7 +72,7 @@ The consumer endgame: your memory follows you across Claude, Cursor, ChatGPT, Co
 | Milestone | Work | Est. |
 |---|---|---|
 | 3.1 MCP everywhere | **Shipped 2026-08-15:** `engram mcp install` writes/merges configs for Claude Desktop / Cursor / Windsurf (creates where the app is installed, prints snippets otherwise), `engram mcp status` checks binary + daemon + editors, `claude mcp add` for Claude Code, repo `.mcp.json`, capture tools report skipped duplicates honestly, search uses the daemon's hybrid default — docs in MCP.md. Web-vault read-only polish deferred | done |
-| 3.2 Weekly digest | Local-model digest (zero per-request cost; BYO-key as an option), delivered by email/push | 3 wks |
+| 3.2 Weekly digest | **Shipped 2026-08-15:** `GET /digest/weekly` + Digest tab in the vault UI + `engram digest` CLI. Deterministic local core (new/reinforced/fading stats, themes clustered from the vault's own embeddings, quarantine counts) — zero per-request cost; AI-written prose opt-in per request via the user's own OpenAI-compatible endpoint (BYO-key, never automatic; local Ollama qualifies). Email/push delivery remains future | done |
 | 3.3 Consumer onboarding | **Shipped 2026-08-15:** `engram onboarding` (5-minute vault → first memory → running daemon; passphrase via env, never argv) + consumer landing reframe + real one-command installer (`curl install.sh \| bash` — SHA-256-verified release binaries for all three bins served from the live site, staged by deploy.sh; verified end-to-end: install → onboarding → daemon → retrievable memory). Browser extension remains (future) | done — extension deferred |
 
 **Cost to run:** digest runs locally or BYO-key — no metered costs; extension is dev time only.
@@ -96,5 +96,5 @@ Layer 1 pays for the infra and de-risks accounts/billing. Layer 2's control plan
 
 - **Brand/domain for the cloud:** keep `engram.ellmstack.dev` or move to its own domain before charging money?
 - **Capacity tiers:** are 1 GB / 10 GB the right flat buckets? (Capacity is the only meter we keep — flat tiers, not per-GB billing.)
-- **Digest model:** local small model by default, or BYO-key by default? (Both keep costs flat; differs in UX.)
+- **Digest model:** answered — deterministic local core by default, BYO-key prose opt-in per request (2026-08-15).
 - **Org size cap:** "≤ 10 members" needs a soft limit in the app — hard limits feel un-flat; how to enforce gracefully?

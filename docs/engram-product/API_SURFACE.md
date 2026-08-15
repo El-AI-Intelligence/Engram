@@ -508,6 +508,11 @@ The `sync` block merges **field-wise** (partial patches never erase
 ignored). Supported fields: `enabled`, `server_url`, `api_key`,
 `interval_secs`, `vault_id`, `name`.
 
+The `digest` block also merges field-wise: `enabled` (bool), and `llm`
+(either `null` to clear the block, or `{base_url, api_key, model}` merged
+into the existing block — masked `api_key` round-trips are ignored, same as
+sync).
+
 ### 3.7 Sync & Teams
 
 Shared-vault v0 (see SYNC.md): a team is devices sharing one vault
@@ -547,6 +552,82 @@ appears only after its first push to that vault.
   ]
 }
 ```
+
+### 3.8 Weekly Digest
+
+`GET /digest/weekly` — "what your AI learned about you this week".
+Deterministic and local: stats come straight from the vault, themes are
+clustered from the vault's own embeddings (tag fallback when unembedded).
+No third-party call is ever made unless explicitly requested.
+
+#### `GET /digest/weekly` — Weekly digest
+
+Query params: `days` (default 7, clamped 1–90), `prose` (`1`/`true` — see
+below). Returns `409 {"error":{"code":"digest_disabled",...}}` when
+`digest.enabled` is false.
+
+```json
+// Response 200 (prose omitted when not requested)
+{
+  "generated_at": "2026-08-15T09:00:00Z",
+  "window_start": "2026-08-08T09:00:00Z",
+  "window_end": "2026-08-15T09:00:00Z",
+  "stats": {
+    "live_total": 214,
+    "new": 6,
+    "reinforced": 18,
+    "fading": 9,
+    "quarantined": 12,
+    "quarantined_new": 2
+  },
+  "themes": [
+    {
+      "label": "async stream design decision",
+      "count": 3,
+      "examples": ["async stream design decision", "tokio spawn best practice"]
+    }
+  ],
+  "new_memories": [
+    { "id": "eng_…", "content": "…", "layer": "semantic", "tags": ["work"], "strength": 1.4 }
+  ],
+  "reinforced": [ "…same shape…" ],
+  "fading": [ "…same shape…" ],
+  "prose": "This week your AI learned…",
+  "llm_configured": true
+}
+```
+
+Semantics: `new` = live memories created inside the window;
+`reinforced` = created earlier but retrieved inside it (the AI actually
+used them); `fading` = not retrieved in the window, weakest first;
+`quarantined` = imagined-and-ungrounded rows (any age), with
+`quarantined_new` = the subset filtered out this window. Memory slices are
+capped at 50 each (highlights, not full dumps — the counts are exact).
+
+**Prose (`?prose=1`) is opt-in per request.** It calls the user's own
+OpenAI-compatible endpoint configured in `config.json`:
+
+```json
+{
+  "digest": {
+    "enabled": true,
+    "llm": {
+      "base_url": "http://localhost:11434/v1",
+      "api_key": "…",
+      "model": "llama3.1"
+    }
+  }
+}
+```
+
+Because BYO-key calls bill the user's key, prose is never generated
+automatically — only on the explicit request flag (or the UI's "Generate
+prose" button). Without a usable `llm` block the request returns
+`409 {"error":{"code":"llm_not_configured",...}}`; a failed provider call
+returns `502 {"error":{"code":"llm_error",...}}`. `llm.api_key` is masked
+(`••••••••`) in `/config` responses and never persisted on masked
+round-trips. The LLM only phrases a deterministic prompt built from the
+digest data — it never fabricates the numbers.
 
 ---
 
