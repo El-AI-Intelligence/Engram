@@ -47,6 +47,33 @@ async function post(path, body = {}) {
   return r.json();
 }
 
+// ── Sync-server (relay) account client ─────────────────────────────────────
+// The relay's error shape is {error: {code, error}} — surface the message
+// and keep code/status on the Error so the panel can branch on them.
+
+async function acctReq(server, path, opts = {}) {
+  const headers = { 'Content-Type': 'application/json', ...(opts.headers || {}) };
+  const token = localStorage.getItem('engram-sync-session');
+  if (token) headers['Authorization'] = 'Bearer ' + token;
+  const r = await fetch(String(server).replace(/\/+$/, '') + path, { ...opts, headers });
+  if (!r.ok) {
+    let code = null, msg = `${r.status} ${r.statusText}`;
+    try {
+      const b = await r.json();
+      code = b?.error?.code || null;
+      if (b?.error?.error) msg = b.error.error;
+    } catch {}
+    const e = new Error(msg);
+    e.status = r.status;
+    e.code = code;
+    throw e;
+  }
+  return r.json();
+}
+const acctGet = (server, path) => acctReq(server, path);
+const acctPost = (server, path, body) => acctReq(server, path, { method: 'POST', body: JSON.stringify(body || {}) });
+const acctDel = (server, path) => acctReq(server, path, { method: 'DELETE' });
+
 const api = {
   health: () => get('/health'),
   stats: () => get('/analytics/stats'),
@@ -95,6 +122,25 @@ const api = {
   },
   teams: {
     status: () => get('/teams/status'),
+  },
+  account: {
+    // Account endpoints live on the SYNC SERVER (the relay), not the
+    // daemon: WebAuthn ceremonies and key management are relay features.
+    // The browser calls them directly (the relay's CORS allows it) and
+    // the session Bearer token lives in localStorage — cross-site cookies
+    // would never stick from localhost:8787 → sync.ellmstack.dev.
+    token: () => localStorage.getItem('engram-sync-session'),
+    setToken: (t) => t ? localStorage.setItem('engram-sync-session', t) : localStorage.removeItem('engram-sync-session'),
+    registerStart: (server, origin) => acctPost(server, '/auth/register/start', { origin }),
+    registerFinish: (server, origin, challengeId, registration) =>
+      acctPost(server, '/auth/register/finish', { origin, challenge_id: challengeId, registration }),
+    loginStart: (server, origin) => acctPost(server, '/auth/login/start', { origin }),
+    loginFinish: (server, origin, challengeId, credential) =>
+      acctPost(server, '/auth/login/finish', { origin, challenge_id: challengeId, credential }),
+    logout: (server) => acctPost(server, '/auth/logout', {}),
+    get: (server) => acctGet(server, '/account'),
+    createKey: (server, vaultId) => acctPost(server, '/account/keys', vaultId ? { vault_id: vaultId } : {}),
+    revokeKey: (server, keyId) => acctDel(server, '/account/keys/' + encodeURIComponent(keyId)),
   },
   sync: {
     now: () => post('/sync/now'),
@@ -1630,6 +1676,96 @@ route('/consolidation', async () => {
   updateStatus();
 });
 
+// ── WebAuthn (passkey) plumbing ────────────────────────────────────────────
+// Fresh implementation for the relay's ceremonies. The relay speaks
+// base64url strings (webauthn-rs JSON format); the browser API needs
+// ArrayBuffers — convert both ways. No `hints` are ever sent (browser
+// defaults), origin is always window.location.origin, and SecurityError
+// surfaces as an RP ID/origin mismatch.
+
+function b64urlFromBuf(buf) {
+  const bytes = new Uint8Array(buf);
+  let bin = '';
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function bufFromB64url(s) {
+  const b64 = String(s).replace(/-/g, '+').replace(/_/g, '/');
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes.buffer;
+}
+
+function encodeCredential(c) {
+  const r = c.response;
+  return {
+    id: c.id,
+    rawId: b64urlFromBuf(c.rawId),
+    type: c.type,
+    response: {
+      clientDataJSON: b64urlFromBuf(r.clientDataJSON),
+      attestationObject: r.attestationObject ? b64urlFromBuf(r.attestationObject) : undefined,
+      authenticatorData: r.authenticatorData ? b64urlFromBuf(r.authenticatorData) : undefined,
+      signature: r.signature ? b64urlFromBuf(r.signature) : undefined,
+      userHandle: r.userHandle ? b64urlFromBuf(r.userHandle) : null,
+      transports: r.getTransports ? r.getTransports() : undefined,
+    },
+    authenticatorAttachment: c.authenticatorAttachment || undefined,
+    clientExtensionResults: c.clientExtensionResults || {},
+  };
+}
+
+async function webauthnRegister(server) {
+  try {
+    const start = await api.account.registerStart(server, window.location.origin);
+    const pub = start.challenge.publicKey;
+    pub.challenge = bufFromB64url(pub.challenge);
+    pub.user.id = bufFromB64url(pub.user.id);
+    for (const ec of (pub.excludeCredentials || [])) ec.id = bufFromB64url(ec.id);
+    const credential = await navigator.credentials.create({ publicKey: pub });
+    const res = await api.account.registerFinish(
+      server, window.location.origin, start.challenge_id, encodeCredential(credential));
+    api.account.setToken(res.session_token);
+    toast(res.already_registered ? 'Passkey already registered — signed in' : 'Account created — signed in', 'ok');
+    render();
+  } catch (e) {
+    if (e.name === 'SecurityError') {
+      toast('Passkey blocked: RP ID/origin mismatch — the sync server must allow this origin (--rp-id / --origin, see SYNC.md)', 'error');
+    } else if (e.name === 'NotAllowedError') {
+      toast('Passkey registration cancelled or not allowed by the browser', 'error');
+    } else {
+      toast(e.message || 'Passkey registration failed', 'error');
+    }
+  }
+}
+
+async function webauthnLogin(server) {
+  try {
+    const start = await api.account.loginStart(server, window.location.origin);
+    const pub = start.challenge.publicKey;
+    pub.challenge = bufFromB64url(pub.challenge);
+    for (const ac of (pub.allowCredentials || [])) ac.id = bufFromB64url(ac.id);
+    const credential = await navigator.credentials.get({ publicKey: pub });
+    const res = await api.account.loginFinish(
+      server, window.location.origin, start.challenge_id, encodeCredential(credential));
+    api.account.setToken(res.session_token);
+    toast('Signed in', 'ok');
+    render();
+  } catch (e) {
+    if (e.code === 'no_passkeys') {
+      toast('No passkeys registered on this server yet — register one first', 'error');
+    } else if (e.name === 'SecurityError') {
+      toast('Passkey blocked: RP ID/origin mismatch — the sync server must allow this origin (--rp-id / --origin, see SYNC.md)', 'error');
+    } else if (e.name === 'NotAllowedError') {
+      toast('Sign-in cancelled or not allowed', 'error');
+    } else {
+      toast(e.message || 'Sign-in failed', 'error');
+    }
+  }
+}
+
 // ── Settings ───────────────────────────────────────────────────────────────
 
 route('/settings', async () => {
@@ -1717,6 +1853,16 @@ route('/settings', async () => {
           environment variable when <code>engramd</code> starts. It cannot be changed from the UI.
           See <code>docs/engram-product/DEPLOY.md</code> for exposing the vault behind Caddy.
         </div>
+      </div>
+
+      <div class="panel" style="margin-bottom:1rem;">
+        <div class="panel-header">Account (Sync Server)</div>
+        <div class="settings-note">
+          Accounts are standalone passkeys — no email, no name. The account lives on the
+          sync server (<code>${esc(sync.server_url || 'not set')}</code>) and owns the API keys
+          this vault syncs with. Sessions are Bearer tokens stored in this browser only.
+        </div>
+        <div id="account-body" class="health-list" style="padding:0 1rem 1rem;"><div class="loading-sm">Loading…</div></div>
       </div>
 
       <div class="panel" style="margin-bottom:1rem;">
@@ -1889,6 +2035,108 @@ route('/settings', async () => {
     const lp = team.last_push ? String(team.last_push).slice(0, 19) : '—';
     const pl = team.last_pull ? String(team.last_pull).slice(0, 19) : '—';
     devicesEl.insertAdjacentHTML('beforeend', `<div class="health-row faint">Last push: <span class="mono">${lp}</span> · Last pull: <span class="mono">${pl}</span></div>`);
+    if (team.last_push_error) {
+      devicesEl.insertAdjacentHTML('beforeend', `<div class="health-row error">Last push error: ${esc(team.last_push_error)}</div>`);
+    }
+  })();
+
+  // ── Account panel: passkey sign-in/register, quota bars, API keys
+  (async function renderAccount() {
+    const bodyEl = document.getElementById('account-body');
+    const server = (sync.server_url || '').trim();
+    if (!server) {
+      bodyEl.innerHTML = '<div class="health-row faint">Set a sync server URL (Sync &amp; Team panel) to use accounts.</div>';
+      return;
+    }
+    const renderSignedOut = () => {
+      bodyEl.innerHTML = `
+        <div class="mutation" style="display:flex;gap:0.5rem;padding:1rem;">
+          <button class="btn btn-primary" id="acct-register">Register passkey</button>
+          <button class="btn" id="acct-login">Sign in with passkey</button>
+        </div>`;
+      document.getElementById('acct-register').onclick = () => webauthnRegister(server);
+      document.getElementById('acct-login').onclick = () => webauthnLogin(server);
+    };
+    if (!api.account.token()) { renderSignedOut(); return; }
+
+    let acct;
+    try { acct = await api.account.get(server); }
+    catch (e) {
+      if (e.status === 401) { api.account.setToken(null); renderSignedOut(); return; }
+      bodyEl.innerHTML = `<div class="health-row error">Account unreachable: ${esc(e.message)}</div>`;
+      return;
+    }
+
+    const q = acct.quota || {};
+    const quotaBar = (label, used, limit, fmt) => {
+      if (!limit) return `<div class="health-row">${label}: <span class="mono">${fmt ? fmt(used) : used}</span> <span class="faint">(unlimited)</span></div>`;
+      const pct = Math.min(100, Math.round((used / limit) * 100));
+      const color = pct > 90 ? 'var(--decaying)' : pct > 60 ? 'var(--episodic)' : 'var(--grounded)';
+      return `<div class="health-row">${label}: <span class="mono">${fmt ? fmt(used) : used} / ${fmt ? fmt(limit) : limit}</span>
+        <div class="mini-bar"><div class="mini-bar-fill" style="width:${pct}%;background:${color};"></div></div></div>`;
+    };
+    const activeKeys = (acct.keys || []).filter(k => !k.revoked);
+    const revokedKeys = (acct.keys || []).filter(k => k.revoked);
+    bodyEl.innerHTML = `
+      <div class="health-row">Account: <span class="mono">${esc((acct.account_id || '').slice(0, 13))}…</span>
+        <span class="ml-auto"><button class="btn btn-sm" id="acct-logout">Sign out</button></span></div>
+      ${quotaBar('Devices', q.devices_used || 0, q.devices || 0)}
+      ${quotaBar('Bytes', q.bytes_used || 0, q.bytes || 0, formatBytes)}
+      <div class="health-row" style="margin-top:0.5rem;"><strong>API keys</strong>
+        <span class="ml-auto"><button class="btn btn-sm btn-primary" id="acct-new-key">New key${(team?.vault_id || sync.vault_id) ? ' (this vault)' : ''}</button></span></div>
+      ${activeKeys.map(k => `
+        <div class="health-row"><span class="mono">${esc(k.key_prefix)}…</span>
+          <span class="faint">${k.vault_id ? 'scoped to ' + esc(k.vault_id) : 'all vaults'} · ${esc(String(k.created_at || '').slice(0, 10))}</span>
+          <span class="ml-auto"><button class="btn btn-sm btn-danger" data-revoke="${esc(k.id)}">Revoke</button></span></div>`).join('')
+        || '<div class="health-row faint">No keys yet — create one to let this device sync.</div>'}
+      ${revokedKeys.length ? `<div class="health-row faint">${revokedKeys.length} revoked key${revokedKeys.length > 1 ? 's' : ''} (history)</div>` : ''}
+      <div id="acct-key-once"></div>`;
+
+    document.getElementById('acct-logout').onclick = async () => {
+      try { await api.account.logout(server); } catch {}
+      api.account.setToken(null);
+      toast('Signed out', 'ok');
+      render();
+    };
+
+    document.getElementById('acct-new-key').onclick = async () => {
+      try {
+        const vaultId = team?.vault_id || sync.vault_id || null;
+        const k = await api.account.createKey(server, vaultId);
+        document.getElementById('acct-key-once').innerHTML = `
+          <div class="settings-note">
+            <strong>Copy this API key now — it is shown only once.</strong> The server stores a hash.<br>
+            <code class="mono" style="word-break:break-all;">${esc(k.api_key)}</code>
+          </div>
+          <div class="mutation" style="display:flex;gap:0.5rem;padding:0 1rem 1rem;flex-wrap:wrap;">
+            <button class="btn btn-sm" id="acct-key-copy">Copy key</button>
+            <button class="btn btn-sm btn-primary" id="acct-key-connect">Connect this device</button>
+          </div>`;
+        document.getElementById('acct-key-copy').onclick = async () => {
+          try { await navigator.clipboard.writeText(k.api_key); toast('API key copied', 'ok'); }
+          catch { toast('Copy failed — select the key text manually', 'error'); }
+        };
+        document.getElementById('acct-key-connect').onclick = async () => {
+          try {
+            const r = await api.config.update({ sync: { api_key: k.api_key } });
+            if (!r.ok) { const err = await r.json().catch(() => ({})); toast(err.error?.message || 'Save failed', 'error'); return; }
+            toast('API key saved to this vault — restart engramd to use it', 'ok');
+          } catch (e) { toast(e.message || 'Save failed', 'error'); }
+        };
+      } catch (e) { toast(e.message || 'Key creation failed', 'error'); }
+    };
+
+    bodyEl.querySelectorAll('[data-revoke]').forEach(btn => {
+      btn.onclick = async () => {
+        const keyId = btn.getAttribute('data-revoke');
+        if (!confirm('Revoke this API key? Devices using it will stop syncing immediately.')) return;
+        try {
+          await api.account.revokeKey(server, keyId);
+          toast('Key revoked', 'ok');
+          render();
+        } catch (e) { toast(e.message || 'Revoke failed', 'error'); }
+      };
+    });
   })();
 
   document.getElementById('team-copy-vault').onclick = async () => {
