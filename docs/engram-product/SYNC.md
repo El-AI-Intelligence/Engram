@@ -272,6 +272,34 @@ The sync server is designed to be self-hosted:
 - **Resource-light:** ~20 MB RAM, minimal CPU
 - **Docker:** `docker run -v ./data:/data -p 8788:8788 -e SYNC_API_KEYS=... ghcr.io/pixelphantomai/engramd-sync:latest`
 
+### API key scoping & revocation (teams v1)
+
+`SYNC_API_KEYS` entries accept an optional vault scope:
+
+```bash
+SYNC_API_KEYS="team-key-abcdefgh123456:100:team-acme;team-alpha+admin"
+```
+
+- `key` / `key:rate` — unscoped: all vaults (original behavior)
+- `key:rate:vault1;vault2` — only the listed vaults (403 elsewhere)
+- `vault+admin` — also grants device revocation on that vault
+
+Revoke a device (admin-scoped key required):
+
+```bash
+curl -X DELETE https://sync.example.com/v1/vaults/team-acme/devices/{device_id} \
+  -H "Authorization: Bearer <team-key>"
+```
+
+The relay then blocks that device's pushes and flags it `revoked`
+in the device roster; the revoked device's daemon logs a warning.
+
+> **Honest zero-knowledge boundary:** pulls are vault-scoped, not
+> device-scoped, so the relay cannot stop a revoked device from reading
+> blobs or decrypting what it already holds. Full removal means a vault
+> re-key (new passphrase ⇒ new vault) or per-member key revocation —
+> the hosted control plane's job.
+
 ### Production Deployment
 
 ```nginx
@@ -382,8 +410,9 @@ If you're migrating from another memory system:
   is no revocation, per-member audit, or role separation yet (teams v0). If
   someone leaves a team with the passphrase, the team must re-key a new
   vault.
-- **Any sync-server API-key holder can read any vault on that server**
-  (blobs stay E2E-encrypted, but the key authenticates all vault operations).
+- **Unscoped API keys can read any vault on that server** (blobs stay
+  E2E-encrypted, but the key authenticates all vault operations). Scoped
+  keys (`key:rate:vault1;vault2`) fix this — see Self-Hosting.
 - **Machine-keyed vaults cannot sync:** a passphrase is required at daemon
   startup.
 - **Device roster counts pushes only:** a teammate who has only pulled
