@@ -26,10 +26,49 @@ REST API — it does not serve static files. Caddy serves the vault SPA
 statically at `/app`, enforces HTTP basic auth, and injects the bearer token
 the API requires, so the SPA's same-origin `fetch()` calls carry no API key.
 
+## Server topology (which box is which)
+
+Engram runs on **two separate Hetzner VPSes** — kept split on purpose:
+
+| Box | Hetzner | Public IP | Serves | Runs |
+|---|---|---|---|---|
+| **Site box** | `ubuntu-4gb-hel1-1` | 204.168.163.161 | `engram.ellmstack.dev` (landing, vault UI at `/app`, installer binaries) | Caddy + `engramd` (vault daemon on 127.0.0.1:8787) |
+| **Sync relay** | server 125572177 (CX23) | 138.199.144.93 | `sync.ellmstack.dev` (E2E sync relay) | Caddy + `engramd-sync` (127.0.0.1:8788) |
+
+Both are 2 vCPU / 4 GB / 40 GB. The site box also hosts **guardrail**, so it
+cannot be retired — that kills the "merge everything onto the relay" idea
+(no cost savings, and the relay keeps its minimal attack surface). The relay
+runbook is `deploy/sync-relay.md`; this file covers only the site box.
+
+The site box has **no git checkout** — `/root/engram/` is a plain copy:
+rsync `ui/`, `scripts/`, `deploy/`, and `target/release/` binaries from a dev
+machine, then run `./deploy/engram/deploy.sh -y`. Note the systemd unit runs
+`/root/engram/engramd` while deploy.sh installs to `/usr/local/bin/` — copy
+the unit's binary by hand (stop the service first, or you get "Text file
+busy").
+
+## Cloudflare
+
+`engram.ellmstack.dev` is (as of 2026-08-16) **orange-cloud proxied** through
+Cloudflare. That caused stale-UI incidents: the edge caches `main.js` and
+keeps serving it after deploys. Two fixes:
+
+- **One-time:** Cloudflare dashboard → zone `ellmstack.dev` → Caching →
+  Purge Everything, then hard-refresh.
+- **Permanent (recommended):** flip the `engram` A and AAAA records to
+  **grey cloud (DNS only)**, matching the `sync` record. The box's ufw
+  allows 80/443 from anywhere and Caddy has its own Let's Encrypt cert, so
+  nothing else changes — and Cloudflare stops seeing vault traffic (it
+  terminates TLS while proxied, which undermines the end-to-end story).
+  After flipping, `dig +short engram.ellmstack.dev` should show
+  204.168.163.161. The vault SPA also serves `Cache-Control: no-cache`, so
+  browsers revalidate on every load.
+
 ## Prerequisites
 
 - **DNS:** an A record for `engram.ellmstack.dev` pointing at the server,
   with ports 80 and 443 reachable (required for Let's Encrypt issuance).
+  Prefer DNS-only (grey cloud) — see "Cloudflare" above.
 - **Software:** Caddy 2, systemd, rsync.
 - **User and directories:**
   ```bash
