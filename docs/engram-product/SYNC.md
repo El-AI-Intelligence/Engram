@@ -117,6 +117,10 @@ works on existing vaults, not just fresh ones). Restart the daemon with
 `ENGRAM_PASSPHRASE` set and the device appears in the roster after its
 first push.
 
+The device's roster label is taken from `--name` if given, otherwise the
+vault's sync name, otherwise the machine hostname — `engram pair` replaces
+a placeholder label (`unknown`) in the vault's `device.json` automatically.
+
 Notes: codes are single-use, 10-minute TTL, and stored server-side only as
 sha256 — the plaintext is shown once. Paired keys are **unscoped in v1**
 (account-wide); the vault UI can also mint per-vault keys manually.

@@ -582,8 +582,34 @@ pub async fn handle_pair(
     if let Some(ref n) = name {
         sync["name"] = serde_json::Value::String(n.clone());
     }
+    // The roster label comes from vault-local device.json (the sync loop
+    // registers it on startup). Older vaults carry the "unknown" placeholder —
+    // name the device from --name, or fall back to the sync preset name, so
+    // Account & Sync shows who this machine is.
+    let label = name
+        .clone()
+        .or_else(|| sync.get("name").and_then(|v| v.as_str().map(String::from)));
     config["sync"] = sync;
     std::fs::write(&cfg_path, serde_json::to_string_pretty(&config)?)?;
+
+    if let Some(label) = label {
+        let dev_path = vault_path.join("device.json");
+        let mut dev: serde_json::Value = std::fs::read_to_string(&dev_path)
+            .ok()
+            .and_then(|data| serde_json::from_str(&data).ok())
+            .unwrap_or(serde_json::json!({}));
+        let current = dev.get("label").and_then(|v| v.as_str()).unwrap_or("");
+        // An explicit --name always wins; otherwise only replace the
+        // placeholder so a hand-set label survives re-pairing.
+        if name.is_some() || current.is_empty() || current == "unknown" {
+            if dev.get("device_id").and_then(|v| v.as_str()).is_none() {
+                dev["device_id"] = serde_json::Value::String(uuid::Uuid::new_v4().to_string());
+                dev["created_at"] = serde_json::Value::String(chrono::Utc::now().to_rfc3339());
+            }
+            dev["label"] = serde_json::Value::String(label);
+            std::fs::write(&dev_path, serde_json::to_string_pretty(&dev)?)?;
+        }
+    }
 
     println!();
     println!("  ✅ Paired! The relay issued a new API key — stored in {}", cfg_path.display());
