@@ -737,5 +737,6 @@ QEM: 85% hit rate  |  1,423 memories  |  2.3 MB  |  Encrypted ✓  |  Next decay
 - **Mobile read-only:** `body.mobile` (≤767px) hides mutation controls
   (`.mutation`, `.detail-actions`, `.purge-form`).
 - **Deployment:** see [DEPLOY.md](DEPLOY.md) — Caddy serves the landing page
-  at `/`, the vault SPA statically at `/app`, and reverse-proxies the API to
-  `engramd` with basic auth + injected bearer token.
+  at `/`, the vault SPA statically at `/app` (public shell with a branded
+  login screen), and reverse-proxies the API to `engramd` with basic auth +
+  injected bearer token.

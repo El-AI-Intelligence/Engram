@@ -32,7 +32,8 @@ const API = '';  // relative to origin — Caddy reverse-proxies to localhost:87
 // ── API client ────────────────────────────────────────────────────────────
 
 async function get(path) {
-  const r = await fetch(API + path);
+  const r = await fetch(API + path, { headers: authHeaders() });
+  if (r.status === 401) onApi401(r);
   if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
   return r.json();
 }
@@ -40,9 +41,10 @@ async function get(path) {
 async function post(path, body = {}) {
   const r = await fetch(API + path, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify(body),
   });
+  if (r.status === 401) onApi401(r);
   if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
   return r.json();
 }
@@ -85,12 +87,18 @@ const api = {
     related: (id, limit = 10) => get('/memories/' + id + '/related?limit=' + limit),
     ground: (id) => post('/memories/' + id + '/ground'),
     markNoise: (id) => post('/memories/' + id + '/mark-noise'),
-    delete: (id) => fetch(API + '/memories/' + id, { method: 'DELETE' }),
+    delete: async (id) => {
+      const r = await fetch(API + '/memories/' + id, { method: 'DELETE', headers: authHeaders() });
+      if (r.status === 401) onApi401(r);
+    },
     annotations: (id) => get('/memories/' + id + '/annotations'),
     annotate: (id, content) => post('/memories/' + id + '/annotations', { content }),
   },
   annotations: {
-    delete: (id) => fetch(API + '/annotations/' + id, { method: 'DELETE' }),
+    delete: async (id) => {
+      const r = await fetch(API + '/annotations/' + id, { method: 'DELETE', headers: authHeaders() });
+      if (r.status === 401) onApi401(r);
+    },
   },
   analytics: {
     activity: (days = 30) => get('/analytics/activity?days=' + days),
@@ -99,7 +107,10 @@ const api = {
   savedSearches: {
     list: () => get('/searches'),
     create: (s) => post('/searches', s),
-    delete: (id) => fetch(API + '/searches/' + id, { method: 'DELETE' }),
+    delete: async (id) => {
+      const r = await fetch(API + '/searches/' + id, { method: 'DELETE', headers: authHeaders() });
+      if (r.status === 401) onApi401(r);
+    },
   },
   context: {
     assemble: (q) => post('/context/assemble', q),
@@ -118,7 +129,11 @@ const api = {
   },
   config: {
     get: () => get('/config'),
-    update: (c) => fetch(API + '/config', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(c) }),
+    update: async (c) => {
+      const r = await fetch(API + '/config', { method: 'PATCH', headers: { 'Content-Type': 'application/json', ...authHeaders() }, body: JSON.stringify(c) });
+      if (r.status === 401) onApi401(r);
+      return r;  // callers inspect r.ok themselves (sync key save)
+    },
   },
   teams: {
     status: () => get('/teams/status'),
@@ -149,7 +164,8 @@ const api = {
     // Structured daemon errors (409 digest_disabled / llm_not_configured)
     // carry a readable message — surface it instead of "409 Conflict".
     weekly: async (days = 7, prose = false) => {
-      const r = await fetch(API + '/digest/weekly?days=' + days + (prose ? '&prose=1' : ''));
+      const r = await fetch(API + '/digest/weekly?days=' + days + (prose ? '&prose=1' : ''), { headers: authHeaders() });
+      if (r.status === 401) onApi401(r);
       if (!r.ok) {
         let msg = `${r.status} ${r.statusText}`;
         try { const b = await r.json(); if (b?.error?.message) msg = b.error.message; } catch {}
@@ -159,6 +175,52 @@ const api = {
     },
   },
 };
+
+// ── Vault gate (HTTP basic auth via the branded login screen) ─────────────
+// Caddy gates the API paths with HTTP basic auth but strips the
+// WWW-Authenticate challenge (site config), so the browser never shows the
+// native popup — this SPA supplies the credentials instead. Form credentials
+// live ONLY in sessionStorage (per-tab, dies with the tab): the user chose
+// per-session auth, no "keep me signed in", because the vault guards
+// sensitive data. base64-in-storage ≈ the trust level of the browser's own
+// auth cache, mitigated by the strict CSP (script-src 'self').
+
+const VAULT_CREDS_KEY = 'engram-vault-creds';
+// Set when the login screen's headerless /health probe returns 200: the
+// browser still holds popup-era cached credentials (Safari-class) that we
+// cannot read, so we trust the browser to keep attaching them and skip the
+// form. Cleared together with the form credentials on sign-out / 401.
+const VAULT_PROBE_KEY = 'engram-vault-probe';
+
+function getCreds() {
+  return sessionStorage.getItem(VAULT_CREDS_KEY);
+}
+
+function setCreds(b64) {
+  sessionStorage.setItem(VAULT_CREDS_KEY, b64);
+}
+
+function clearCreds() {
+  sessionStorage.removeItem(VAULT_CREDS_KEY);
+  sessionStorage.removeItem(VAULT_PROBE_KEY);
+}
+
+function hasAuth() {
+  return getCreds() || sessionStorage.getItem(VAULT_PROBE_KEY) === '1';
+}
+
+function authHeaders() {
+  const creds = getCreds();
+  return creds ? { Authorization: 'Basic ' + creds } : {};
+}
+
+// Any API 401 means the stored credentials stopped working — drop them and
+// return to the login screen.
+function onApi401(r) {
+  clearCreds();
+  const hash = (window.location.hash || '#/').replace(/^#/, '');
+  if (hash !== '/login') navigate('#/login');
+}
 
 // ── Router ────────────────────────────────────────────────────────────────
 
@@ -180,6 +242,9 @@ async function render() {
 
   if (currentCleanup) { currentCleanup(); currentCleanup = null; }
 
+  // Vault gate: everything except the login screen requires credentials.
+  if (!hasAuth() && hash !== '/login') { navigate('#/login'); return; }
+
   // Highlight nav
   document.querySelectorAll('.nav a').forEach(a => {
     a.classList.toggle('active', a.getAttribute('href') === hash);
@@ -198,6 +263,9 @@ async function render() {
           if (cleanup && typeof cleanup === 'function') currentCleanup = cleanup;
         }
       } catch (e) {
+        // If a 401 cleared the creds mid-route, render() has already been
+        // re-invoked for #/login — don't let the stale route clobber it.
+        if (!hasAuth() && (window.location.hash || '#/').replace(/^#/, '') === '/login') return;
         app.innerHTML = `<div class="error-panel"><p>Error: ${esc(e.message)}</p></div>`;
       }
       return;
@@ -454,6 +522,7 @@ function liveFeedItem(m) {
 // ── Status bar ────────────────────────────────────────────────────────────
 
 async function updateStatus() {
+  if (!hasAuth()) return;  // not signed in — the login screen covers the app
   try {
     const h = await api.health();
     const el = document.getElementById('statusbar');
@@ -548,6 +617,79 @@ function openCaptureModal() {
 // SCREENS
 // ==========================================================================
 
+// ── Login ─────────────────────────────────────────────────────────────────
+// Branded vault gate replacing the native basic-auth popup. The form sends
+// an explicit Authorization header — browsers never show the popup when a
+// request already carries credentials, and Caddy strips the challenge from
+// API 401s anyway. One silent headerless /health probe first: if the
+// browser still holds popup-era cached creds (Safari-class), enter without
+// prompting — self-eliminating once the user signs out once.
+
+route('/login', () => {
+  const app = document.getElementById('app');
+  app.innerHTML = `
+    <div class="modal-overlay">
+      <div class="modal login-modal">
+        <div class="login-brand"><span class="brand-gem">◆</span> Engram Vault</div>
+        <div class="modal-body">
+          <p class="faint" style="margin-top:0;">Sign in to access your memories.</p>
+          <input id="login-user" type="text" placeholder="Username" autocomplete="username" autocapitalize="off" spellcheck="false">
+          <input id="login-pass" type="password" placeholder="Password" autocomplete="current-password">
+          <div id="login-error"></div>
+          <div class="mutation">
+            <button class="btn btn-primary" id="login-submit">Sign in</button>
+          </div>
+        </div>
+      </div>
+    </div>`;
+
+  const fail = (msg) => {
+    document.getElementById('login-error').innerHTML = `<div class="error-panel"><p>${esc(msg)}</p></div>`;
+  };
+
+  const submit = async () => {
+    const btn = document.getElementById('login-submit');
+    const user = document.getElementById('login-user').value.trim();
+    const pass = document.getElementById('login-pass').value;
+    if (!user || !pass) return;
+    const b64 = btoa(unescape(encodeURIComponent(user + ':' + pass)));
+    btn.disabled = true;
+    try {
+      const r = await fetch(API + '/health', { headers: { Authorization: 'Basic ' + b64 } });
+      if (r.ok) {
+        setCreds(b64);
+        updateStatus();
+        navigate('#/');
+        return;
+      }
+      if (r.status === 401) fail('Incorrect username or password.');
+      else fail(`Sign-in failed (${r.status}).`);
+    } catch (e) {
+      fail('Cannot reach the vault server.');
+    } finally {
+      btn.disabled = false;
+    }
+  };
+
+  document.getElementById('login-submit').onclick = submit;
+  const onKey = (e) => { if (e.key === 'Enter') submit(); };
+  document.getElementById('login-user').onkeydown = onKey;
+  document.getElementById('login-pass').onkeydown = onKey;
+  document.getElementById('login-user').focus();
+
+  // Transition probe (comment above) — auto-enter on cached creds.
+  (async () => {
+    try {
+      const r = await fetch(API + '/health');
+      if (r.ok) {
+        sessionStorage.setItem(VAULT_PROBE_KEY, '1');
+        updateStatus();
+        navigate('#/');
+      }
+    } catch {}
+  })();
+});
+
 // ── Dashboard ─────────────────────────────────────────────────────────────
 
 route('/', async () => {
@@ -557,6 +699,7 @@ route('/', async () => {
   const app = document.getElementById('app');
 
   if (!stats) {
+    if (!hasAuth()) return;  // signed out mid-load — the login screen owns #app
     app.innerHTML = `<div class="error-panel">
       <h2>Cannot reach engramd</h2>
       <p>Make sure <code>engramd</code> is running on port 8787.</p>
@@ -2134,10 +2277,12 @@ route('/settings', async () => {
       // Also drop the vault's HTTP basic-auth gate: /auth/ui-logout answers
       // 401 with a fresh challenge (Caddy config), which makes the browser
       // clear its cached vault credentials. 401 is the EXPECTED reply, so
-      // this fetch resolves — then reload /app and the browser re-prompts.
+      // this fetch resolves. Then clear sessionStorage and return to the
+      // branded login screen (no page reload).
       try { await fetch('/auth/ui-logout', { method: 'POST' }); } catch {}
+      clearCreds();
       toast('Signed out', 'ok');
-      setTimeout(() => { window.location.href = '/app/'; }, 600);
+      navigate('#/login');
     };
 
     document.getElementById('acct-new-key').onclick = async () => {

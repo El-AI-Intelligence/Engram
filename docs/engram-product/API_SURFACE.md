@@ -46,11 +46,14 @@ a non-loopback address without `ENGRAMD_API_KEY` set, startup is refused.
 ### 2.3 Production deployment (engram.ellmstack.dev)
 
 The daemon still binds loopback. A Caddy reverse proxy terminates TLS and
-enforces **HTTP Basic auth** on `/app` and the API. Caddy injects
-`Authorization: Bearer <ENGRAMD_API_KEY>` on upstream requests from the
-daemon's env file, so browsers authenticate once via Basic auth and the
-daemon sees its own Bearer key. Clients should never send the API key
-themselves.
+enforces **HTTP Basic auth** on the API paths. The vault SPA at `/app` is a
+public shell showing a branded login screen (`#/login`) that sends an
+explicit `Authorization: Basic` header — Caddy strips the `WWW-Authenticate`
+challenge from API 401s, so the browser never shows the native popup.
+Caddy injects `Authorization: Bearer <ENGRAMD_API_KEY>` on upstream
+requests from the daemon's env file, so browsers authenticate once via the
+login form and the daemon sees its own Bearer key. Clients should never
+send the API key themselves.
 
 ### 2.4 Multi-tenancy
 

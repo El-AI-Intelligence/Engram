@@ -8,7 +8,7 @@
 # Architecture:
 #   browser → Caddy :443 (automatic TLS via Let's Encrypt)
 #     ├── /              → static landing page (/srv/engram/landing)   [public]
-#     ├── /app           → static vault UI SPA (/srv/engram/vault)     [basic_auth]
+#     ├── /app           → static vault UI SPA (/srv/engram/vault)     [public shell]
 #     └── API paths      → reverse_proxy 127.0.0.1:8787 (engramd)      [basic_auth]
 #
 # Routing note: the API proxy MUST be a `handle` block, not a bare
@@ -39,9 +39,11 @@ engram.ellmstack.dev {
 	encode zstd gzip
 
 	# ── Authentication ──────────────────────────────────────────────────────
-	# Everything except the public landing page sits behind HTTP basic auth.
+	# API paths sit behind HTTP basic auth; the SPA shell at /app is PUBLIC
+	# and shows a branded login screen that sends explicit Authorization
+	# headers (the popup challenge is stripped from API 401s below).
 	# Path prefixes mirror engramd's routers (crates/engramd/src/routes/*.rs).
-	@protected path /app /app/* /health /memories* /context* /consolidate* /analytics* /config /export /import /ws* /annotations* /searches* /privacy* /sync* /teams* /digest*
+	@protected path /health /memories* /context* /consolidate* /analytics* /config /export /import /ws* /annotations* /searches* /privacy* /sync* /teams* /digest*
 	basic_auth @protected {
 		{$ENGRAM_UI_USER} {$ENGRAM_UI_PASS_HASH}
 	}
@@ -76,6 +78,15 @@ engram.ellmstack.dev {
 			header_up Authorization "Bearer {$ENGRAMD_API_KEY}"
 		}
 	}
+
+	# Strip the Basic challenge from API-path 401s so the browser never shows the
+	# native auth popup — the SPA login screen sends explicit Authorization headers.
+	# Site-level on purpose (NOT inside `handle @api`): `header` sorts before
+	# `basic_auth` in Caddy's directive order and its deletions are deferred to
+	# response-write time, so this wraps basic_auth's own 401s; a header inside
+	# `handle @api` would never run (basic_auth terminates the chain first).
+	# /auth/ui-logout is NOT in @api, so its deliberate challenge still works.
+	header @api -WWW-Authenticate
 
 	# ── Vault UI SPA at /app ────────────────────────────────────────────────
 	# No-build static SPA with hash routing (#/, #/memories, ...), so the only

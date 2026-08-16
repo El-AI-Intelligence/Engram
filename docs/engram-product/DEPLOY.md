@@ -12,7 +12,7 @@ browser
 ┌──────────────────────────────────────────────────────┐
 │ Caddy 2                                              │
 │  /            → static files  /srv/engram/landing    │  (public)
-│  /app*        → static files  /srv/engram/vault      │  (basic_auth)
+│  /app*        → static files  /srv/engram/vault      │  (public shell — branded login screen)
 │  /health, /memories*, /context*, /consolidate*,      │
 │  /analytics*, /config, /export, /import, /ws*,       │
 │  /annotations*, /searches*, /privacy*, /sync*        │
@@ -23,8 +23,10 @@ browser
 
 `engramd` binds to loopback only (`127.0.0.1:8787`) and exposes only the JSON
 REST API — it does not serve static files. Caddy serves the vault SPA
-statically at `/app`, enforces HTTP basic auth, and injects the bearer token
-the API requires, so the SPA's same-origin `fetch()` calls carry no API key.
+statically at `/app` as a **public shell** (the bundle holds no data — a
+branded login screen gates it), enforces HTTP basic auth on the API paths,
+and injects the bearer token the API requires, so the SPA's same-origin
+`fetch()` calls carry no API key.
 
 ## Server topology (which box is which)
 
@@ -114,13 +116,20 @@ caddy hash-password
 
 ## How the two auth layers interact
 
-1. The browser hits any `/app` or API path → Caddy challenges with HTTP
-   **basic auth** (`ENGRAM_UI_USER` / bcrypt hash). The landing page at `/`
-   is public.
-2. For proxied API requests, Caddy **replaces** the `Authorization` header
+1. The landing page at `/` and the vault SPA shell at `/app` are **public**.
+   The SPA renders a branded login screen (route `#/login`) instead of
+   Caddy's native basic-auth popup.
+2. All API paths (`/health`, `/memories*`, …) stay behind Caddy's HTTP
+   **basic auth** (`ENGRAM_UI_USER` / bcrypt hash). The login form sends an
+   explicit `Authorization: Basic base64(user:pass)` header — browsers never
+   show the native popup when a request already carries credentials, and
+   Caddy strips the `WWW-Authenticate` challenge from API 401s (site-level
+   `header @api -WWW-Authenticate`), so a rejected login shows an inline
+   error on the login screen instead.
+3. For proxied API requests, Caddy **replaces** the `Authorization` header
    with `Bearer {$ENGRAMD_API_KEY}` before forwarding to `engramd`
    (`header_up` in `deploy/caddy/engram.Caddyfile`).
-3. `engramd`'s middleware (`crates/engramd/src/auth.rs`) requires
+4. `engramd`'s middleware (`crates/engramd/src/auth.rs`) requires
    `Authorization: Bearer <key>` on every non-`/health` route when
    `ENGRAMD_API_KEY` is set, with constant-time comparison and a 100 req/s
    rate limit.
@@ -129,12 +138,23 @@ So the vault UI's same-origin fetches (`fetch('/health')` etc. — `API = ''`
 in `ui/engram-vault/js/main.js`) work without embedding any API key in the
 SPA. The API key lives only in server-side config.
 
+The SPA keeps the vault credentials only in `sessionStorage`
+(`engram-vault-creds`) — per-tab, gone when the tab closes, deliberately no
+"keep me signed in". If a previous basic-auth session left credentials in
+the browser's auth cache, the login screen probes `/health` headerless once
+and auto-enters; that self-eliminates after the first sign-out.
+
 **Sign-out:** basic auth has no server-side session — the browser caches
 the credentials. The SPA's "Sign out" calls `/auth/ui-logout`, which Caddy
 answers with `401` + `WWW-Authenticate: Basic realm="restricted"`; the
-matching challenge makes Chrome/Firefox discard the cached credentials, so
-the next `/app` load re-prompts (Safari may keep the cache — closing the
-tab always works).
+matching challenge makes Chrome/Firefox discard the cached credentials
+(Safari may keep the cache — closing the tab always works). The SPA then
+clears `sessionStorage` and returns to the login screen without a reload.
+
+**Known consequence:** `WebSocket()` cannot set headers, so `/ws/events`
+always 401s behind the gate; the UI's existing 5s polling + 8s reconnect
+fallback takes over permanently (the stream badge shows "polling" instead
+of "live").
 
 ## First-run checklist
 
@@ -157,8 +177,10 @@ tab always works).
    ```bash
    journalctl -u engramd -n 50                 # daemon started, vault opened
    curl -s http://127.0.0.1:8787/health        # direct API health check
-   curl -sI https://engram.ellmstack.dev/      # 200, valid TLS cert
-   curl -sI https://engram.ellmstack.dev/app/  # 401 without basic auth
+   curl -sI https://engram.ellmstack.dev/       # 200, valid TLS cert
+   curl -sI https://engram.ellmstack.dev/app/   # 200 — public SPA shell (login screen)
+   curl -sI https://engram.ellmstack.dev/health # 401, and NO www-authenticate header
+   curl -sI -u user:pass https://engram.ellmstack.dev/health  # 200 — the SPA's login path
    ```
 
 TLS certificates are issued and renewed automatically by Caddy via
@@ -193,6 +215,11 @@ the same origin, so use a tiny proxy — see below):
 cargo run -p engramd -- daemon --vault ./engram-data          # API on :8787
 python3 ui/engram-vault/server.py                             # static + mock API on :8787 (offline demo)
 ```
+
+The mock server (and a local `engramd` without the Caddy gate) applies no
+basic auth, so the login screen's headerless `/health` probe always
+succeeds and the SPA auto-enters — the login flow itself is only
+exercisable behind the real Caddy gate.
 
 For live-API development, serve `ui/engram-vault/` statically and proxy
 non-file requests to `127.0.0.1:8787` (any dev proxy works; Caddy with the

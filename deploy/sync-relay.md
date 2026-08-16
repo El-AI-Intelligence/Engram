@@ -68,9 +68,10 @@ old and new binaries.
   only `sha256(key)` — a DB leak cannot recover account keys. Revocation is
   soft (row kept as audit trail).
 - **Browser e2e** (human step, on this box): open
-  https://engram.ellmstack.dev (basic auth), Settings → Account → Register
-  passkey → Sign out → Sign in → mint a key → "Connect this device" →
-  restart engramd → Sync & Team shows this device's label and a green push.
+  https://engram.ellmstack.dev (branded login screen), Settings → Account →
+  Register passkey → Sign out → Sign in → mint a key → "Connect this device"
+  → restart engramd → Sync & Team shows this device's label and a green
+  push.
 
 ## Add / rotate an API key
 

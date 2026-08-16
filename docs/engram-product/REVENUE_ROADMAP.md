@@ -16,7 +16,7 @@
 - E2E sync **client** in `engramd` (`/sync/status`, `sync_server_url` config) — edit propagation via `modified_at` push cursor (2026-08-14)
 - `engramd-sync` — sync **relay server**: "dumb pipe" for encrypted blobs, HMAC verification, token-bucket rate limiting, tombstones with 30-day retention, API-key auth, plus (1.2) passkey accounts, per-account keys, device labels, and quota enforcement. Live at `sync.ellmstack.dev`.
 - **Shared-vault v0 (teams) shipped 2026-08-14:** `vault_id` + passphrase multi-device sync, device roster endpoint, `/teams/status`, Settings "Sync & Team" panel. Zero-knowledge core untouched — the server still only sees device IDs and blob counts.
-- Live site: landing + vault UI + API behind Caddy basic auth
+- Live site: landing + vault UI (branded login screen) + API behind Caddy basic auth
 - Guardrail platform experience (WebAuthn accounts, admin dashboard, roles) to reuse for the control plane
 
 ---
