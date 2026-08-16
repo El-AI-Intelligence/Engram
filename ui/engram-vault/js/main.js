@@ -2083,7 +2083,8 @@ route('/settings', async () => {
     }
     const renderSignedOut = () => {
       bodyEl.innerHTML = `
-        <div class="mutation" style="display:flex;gap:0.5rem;padding:1rem;">
+        <div class="health-row faint">Not signed in — no account session on this browser.</div>
+        <div class="mutation" style="display:flex;gap:0.5rem;padding:0 1rem 1rem;">
           <button class="btn btn-primary" id="acct-register">Register passkey</button>
           <button class="btn" id="acct-login">Sign in with passkey</button>
         </div>`;
@@ -2111,8 +2112,10 @@ route('/settings', async () => {
     const activeKeys = (acct.keys || []).filter(k => !k.revoked);
     const revokedKeys = (acct.keys || []).filter(k => k.revoked);
     bodyEl.innerHTML = `
-      <div class="health-row">Account: <span class="mono">${esc((acct.account_id || '').slice(0, 13))}…</span>
-        <span class="ml-auto"><button class="btn btn-sm" id="acct-logout">Sign out</button></span></div>
+      <div class="health-row">Signed in as <span class="mono">${esc((acct.account_id || '').slice(0, 13))}…</span></div>
+      <div class="mutation" style="display:flex;gap:0.5rem;padding:0 1rem 0.5rem;flex-wrap:wrap;">
+        <button class="btn btn-sm btn-danger" id="acct-logout">Sign out</button>
+      </div>
       ${quotaBar('Devices', q.devices_used || 0, q.devices || 0)}
       ${quotaBar('Bytes', q.bytes_used || 0, q.bytes || 0, formatBytes)}
       <div class="health-row" style="margin-top:0.5rem;"><strong>API keys</strong>
