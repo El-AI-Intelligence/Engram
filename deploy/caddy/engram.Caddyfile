@@ -81,12 +81,20 @@ engram.ellmstack.dev {
 
 	# Strip the Basic challenge from API-path 401s so the browser never shows the
 	# native auth popup — the SPA login screen sends explicit Authorization headers.
-	# Site-level on purpose (NOT inside `handle @api`): `header` sorts before
-	# `basic_auth` in Caddy's directive order and its deletions are deferred to
-	# response-write time, so this wraps basic_auth's own 401s; a header inside
-	# `handle @api` would never run (basic_auth terminates the chain first).
-	# /auth/ui-logout is NOT in @api, so its deliberate challenge still works.
-	header @api -WWW-Authenticate
+	# Must live in handle_errors: basic_auth's 401 is written through Caddy's
+	# ERROR path, which bypasses the `header` directive's write-time wrapper
+	# (verified against Caddy 2.11 on the box — `header @api -WWW-Authenticate`
+	# does NOT strip basic_auth's own 401s), while handle_errors intercepts the
+	# error response before it is written, where the strip does apply.
+	# /auth/ui-logout's 401 is a `respond`, i.e. a normal handler response, not
+	# an error — it never enters handle_errors and keeps its deliberate challenge.
+	handle_errors 401 {
+		@api_err path /health /memories* /context* /consolidate* /analytics* /config /export /import /ws* /annotations* /searches* /privacy* /sync* /teams* /digest*
+		handle @api_err {
+			header -WWW-Authenticate
+			respond "unauthorized" 401
+		}
+	}
 
 	# ── Vault UI SPA at /app ────────────────────────────────────────────────
 	# No-build static SPA with hash routing (#/, #/memories, ...), so the only

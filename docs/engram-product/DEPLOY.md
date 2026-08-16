@@ -123,9 +123,14 @@ caddy hash-password
    **basic auth** (`ENGRAM_UI_USER` / bcrypt hash). The login form sends an
    explicit `Authorization: Basic base64(user:pass)` header — browsers never
    show the native popup when a request already carries credentials, and
-   Caddy strips the `WWW-Authenticate` challenge from API 401s (site-level
-   `header @api -WWW-Authenticate`), so a rejected login shows an inline
-   error on the login screen instead.
+   Caddy strips the `WWW-Authenticate` challenge from API 401s, so a
+   rejected login shows an inline error on the login screen instead. The
+   strip lives in a `handle_errors 401` route (see the Caddyfile comment):
+   basic_auth's 401 travels Caddy's error path, which bypasses the `header`
+   directive's write-time wrapper — verified on Caddy 2.11, a site-level
+   `header @api -WWW-Authenticate` does NOT strip basic_auth's own 401s.
+   `/auth/ui-logout`'s 401 is a `respond`, not an error, so it keeps its
+   deliberate challenge.
 3. For proxied API requests, Caddy **replaces** the `Authorization` header
    with `Bearer {$ENGRAMD_API_KEY}` before forwarding to `engramd`
    (`header_up` in `deploy/caddy/engram.Caddyfile`).
