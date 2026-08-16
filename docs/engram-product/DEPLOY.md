@@ -49,20 +49,22 @@ busy").
 
 ## Cloudflare
 
-`engram.ellmstack.dev` is (as of 2026-08-16) **orange-cloud proxied** through
-Cloudflare. That caused stale-UI incidents: the edge caches `main.js` and
-keeps serving it after deploys. Two fixes:
+`engram.ellmstack.dev` is **grey-cloud (DNS only)** — flipped 2026-08-16
+after repeated stale-UI incidents: while orange-cloud proxied, the edge
+caches `main.js` and keeps serving it after deploys, and Cloudflare
+terminates TLS (seeing vault traffic, undermining the end-to-end story).
+The A record points straight at the site box and Caddy serves its own
+Let's Encrypt cert; `dig +short engram.ellmstack.dev` → 204.168.163.161.
+The vault SPA also serves `Cache-Control: no-cache`, so browsers revalidate
+on every load.
 
-- **One-time:** Cloudflare dashboard → zone `ellmstack.dev` → Caching →
-  Purge Everything, then hard-refresh.
-- **Permanent (recommended):** flip the `engram` A and AAAA records to
-  **grey cloud (DNS only)**, matching the `sync` record. The box's ufw
-  allows 80/443 from anywhere and Caddy has its own Let's Encrypt cert, so
-  nothing else changes — and Cloudflare stops seeing vault traffic (it
-  terminates TLS while proxied, which undermines the end-to-end story).
-  After flipping, `dig +short engram.ellmstack.dev` should show
-  204.168.163.161. The vault SPA also serves `Cache-Control: no-cache`, so
-  browsers revalidate on every load.
+If the record is ever re-proxied (orange): expect stale-UI reports again —
+purge the zone cache after each deploy, or flip back to grey. The flip was
+done via the Cloudflare API (zone `ellmstack.dev`
+`010caaa5c0050af0606fa00f1395fc11`, A record
+`3a6786e6ced92607be9d00c2b272f049`, `proxied: false`); Claude Code has the
+`cloudflare@cloudflare` plugin installed (OAuth'd MCP), so DNS/cache changes
+can be made with the API instead of the dashboard.
 
 ## Prerequisites
 
