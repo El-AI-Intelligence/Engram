@@ -735,6 +735,7 @@ route('/login', () => {
             <div class="login-brand"><span class="brand-gem">◆</span> Engram Vault</div>
             <div class="modal-body">
               <p class="faint" style="margin-top:0;">Sign in to access your memories.</p>
+              <div id="login-acct"></div>
               <input id="login-user" type="text" placeholder="Username" autocomplete="username" autocapitalize="off" spellcheck="false">
               <input id="login-pass" type="password" placeholder="Password" autocomplete="current-password">
               <div id="login-error"></div>
@@ -787,6 +788,57 @@ route('/login', () => {
       // Passkey sign-in lands back here (the 'form' view) via renderLoginView;
       // only fresh registration shows the pairing wizard.
       document.getElementById('login-passkey').onclick = (e) => { e.preventDefault(); webauthnLogin(PAIR_CODE_SERVER); };
+
+      // A verified account changes this view visibly: a banner with the
+      // account id plus pair / sign-out actions, so a successful passkey
+      // login clearly "does something" without forcing the wizard.
+      if (api.account.token()) {
+        const acctEl = document.getElementById('login-acct');
+        acctEl.innerHTML = '<div class="faint">Checking account…</div>';
+        (async () => {
+          try {
+            const acct = await api.account.get(PAIR_CODE_SERVER);
+            acctEl.innerHTML = `
+              <div class="settings-note">
+                <div class="faint">✓ Signed in as <span class="mono">${esc((acct.account_id || '').slice(0, 13))}…</span></div>
+                <div class="mutation" style="padding:0;">
+                  <button class="btn btn-sm" id="login-pair">Pair this machine</button>
+                  <button class="btn btn-sm" id="login-acct-logout">Sign out</button>
+                </div>
+                <div id="login-pair-once"></div>
+              </div>`;
+            document.getElementById('login-pair').onclick = async () => {
+              const once = document.getElementById('login-pair-once');
+              once.innerHTML = '<div class="faint">Requesting a pairing code…</div>';
+              try {
+                const res = await api.account.pairCodes(PAIR_CODE_SERVER);
+                once.innerHTML = pairCodeHtml(res.code);
+                wirePairCodeCopies(once);
+              } catch (e) {
+                if (e.status === 401) {
+                  api.account.setToken(null);
+                  toast('Account session expired — sign in again', 'error');
+                  renderLoginView('form');
+                  return;
+                }
+                once.innerHTML = `<div class="error-panel"><p>${esc(e.message)}</p></div>`;
+              }
+            };
+            document.getElementById('login-acct-logout').onclick = async (e) => {
+              e.preventDefault();
+              try { await api.account.logout(PAIR_CODE_SERVER); } catch {}
+              api.account.setToken(null);
+              toast('Signed out', 'ok');
+              renderLoginView('form');
+            };
+          } catch (e) {
+            if (e.status === 401) {
+              api.account.setToken(null);
+              acctEl.innerHTML = '';
+            }
+          }
+        })();
+      }
     }
   };
 
