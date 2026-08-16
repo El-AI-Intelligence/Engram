@@ -2131,8 +2131,13 @@ route('/settings', async () => {
     document.getElementById('acct-logout').onclick = async () => {
       try { await api.account.logout(server); } catch {}
       api.account.setToken(null);
+      // Also drop the vault's HTTP basic-auth gate: /auth/ui-logout answers
+      // 401 with a fresh challenge (Caddy config), which makes the browser
+      // clear its cached vault credentials. 401 is the EXPECTED reply, so
+      // this fetch resolves — then reload /app and the browser re-prompts.
+      try { await fetch('/auth/ui-logout', { method: 'POST' }); } catch {}
       toast('Signed out', 'ok');
-      render();
+      setTimeout(() => { window.location.href = '/app/'; }, 600);
     };
 
     document.getElementById('acct-new-key').onclick = async () => {

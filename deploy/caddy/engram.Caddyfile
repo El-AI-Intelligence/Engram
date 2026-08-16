@@ -46,6 +46,18 @@ engram.ellmstack.dev {
 		{$ENGRAM_UI_USER} {$ENGRAM_UI_PASS_HASH}
 	}
 
+	# ── Sign out of the vault UI ─────────────────────────────────────────────
+	# HTTP basic auth has no server-side session: the browser caches the
+	# password and re-sends it on every request. Answering 401 with a fresh
+	# challenge for the SAME realm makes Chrome/Firefox discard the cached
+	# credentials, so the next /app load prompts again (Safari may keep the
+	# cache; closing the tab always works). The SPA calls this route when the
+	# user clicks "Sign out" in Settings → Account & Sync.
+	handle /auth/ui-logout {
+		header WWW-Authenticate `Basic realm="restricted"`
+		respond "Signed out of the vault." 401
+	}
+
 	# ── SSE: real-time context stream (must precede @api: both match) ────────
 	# /context/stream is Server-Sent Events (crates/engramd/src/routes/context.rs).
 	# flush_interval -1 disables response buffering so events arrive immediately.

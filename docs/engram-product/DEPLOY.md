@@ -129,6 +129,13 @@ So the vault UI's same-origin fetches (`fetch('/health')` etc. — `API = ''`
 in `ui/engram-vault/js/main.js`) work without embedding any API key in the
 SPA. The API key lives only in server-side config.
 
+**Sign-out:** basic auth has no server-side session — the browser caches
+the credentials. The SPA's "Sign out" calls `/auth/ui-logout`, which Caddy
+answers with `401` + `WWW-Authenticate: Basic realm="restricted"`; the
+matching challenge makes Chrome/Firefox discard the cached credentials, so
+the next `/app` load re-prompts (Safari may keep the cache — closing the
+tab always works).
+
 ## First-run checklist
 
 1. DNS A record live and ports 80/443 open.
