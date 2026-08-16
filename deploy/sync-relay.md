@@ -32,7 +32,7 @@ cargo build --release -p engramd-sync          # locally
 scp deploy/systemd/engramd-sync.service hetzner-sync:/etc/systemd/system/
 ssh hetzner-sync 'systemctl daemon-reload && systemctl stop engramd-sync'
 scp target/release/engramd-sync hetzner-sync:/usr/local/bin/engramd-sync
-ssh hetzner-sync 'systemctl start engramd-sync && curl -s 127.0.0.1:8788/health'
+ssh hetzner-sync 'systemctl start engramd-sync && sleep 2 && curl -s 127.0.0.1:8788/health'
 curl -s https://sync.ellmstack.dev/health
 ```
 
