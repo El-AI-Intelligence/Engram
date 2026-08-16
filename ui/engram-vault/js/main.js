@@ -1789,6 +1789,14 @@ route('/settings', async () => {
     <div class="page settings-page">
       <h2>Vault Settings</h2>
 
+      <div class="settings-tabs">
+        <button class="tab-btn" data-tab="account-sync">Account &amp; Sync</button>
+        <button class="tab-btn" data-tab="vault">Vault</button>
+        <button class="tab-btn" data-tab="privacy">Privacy</button>
+        <button class="tab-btn" data-tab="automation">Automation</button>
+      </div>
+
+      <div class="tab-panel" id="tab-vault">
       <div class="panel" style="margin-bottom:1rem;">
         <div class="panel-header">Vault</div>
         <div class="health-list">
@@ -1846,6 +1854,9 @@ route('/settings', async () => {
         </div>
       </div>
 
+      </div>
+
+      <div class="tab-panel active" id="tab-account-sync">
       <div class="panel" style="margin-bottom:1rem;">
         <div class="panel-header">Remote Access</div>
         <div class="settings-note">
@@ -1912,6 +1923,9 @@ route('/settings', async () => {
         </div>
       </div>
 
+      </div>
+
+      <div class="tab-panel" id="tab-privacy">
       <div class="panel" style="margin-bottom:1rem;">
         <div class="panel-header">Privacy — What's Stored</div>
         ${audit ? `
@@ -1974,6 +1988,9 @@ route('/settings', async () => {
         </div>
       </div>
 
+      </div>
+
+      <div class="tab-panel" id="tab-automation">
       <div class="panel" style="margin-bottom:1rem;">
         <div class="panel-header">Saved Searches <button class="btn btn-sm" id="ss-check-all">Check all now</button></div>
         <div class="ss-form">
@@ -1988,7 +2005,7 @@ route('/settings', async () => {
           <button id="ss-add" class="btn btn-primary btn-sm">Save</button>
         </div>
         <div id="ss-list" class="ss-list"><div class="loading-sm">Loading…</div></div>
-      
+      </div>
 
       <div class="panel">
         <div class="panel-header">Onboarding &amp; Demo Data</div>
@@ -2004,8 +2021,24 @@ route('/settings', async () => {
           <button class="btn" id="btn-replay-onboarding">Replay onboarding wizard</button>
         </div>
       </div>
+      </div>
     </div>
   `;
+
+  // ── Settings tabs: one group of panels at a time, choice persisted
+  (function initSettingsTabs() {
+    const tabs = document.querySelectorAll('.settings-tabs .tab-btn');
+    const panels = document.querySelectorAll('.tab-panel');
+    const saved = localStorage.getItem('engram-settings-tab');
+    const activate = (btn) => {
+      tabs.forEach(t => t.classList.toggle('active', t === btn));
+      panels.forEach(p => p.classList.toggle('active', p.id === 'tab-' + btn.dataset.tab));
+      localStorage.setItem('engram-settings-tab', btn.dataset.tab);
+    };
+    const initial = [...tabs].find(t => t.dataset.tab === saved) || tabs[0];
+    activate(initial);
+    tabs.forEach(btn => { btn.onclick = () => activate(btn); });
+  })();
 
   // ── Slider value labels
   document.getElementById('set-budget').oninput = function() {
