@@ -611,6 +611,16 @@ pub async fn handle_pair(
         }
     }
 
+    // Re-pointing a vault at a new relay must re-sync its EXISTING
+    // memories: sync_state.json remembers pushes against the old relay,
+    // so without a reset the daemon would only ever sync memories
+    // captured after the pair. Dropping it makes the next tick a full
+    // first sync (push everything local, pull everything remote).
+    let sync_state = vault_path.join("sync_state.json");
+    if sync_state.exists() {
+        std::fs::remove_file(&sync_state)?;
+    }
+
     println!();
     println!("  ✅ Paired! The relay issued a new API key — stored in {}", cfg_path.display());
     println!("     (the key is masked in all status output; it is not printed here)");
