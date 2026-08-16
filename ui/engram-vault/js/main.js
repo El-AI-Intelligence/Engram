@@ -156,6 +156,7 @@ const api = {
     get: (server) => acctGet(server, '/account'),
     createKey: (server, vaultId) => acctPost(server, '/account/keys', vaultId ? { vault_id: vaultId } : {}),
     revokeKey: (server, keyId) => acctDel(server, '/account/keys/' + encodeURIComponent(keyId)),
+    pairCodes: (server) => acctPost(server, '/devices/pair-codes', {}),
   },
   sync: {
     now: () => post('/sync/now'),
@@ -191,6 +192,9 @@ const VAULT_CREDS_KEY = 'engram-vault-creds';
 // cannot read, so we trust the browser to keep attaching them and skip the
 // form. Cleared together with the form credentials on sign-out / 401.
 const VAULT_PROBE_KEY = 'engram-vault-probe';
+// Set on sign-out: the login screen's auto-enter probe must NOT re-admit
+// this tab after an in-tab sign-out. Tab-lifetime like the creds above.
+const VAULT_NO_PROBE_KEY = 'engram-no-probe';
 
 function getCreds() {
   return sessionStorage.getItem(VAULT_CREDS_KEY);
@@ -203,6 +207,7 @@ function setCreds(b64) {
 function clearCreds() {
   sessionStorage.removeItem(VAULT_CREDS_KEY);
   sessionStorage.removeItem(VAULT_PROBE_KEY);
+  sessionStorage.setItem(VAULT_NO_PROBE_KEY, '1');
 }
 
 function hasAuth() {
@@ -623,62 +628,165 @@ function openCaptureModal() {
 // request already carries credentials, and Caddy strips the challenge from
 // API 401s anyway. One silent headerless /health probe first: if the
 // browser still holds popup-era cached creds (Safari-class), enter without
-// prompting — self-eliminating once the user signs out once.
+// prompting — self-eliminating once the user signs out once (the probe is
+// suppressed after an in-tab sign-out via VAULT_NO_PROBE_KEY).
+//
+// The login screen is also the site's front door for Engram ACCOUNTS
+// (roadmap 1.2): "Create an account" registers a passkey against the
+// public relay, then lands on the Add-device wizard (WARP-style pairing
+// code). No vault credentials are needed for any of that — the relay calls
+// go straight from the browser, and the hosted site's relay is fixed.
 
 route('/login', () => {
   const app = document.getElementById('app');
-  app.innerHTML = `
-    <div class="modal-overlay">
-      <div class="modal login-modal">
-        <div class="login-brand"><span class="brand-gem">◆</span> Engram Vault</div>
-        <div class="modal-body">
-          <p class="faint" style="margin-top:0;">Sign in to access your memories.</p>
-          <input id="login-user" type="text" placeholder="Username" autocomplete="username" autocapitalize="off" spellcheck="false">
-          <input id="login-pass" type="password" placeholder="Password" autocomplete="current-password">
-          <div id="login-error"></div>
-          <div class="mutation">
-            <button class="btn btn-primary" id="login-submit">Sign in</button>
+  // The relay behind the hosted site is fixed; the Settings panel uses the
+  // daemon's configured server_url for custom-relay users.
+  const PAIR_CODE_SERVER = 'https://sync.ellmstack.dev';
+
+  const renderLoginView = (view) => {
+    if (view === 'register') {
+      app.innerHTML = `
+        <div class="modal-overlay">
+          <div class="modal login-modal">
+            <div class="login-brand"><span class="brand-gem">◆</span> Engram Vault</div>
+            <div class="modal-body">
+              <p class="faint" style="margin-top:0;">Engram accounts are passkeys — no email, no password. The account is how your devices find each other.</p>
+              <div class="mutation">
+                <button class="btn btn-primary" id="reg-create">Create account</button>
+              </div>
+              <div class="login-alt">
+                <p class="faint"><a href="#" id="reg-back">← Back to sign in</a></p>
+              </div>
+            </div>
           </div>
-        </div>
-      </div>
-    </div>`;
+        </div>`;
+      // webauthnRegister calls render() on success — the login route then
+      // sees the fresh session token and lands on the 'pair' view.
+      document.getElementById('reg-create').onclick = () => webauthnRegister(PAIR_CODE_SERVER);
+      document.getElementById('reg-back').onclick = (e) => { e.preventDefault(); renderLoginView('form'); };
+    } else if (view === 'pair') {
+      app.innerHTML = `
+        <div class="modal-overlay">
+          <div class="modal login-modal">
+            <div class="login-brand"><span class="brand-gem">◆</span> Engram Vault</div>
+            <div class="modal-body">
+              <p class="faint" style="margin-top:0;">Signed in<span id="pair-acct"></span>. Now link this machine:</p>
+              <div class="mutation">
+                <button class="btn btn-primary" id="pair-mint">Pair a device</button>
+              </div>
+              <div id="pair-once"></div>
+              <div class="login-alt">
+                <p class="faint"><a href="#" id="pair-back">← Back to vault sign in</a> · <a href="#" id="pair-logout">Sign out</a></p>
+              </div>
+            </div>
+          </div>
+        </div>`;
+      document.getElementById('pair-mint').onclick = async () => {
+        const el = document.getElementById('pair-once');
+        el.innerHTML = '<div class="faint">Requesting a pairing code…</div>';
+        try {
+          const res = await api.account.pairCodes(PAIR_CODE_SERVER);
+          el.innerHTML = pairCodeHtml(res.code);
+          wirePairCodeCopies(el);
+        } catch (e) {
+          if (e.status === 401) {
+            api.account.setToken(null);
+            toast('Account session expired — sign in again', 'error');
+            renderLoginView('form');
+            return;
+          }
+          el.innerHTML = `<div class="error-panel"><p>${esc(e.message)}</p></div>`;
+        }
+      };
+      document.getElementById('pair-back').onclick = (e) => { e.preventDefault(); renderLoginView('form'); };
+      document.getElementById('pair-logout').onclick = async (e) => {
+        e.preventDefault();
+        try { await api.account.logout(PAIR_CODE_SERVER); } catch {}
+        api.account.setToken(null);
+        toast('Signed out', 'ok');
+        renderLoginView('form');
+      };
+      // Validate the session and show the account id (401 → back to form).
+      (async () => {
+        try {
+          const acct = await api.account.get(PAIR_CODE_SERVER);
+          const el = document.getElementById('pair-acct');
+          if (el) el.textContent = ' as ' + (acct.account_id || '').slice(0, 13) + '…';
+        } catch (e) {
+          if (e.status === 401) {
+            api.account.setToken(null);
+            toast('Account session expired — sign in again', 'error');
+            renderLoginView('form');
+          }
+        }
+      })();
+    } else {
+      app.innerHTML = `
+        <div class="modal-overlay">
+          <div class="modal login-modal">
+            <div class="login-brand"><span class="brand-gem">◆</span> Engram Vault</div>
+            <div class="modal-body">
+              <p class="faint" style="margin-top:0;">Sign in to access your memories.</p>
+              <input id="login-user" type="text" placeholder="Username" autocomplete="username" autocapitalize="off" spellcheck="false">
+              <input id="login-pass" type="password" placeholder="Password" autocomplete="current-password">
+              <div id="login-error"></div>
+              <div class="mutation">
+                <button class="btn btn-primary" id="login-submit">Sign in</button>
+              </div>
+              <div class="login-alt">
+                <p class="faint">New here? <a href="#" id="login-register">Create an Engram account</a> — it's how your devices sync.</p>
+                <p class="faint">Already have an account? <a href="#" id="login-passkey">Sign in with a passkey</a> to pair a device.</p>
+              </div>
+            </div>
+          </div>
+        </div>`;
 
-  const fail = (msg) => {
-    document.getElementById('login-error').innerHTML = `<div class="error-panel"><p>${esc(msg)}</p></div>`;
-  };
+      const fail = (msg) => {
+        document.getElementById('login-error').innerHTML = `<div class="error-panel"><p>${esc(msg)}</p></div>`;
+      };
 
-  const submit = async () => {
-    const btn = document.getElementById('login-submit');
-    const user = document.getElementById('login-user').value.trim();
-    const pass = document.getElementById('login-pass').value;
-    if (!user || !pass) return;
-    const b64 = btoa(unescape(encodeURIComponent(user + ':' + pass)));
-    btn.disabled = true;
-    try {
-      const r = await fetch(API + '/health', { headers: { Authorization: 'Basic ' + b64 } });
-      if (r.ok) {
-        setCreds(b64);
-        updateStatus();
-        navigate('#/');
-        return;
-      }
-      if (r.status === 401) fail('Incorrect username or password.');
-      else fail(`Sign-in failed (${r.status}).`);
-    } catch (e) {
-      fail('Cannot reach the vault server.');
-    } finally {
-      btn.disabled = false;
+      const submit = async () => {
+        const btn = document.getElementById('login-submit');
+        const user = document.getElementById('login-user').value.trim();
+        const pass = document.getElementById('login-pass').value;
+        if (!user || !pass) return;
+        const b64 = btoa(unescape(encodeURIComponent(user + ':' + pass)));
+        btn.disabled = true;
+        try {
+          const r = await fetch(API + '/health', { headers: { Authorization: 'Basic ' + b64 } });
+          if (r.ok) {
+            setCreds(b64);
+            updateStatus();
+            navigate('#/');
+            return;
+          }
+          if (r.status === 401) fail('Incorrect username or password.');
+          else fail(`Sign-in failed (${r.status}).`);
+        } catch (e) {
+          fail('Cannot reach the vault server.');
+        } finally {
+          btn.disabled = false;
+        }
+      };
+
+      document.getElementById('login-submit').onclick = submit;
+      const onKey = (e) => { if (e.key === 'Enter') submit(); };
+      document.getElementById('login-user').onkeydown = onKey;
+      document.getElementById('login-pass').onkeydown = onKey;
+      document.getElementById('login-user').focus();
+      document.getElementById('login-register').onclick = (e) => { e.preventDefault(); renderLoginView('register'); };
+      // Passkey sign-in lands on the 'pair' view via webauthnLogin's render().
+      document.getElementById('login-passkey').onclick = (e) => { e.preventDefault(); webauthnLogin(PAIR_CODE_SERVER); };
     }
   };
 
-  document.getElementById('login-submit').onclick = submit;
-  const onKey = (e) => { if (e.key === 'Enter') submit(); };
-  document.getElementById('login-user').onkeydown = onKey;
-  document.getElementById('login-pass').onkeydown = onKey;
-  document.getElementById('login-user').focus();
+  if (api.account.token()) renderLoginView('pair');
+  else renderLoginView('form');
 
-  // Transition probe (comment above) — auto-enter on cached creds.
+  // Transition probe (comment above) — auto-enter on cached creds, unless
+  // this tab signed out (VAULT_NO_PROBE_KEY).
   (async () => {
+    if (sessionStorage.getItem(VAULT_NO_PROBE_KEY) === '1') return;
     try {
       const r = await fetch(API + '/health');
       if (r.ok) {
@@ -1909,6 +2017,34 @@ async function webauthnLogin(server) {
   }
 }
 
+// Shared pairing-code panel: used by the login screen's Add-device wizard
+// and the Settings → Account & Sync panel. The code is single-use and
+// expires in 10 minutes (server-side); copy buttons wire via delegation-
+// style data attributes because the host containers differ.
+function pairCodeHtml(code) {
+  const cmd = `engram pair ${code}`;
+  return `
+    <div class="settings-note">
+      <strong>Pair this machine within 10 minutes:</strong><br>
+      <div class="pair-code mono">${esc(code)}</div>
+      <div class="pair-command mono">${esc(cmd)}</div>
+      <div class="faint">Run the command on the machine. The device appears in Account &amp; Sync → Devices after its first sync. Codes are single-use; this one expires in 10 minutes.</div>
+    </div>
+    <div class="mutation" style="display:flex;gap:0.5rem;padding:0 1rem 1rem;flex-wrap:wrap;">
+      <button class="btn btn-sm" data-copy="${esc(code)}">Copy code</button>
+      <button class="btn btn-sm" data-copy="${esc(cmd)}">Copy command</button>
+    </div>`;
+}
+
+function wirePairCodeCopies(el) {
+  el.querySelectorAll('[data-copy]').forEach(b => {
+    b.onclick = async () => {
+      try { await navigator.clipboard.writeText(b.getAttribute('data-copy')); toast('Copied', 'ok'); }
+      catch { toast('Copy failed — copy the text manually', 'error'); }
+    };
+  });
+}
+
 // ── Settings ───────────────────────────────────────────────────────────────
 
 route('/settings', async () => {
@@ -2262,7 +2398,8 @@ route('/settings', async () => {
       ${quotaBar('Devices', q.devices_used || 0, q.devices || 0)}
       ${quotaBar('Bytes', q.bytes_used || 0, q.bytes || 0, formatBytes)}
       <div class="health-row" style="margin-top:0.5rem;"><strong>API keys</strong>
-        <span class="ml-auto"><button class="btn btn-sm btn-primary" id="acct-new-key">New key${(team?.vault_id || sync.vault_id) ? ' (this vault)' : ''}</button></span></div>
+        <span class="ml-auto"><button class="btn btn-sm" id="acct-pair">Pair a device</button> <button class="btn btn-sm btn-primary" id="acct-new-key">New key${(team?.vault_id || sync.vault_id) ? ' (this vault)' : ''}</button></span></div>
+      <div id="acct-pair-once"></div>
       ${activeKeys.map(k => `
         <div class="health-row"><span class="mono">${esc(k.key_prefix)}…</span>
           <span class="faint">${k.vault_id ? 'scoped to ' + esc(k.vault_id) : 'all vaults'} · ${esc(String(k.created_at || '').slice(0, 10))}</span>
@@ -2310,6 +2447,18 @@ route('/settings', async () => {
           } catch (e) { toast(e.message || 'Save failed', 'error'); }
         };
       } catch (e) { toast(e.message || 'Key creation failed', 'error'); }
+    };
+
+    document.getElementById('acct-pair').onclick = async () => {
+      const el = document.getElementById('acct-pair-once');
+      el.innerHTML = '<div class="faint">Requesting a pairing code…</div>';
+      try {
+        const res = await api.account.pairCodes(server);
+        el.innerHTML = pairCodeHtml(res.code);
+        wirePairCodeCopies(el);
+      } catch (e) {
+        el.innerHTML = `<div class="error-panel"><p>${esc(e.message)}</p></div>`;
+      }
     };
 
     bodyEl.querySelectorAll('[data-revoke]').forEach(btn => {

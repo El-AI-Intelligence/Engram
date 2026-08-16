@@ -71,6 +71,34 @@ pub fn generate_api_key() -> anyhow::Result<String> {
     Ok(format!("{API_KEY_PREFIX}{}", random_base64url(32)?))
 }
 
+/// Alphabet for pairing codes, without ambiguous glyphs (no 0/O, 1/I/L) —
+/// a code is read off a screen and typed on another machine.
+const PAIRING_ALPHABET: &[u8] = b"23456789ABCDEFGHJKMNPQRSTUVWXYZ";
+
+/// Mint a one-time device-pairing code: `ENG-XXXX-XXXX-XXXX` (12 random
+/// bytes over the 31-char alphabet ≈ 60 bits). Single-use and TTL'd at
+/// redemption, so the code needs no server-side plaintext beyond the mint
+/// response. Rejection sampling keeps the modulo mapping unbiased.
+pub fn generate_pairing_code() -> anyhow::Result<String> {
+    let limit = 256 - (256 % PAIRING_ALPHABET.len());
+    let mut buf = [0u8; 4];
+    let mut groups: Vec<String> = Vec::with_capacity(3);
+    while groups.len() < 3 {
+        rand::rngs::OsRng
+            .try_fill_bytes(&mut buf)
+            .map_err(|e| anyhow::anyhow!("OS RNG failure: {e}"))?;
+        let group: String = buf
+            .iter()
+            .filter(|&&b| (b as usize) < limit)
+            .map(|&b| PAIRING_ALPHABET[b as usize % PAIRING_ALPHABET.len()] as char)
+            .collect();
+        if group.len() == 4 {
+            groups.push(group);
+        }
+    }
+    Ok(format!("ENG-{}", groups.join("-")))
+}
+
 /// Mint a fresh session token: 32 random bytes (base64url). Only its
 /// sha256 is stored server-side.
 pub fn mint_session_token() -> anyhow::Result<String> {
@@ -213,6 +241,27 @@ mod tests {
             let token = mint_session_token().unwrap();
             assert_eq!(token.len(), 43);
             assert!(seen.insert(token), "duplicate session token generated");
+        }
+    }
+
+    #[test]
+    fn pairing_codes_are_well_formed_and_unique() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..100 {
+            let code = generate_pairing_code().unwrap();
+            let parts: Vec<&str> = code.split('-').collect();
+            assert_eq!(parts.len(), 4, "ENG-X-X-X shape");
+            assert_eq!(parts[0], "ENG");
+            for group in &parts[1..] {
+                assert_eq!(group.len(), 4);
+                assert!(
+                    group
+                        .bytes()
+                        .all(|b| PAIRING_ALPHABET.contains(&b)),
+                    "group {group} has chars outside the alphabet"
+                );
+            }
+            assert!(seen.insert(code), "duplicate pairing code generated");
         }
     }
 

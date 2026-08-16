@@ -95,6 +95,34 @@ above and `api_key` to your key — everything else in this document applies
 unchanged. See [Accounts & Passkeys](#accounts--passkeys) for the account
 model.
 
+#### Pairing a device (WARP-style, recommended)
+
+Copying API keys by hand is the manual path. The smooth path is a one-time
+pairing code, like Cloudflare WARP:
+
+1. In the vault UI, open **Settings → Account & Sync** and sign in with your
+   passkey (or create an account right from the login screen — "New here?
+   Create an account" — which lands directly on the pairing wizard).
+2. Click **Pair a device**. The site shows a single-use code
+   (`ENG-XXXX-XXXX-XXXX`, expires in 10 minutes).
+3. On the machine:
+
+```bash
+engram pair ENG-XXXX-XXXX-XXXX
+```
+
+That redeems the code for a new account API key and writes the sync block
+into `~/.engram/vault/config.json` (merging with an existing config — it
+works on existing vaults, not just fresh ones). Restart the daemon with
+`ENGRAM_PASSPHRASE` set and the device appears in the roster after its
+first push.
+
+Notes: codes are single-use, 10-minute TTL, and stored server-side only as
+sha256 — the plaintext is shown once. Paired keys are **unscoped in v1**
+(account-wide); the vault UI can also mint per-vault keys manually.
+Machine-keyed vaults (created without a passphrase) cannot pair — sync keys
+derive from the passphrase, so `engram pair` refuses them.
+
 ### 2. Configure your vault
 
 Add sync settings to `~/.engram/vault/config.json`:

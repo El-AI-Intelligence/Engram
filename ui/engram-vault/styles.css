@@ -1471,6 +1471,29 @@ input[type="file"] { font-size: var(--text-sm); color: var(--text-muted); }
   color: var(--text);
 }
 .login-brand .brand-gem { color: var(--semantic); }
+.login-alt { padding: 10px 24px 20px; }
+.login-alt p { margin: 6px 0 0; }
+.login-alt a { color: var(--semantic); text-decoration: none; }
+.login-alt a:hover { text-decoration: underline; }
+
+/* WARP-style pairing code (Add-device wizard + Account & Sync) */
+.pair-code {
+  font-size: 26px;
+  font-weight: 650;
+  letter-spacing: 4px;
+  text-align: center;
+  margin: 10px 0 8px;
+  color: var(--text);
+}
+.pair-command {
+  display: block;
+  text-align: center;
+  background: var(--bg-raised);
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin: 8px 0;
+  word-break: break-all;
+}
 
 .modal-header {
   display: flex;

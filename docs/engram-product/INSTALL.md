@@ -37,6 +37,17 @@ engram onboarding
 It creates the vault, captures your first memory, and starts the daemon,
 then prints the dashboard URL and next steps (MCP, sync).
 
+**Sync to your Engram account** (multi-device, WARP-style): create an
+account on the vault's login screen ("New here? Create an account") or
+Settings → Account & Sync, click **Pair a device**, then run the code:
+
+```bash
+engram pair ENG-XXXX-XXXX-XXXX
+```
+
+That redeems the one-time code for a sync key and wires this machine to
+your account — full details in [SYNC.md](SYNC.md).
+
 Or step through it manually:
 
 1. **Initialize your vault** (interactive wizard):

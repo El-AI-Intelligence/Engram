@@ -38,6 +38,8 @@ pub fn router() -> Router<SyncState> {
         .route("/account", get(get_account))
         .route("/account/keys", post(create_account_key))
         .route("/account/keys/{key_id}", delete(revoke_account_key))
+        .route("/devices/pair-codes", post(mint_pairing_code))
+        .route("/devices/pair", post(redeem_pairing_code))
 }
 
 // ── Register ────────────────────────────────────────────────────────────────
@@ -506,6 +508,173 @@ async fn revoke_account_key(
     Ok(Json(json!({"key_id": key_id, "revoked": true})))
 }
 
+// ── Device pairing (WARP-style onboarding) ──────────────────────────────────
+
+/// Pairing-code lifetime: 10 minutes — enough to walk from the browser to
+/// the machine, short enough to keep the guessing window small.
+const PAIRING_CODE_TTL_SECS: i64 = 600;
+/// Cap on live (unused, unexpired) pairing codes per account.
+const PAIRING_CODES_PER_ACCOUNT: i64 = 5;
+
+/// Mint a one-time pairing code for the signed-in account. The plaintext
+/// code is returned exactly once — the relay stores only its sha256
+/// (same discipline as API keys and sessions).
+async fn mint_pairing_code(
+    State(state): State<SyncState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let account_id = authenticate_session(&state, &headers).await?;
+
+    let code = auth::generate_pairing_code()
+        .map_err(|e| err_json(500, "rng_error", &e.to_string()))?;
+    let now = chrono::Utc::now();
+    let expires = now + chrono::Duration::seconds(PAIRING_CODE_TTL_SECS);
+
+    let conn = state.conn.lock().await;
+    // Sweep stale codes, then cap live codes per account.
+    conn.execute(
+        "DELETE FROM pairing_codes WHERE expires_at < ?1",
+        rusqlite::params![now.to_rfc3339()],
+    )
+    .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+    let live: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pairing_codes WHERE account_id = ?1 AND used = 0",
+            rusqlite::params![account_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+    if live >= PAIRING_CODES_PER_ACCOUNT {
+        return Err(err_json(
+            409,
+            "too_many_codes",
+            &format!(
+                "{PAIRING_CODES_PER_ACCOUNT} live pairing codes already exist — wait for one to expire"
+            ),
+        ));
+    }
+
+    conn.execute(
+        "INSERT INTO pairing_codes (code_hash, account_id, created_at, expires_at, used) \
+         VALUES (?1, ?2, ?3, ?4, 0)",
+        rusqlite::params![
+            auth::hash_key(&code).to_vec(),
+            account_id,
+            now.to_rfc3339(),
+            expires.to_rfc3339(),
+        ],
+    )
+    .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+
+    Ok(Json(json!({
+        "code": code, // shown once — the server keeps only its hash
+        "expires_in": PAIRING_CODE_TTL_SECS,
+    })))
+}
+
+/// Redeem a pairing code for an account API key. No session required —
+/// the code itself is the credential (single-use, 10-minute TTL).
+/// The minted key is unscoped in v1 (reaches every vault the account
+/// syncs); per-vault scoping comes once the wizard knows the vault id.
+async fn redeem_pairing_code(
+    State(state): State<SyncState>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    // Global token bucket: bounds total guessing attempts regardless of
+    // source. Codes are ~60-bit and single-use, so this only slows floods.
+    {
+        let mut limiters = state.rate_limiters.lock().await;
+        let limiter = limiters
+            .entry("pair-redeem".into())
+            .or_insert_with(|| crate::RateLimiter::new(5.0));
+        if !limiter.allow() {
+            return Err(err_json(
+                429,
+                "rate_limit_exceeded",
+                "too many pairing attempts — wait a moment and try again",
+            ));
+        }
+    }
+
+    let code = str_field(&body, "code")?.to_ascii_uppercase();
+    let conn = state.conn.lock().await;
+    let row: Option<(String, String, i64)> = conn
+        .query_row(
+            "SELECT account_id, expires_at, used FROM pairing_codes WHERE code_hash = ?1",
+            rusqlite::params![auth::hash_key(&code).to_vec()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()
+        .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+    let (account_id, expires_at, used) = row.ok_or_else(|| {
+        err_json(
+            401,
+            "invalid_pairing_code",
+            "unknown pairing code — mint a new one from the site",
+        )
+    })?;
+    if used != 0 {
+        return Err(err_json(
+            401,
+            "invalid_pairing_code",
+            "pairing code already used",
+        ));
+    }
+    let expires: chrono::DateTime<chrono::Utc> =
+        chrono::DateTime::parse_from_rfc3339(&expires_at)
+            .map_err(|e| err_json(500, "database_error", &format!("corrupt expires_at: {e}")))?
+            .with_timezone(&chrono::Utc);
+    if expires <= chrono::Utc::now() {
+        return Err(err_json(
+            401,
+            "expired_pairing_code",
+            "pairing code expired — mint a new one from the site",
+        ));
+    }
+
+    // Consume the code first: a concurrent redeem must never mint two keys.
+    let consumed = conn
+        .execute(
+            "UPDATE pairing_codes SET used = 1 WHERE code_hash = ?1 AND used = 0",
+            rusqlite::params![auth::hash_key(&code).to_vec()],
+        )
+        .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+    if consumed == 0 {
+        return Err(err_json(
+            401,
+            "invalid_pairing_code",
+            "pairing code already used",
+        ));
+    }
+
+    // Mint the key — same shape as /account/keys (see create_account_key).
+    let api_key = auth::generate_api_key()
+        .map_err(|e| err_json(500, "rng_error", &e.to_string()))?;
+    let key_id = Uuid::new_v4().to_string();
+    let now_str = chrono::Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO api_keys (id, account_id, key_hash, key_prefix, rate, vault_id, created_at, revoked) \
+         VALUES (?1, ?2, ?3, ?4, 100, NULL, ?5, 0)",
+        rusqlite::params![
+            key_id,
+            account_id,
+            auth::hash_key(&api_key).to_vec(),
+            auth::API_KEY_PREFIX,
+            now_str,
+        ],
+    )
+    .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+
+    Ok(Json(json!({
+        "key_id": key_id,
+        "api_key": api_key, // shown once — the server keeps only its hash
+        "key_prefix": auth::API_KEY_PREFIX,
+        "rate": 100.0,
+        "vault_id": Value::Null,
+        "created_at": now_str,
+    })))
+}
+
 // ── Session helpers (shared with account-key routes) ────────────────────────
 
 /// Resolve a Bearer session token to an account id (401 when absent/expired).
@@ -651,6 +820,10 @@ mod tests {
                  id TEXT PRIMARY KEY, account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
                  key_hash BLOB NOT NULL UNIQUE, key_prefix TEXT NOT NULL, rate REAL NOT NULL DEFAULT 100,
                  vault_id TEXT, created_at TEXT NOT NULL, revoked INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE pairing_codes (
+                 code_hash BLOB PRIMARY KEY, account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+                 created_at TEXT NOT NULL, expires_at TEXT NOT NULL, used INTEGER NOT NULL DEFAULT 0
              );
              CREATE TABLE sync_blobs (
                  vault_id TEXT NOT NULL, memory_id TEXT NOT NULL, device_id TEXT NOT NULL,
@@ -847,5 +1020,130 @@ mod tests {
         assert_eq!(keys[0]["id"], "k1");
         assert!(keys[0].get("api_key").is_none(), "no plaintext in metadata");
         assert!(keys[0].get("key_hash").is_none(), "no hashes in metadata");
+    }
+
+    // ── Device pairing (WARP-style onboarding) ──────────────────────────
+
+    #[tokio::test]
+    async fn mint_pairing_code_requires_session() {
+        let state = test_state();
+        let err = mint_pairing_code(State(state), HeaderMap::new())
+            .await
+            .expect_err("no session");
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(err.1["code"], "missing_authorization");
+    }
+
+    #[tokio::test]
+    async fn pairing_code_round_trip_single_use_and_hashed_at_rest() {
+        let state = test_state();
+        seed_session(&state, "acct-1", "test-token").await;
+
+        let res = mint_pairing_code(State(state.clone()), bearer("test-token"))
+            .await
+            .expect("session valid");
+        let body = res.0;
+        let code = body["code"].as_str().expect("plaintext code returned once");
+        assert_eq!(code.len(), 18, "ENG-XXXX-XXXX-XXXX");
+        assert!(code.starts_with("ENG-"));
+        assert_eq!(body["expires_in"], 600);
+
+        // Stored: sha256 only — never the plaintext.
+        {
+            let conn = state.conn.lock().await;
+            let (hash, used): (Vec<u8>, i64) = conn
+                .query_row(
+                    "SELECT code_hash, used FROM pairing_codes",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(hash, auth::hash_key(code).to_vec(), "sha256 at rest");
+            assert_ne!(hash, code.as_bytes());
+            assert_eq!(used, 0);
+        }
+
+        // Redeem — accept lowercase input (typed codes are case-insensitive).
+        let res = redeem_pairing_code(
+            State(state.clone()),
+            Json(json!({"code": code.to_lowercase()})),
+        )
+        .await
+        .expect("fresh code redeems");
+        let body = res.0;
+        let api_key = body["api_key"].as_str().expect("full key returned once");
+        assert!(api_key.starts_with(auth::API_KEY_PREFIX));
+        assert!(body["vault_id"].is_null(), "unscoped in v1");
+        // The minted key authenticates through the normal api_keys path.
+        {
+            let conn = state.conn.lock().await;
+            let stored: Vec<u8> = conn
+                .query_row(
+                    "SELECT key_hash FROM api_keys WHERE key_hash = ?1",
+                    rusqlite::params![auth::hash_key(api_key).to_vec()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(stored, auth::hash_key(api_key).to_vec());
+        }
+
+        // Second redeem: single-use.
+        let err = redeem_pairing_code(
+            State(state.clone()),
+            Json(json!({"code": code})),
+        )
+        .await
+        .expect_err("already used");
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(err.1["code"], "invalid_pairing_code");
+
+        // Wrong code: same shape as unknown.
+        let err = redeem_pairing_code(
+            State(state.clone()),
+            Json(json!({"code": "ENG-2222-2222-2222"})),
+        )
+        .await
+        .expect_err("unknown code");
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(err.1["code"], "invalid_pairing_code");
+    }
+
+    #[tokio::test]
+    async fn expired_pairing_code_is_rejected() {
+        let state = test_state();
+        seed_session(&state, "acct-1", "test-token").await;
+        {
+            let conn = state.conn.lock().await;
+            conn.execute(
+                "INSERT INTO pairing_codes (code_hash, account_id, created_at, expires_at, used) \
+                 VALUES (?1, 'acct-1', 'now', '2000-01-01T00:00:00Z', 0)",
+                rusqlite::params![auth::hash_key("ENG-2345-6789-ABCD").to_vec()],
+            )
+            .unwrap();
+        }
+        let err = redeem_pairing_code(
+            State(state),
+            Json(json!({"code": "ENG-2345-6789-ABCD"})),
+        )
+        .await
+        .expect_err("expired");
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(err.1["code"], "expired_pairing_code");
+    }
+
+    #[tokio::test]
+    async fn live_pairing_codes_are_capped_per_account() {
+        let state = test_state();
+        seed_session(&state, "acct-1", "test-token").await;
+        for _ in 0..PAIRING_CODES_PER_ACCOUNT {
+            mint_pairing_code(State(state.clone()), bearer("test-token"))
+                .await
+                .expect("under the cap");
+        }
+        let err = mint_pairing_code(State(state), bearer("test-token"))
+            .await
+            .expect_err("cap reached");
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert_eq!(err.1["code"], "too_many_codes");
     }
 }

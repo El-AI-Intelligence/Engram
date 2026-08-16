@@ -825,6 +825,44 @@ reach: distinct active devices and stored ciphertext bytes (see SYNC.md).
 // identical so key ids can't be enumerated across accounts.
 ```
 
+#### `POST /devices/pair-codes` — Mint a pairing code (Bearer session)
+
+WARP-style device onboarding (shipped 2026-08-16). Codes are single-use,
+expire after 10 minutes, and are stored only as sha256 (`code_hash`).
+Live codes are capped at 5 per account.
+
+```json
+// Response 200 — code is shown exactly once
+{ "code": "ENG-4F7K-9Q2M-D8T3", "expires_in": 600 }
+
+// Errors: 401 invalid_session | 409 too_many_codes
+```
+
+#### `POST /devices/pair` — Redeem a pairing code for an API key (no auth)
+
+The code IS the credential. Redeeming consumes it and mints an account
+API key (unscoped in v1 — every vault the account reaches; see the v1
+caveat in SYNC.md). A global token bucket (burst 5, refill ~5/s) bounds
+guessing attempts.
+
+```json
+// Request
+{ "code": "ENG-4F7K-9Q2M-D8T3", "device_label": "my-laptop" }
+
+// Response 200 — api_key is shown exactly once; the relay stores sha256 only
+{
+  "key_id": "…",
+  "api_key": "en_…43 base64url chars…",
+  "key_prefix": "en_",
+  "rate": 100.0,
+  "vault_id": null,
+  "created_at": "2026-08-16T09:00:00Z"
+}
+
+// Errors: 401 invalid_pairing_code (unknown or already used) |
+//         401 expired_pairing_code | 429 rate_limit_exceeded
+```
+
 ---
 
 ## 4. gRPC API (for high-performance agent loops)

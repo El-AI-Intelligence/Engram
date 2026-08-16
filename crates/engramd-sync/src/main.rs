@@ -300,7 +300,18 @@ async fn main() -> anyhow::Result<()> {
             label      TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             PRIMARY KEY (vault_id, device_id)
-        );",
+        );
+        -- One-time device pairing codes (WARP-style onboarding): code_hash
+        -- is sha256 of the plaintext (shown once at mint); single-use,
+        -- 10-minute TTL enforced at redemption.
+        CREATE TABLE IF NOT EXISTS pairing_codes (
+            code_hash  BLOB PRIMARY KEY,
+            account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            used       INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_pairing_codes_account ON pairing_codes(account_id);",
     )?;
 
     // ── Run tombstone cleanup on startup ───────────────────────────────
