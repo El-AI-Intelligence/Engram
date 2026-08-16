@@ -195,6 +195,10 @@ const VAULT_PROBE_KEY = 'engram-vault-probe';
 // Set on sign-out: the login screen's auto-enter probe must NOT re-admit
 // this tab after an in-tab sign-out. Tab-lifetime like the creds above.
 const VAULT_NO_PROBE_KEY = 'engram-no-probe';
+// Set only by account registration (never login): the login screen shows
+// the Add-device wizard exactly once, right after sign-up — a passkey
+// LOGIN lands back on the vault sign-in form, not on the wizard.
+const VAULT_JUST_REGISTERED_KEY = 'engram-just-registered';
 
 function getCreds() {
   return sessionStorage.getItem(VAULT_CREDS_KEY);
@@ -208,6 +212,7 @@ function clearCreds() {
   sessionStorage.removeItem(VAULT_CREDS_KEY);
   sessionStorage.removeItem(VAULT_PROBE_KEY);
   sessionStorage.setItem(VAULT_NO_PROBE_KEY, '1');
+  sessionStorage.removeItem(VAULT_JUST_REGISTERED_KEY);
 }
 
 function hasAuth() {
@@ -644,6 +649,9 @@ route('/login', () => {
   const PAIR_CODE_SERVER = 'https://sync.ellmstack.dev';
 
   const renderLoginView = (view) => {
+    // Any deliberate exit from the wizard (back, sign-out, expired session,
+    // passkey login) dismisses it — it must not resurface on the next load.
+    if (view !== 'pair') sessionStorage.removeItem(VAULT_JUST_REGISTERED_KEY);
     if (view === 'register') {
       app.innerHTML = `
         <div class="modal-overlay">
@@ -660,8 +668,8 @@ route('/login', () => {
             </div>
           </div>
         </div>`;
-      // webauthnRegister calls render() on success — the login route then
-      // sees the fresh session token and lands on the 'pair' view.
+      // webauthnRegister sets VAULT_JUST_REGISTERED_KEY then calls render()
+      // on success — the login route lands on the 'pair' view exactly once.
       document.getElementById('reg-create').onclick = () => webauthnRegister(PAIR_CODE_SERVER);
       document.getElementById('reg-back').onclick = (e) => { e.preventDefault(); renderLoginView('form'); };
     } else if (view === 'pair') {
@@ -735,7 +743,7 @@ route('/login', () => {
               </div>
               <div class="login-alt">
                 <p class="faint">New here? <a href="#" id="login-register">Create an Engram account</a> — it's how your devices sync.</p>
-                <p class="faint">Already have an account? <a href="#" id="login-passkey">Sign in with a passkey</a> to pair a device.</p>
+                <p class="faint">Already have an account? <a href="#" id="login-passkey">Sign in with a passkey</a>.</p>
               </div>
             </div>
           </div>
@@ -756,6 +764,7 @@ route('/login', () => {
           const r = await fetch(API + '/health', { headers: { Authorization: 'Basic ' + b64 } });
           if (r.ok) {
             setCreds(b64);
+            sessionStorage.removeItem(VAULT_JUST_REGISTERED_KEY);
             updateStatus();
             navigate('#/');
             return;
@@ -775,12 +784,16 @@ route('/login', () => {
       document.getElementById('login-pass').onkeydown = onKey;
       document.getElementById('login-user').focus();
       document.getElementById('login-register').onclick = (e) => { e.preventDefault(); renderLoginView('register'); };
-      // Passkey sign-in lands on the 'pair' view via webauthnLogin's render().
+      // Passkey sign-in lands back here (the 'form' view) via renderLoginView;
+      // only fresh registration shows the pairing wizard.
       document.getElementById('login-passkey').onclick = (e) => { e.preventDefault(); webauthnLogin(PAIR_CODE_SERVER); };
     }
   };
 
-  if (api.account.token()) renderLoginView('pair');
+  // The wizard shows only right after registration (flag set by
+  // webauthnRegister). A lingering session token alone — e.g. a passkey
+  // LOGIN, or any revisit within the 7-day session — lands on the form.
+  if (sessionStorage.getItem(VAULT_JUST_REGISTERED_KEY) === '1') renderLoginView('pair');
   else renderLoginView('form');
 
   // Transition probe (comment above) — auto-enter on cached creds, unless
@@ -791,6 +804,7 @@ route('/login', () => {
       const r = await fetch(API + '/health');
       if (r.ok) {
         sessionStorage.setItem(VAULT_PROBE_KEY, '1');
+        sessionStorage.removeItem(VAULT_JUST_REGISTERED_KEY);
         updateStatus();
         navigate('#/');
       }
@@ -1979,6 +1993,8 @@ async function webauthnRegister(server) {
     const res = await api.account.registerFinish(
       server, window.location.origin, start.challenge_id, encodeCredential(credential));
     api.account.setToken(res.session_token);
+    // Registration is the one path that shows the Add-device wizard.
+    sessionStorage.setItem(VAULT_JUST_REGISTERED_KEY, '1');
     toast(res.already_registered ? 'Passkey already registered — signed in' : 'Account created — signed in', 'ok');
     render();
   } catch (e) {
@@ -2002,7 +2018,7 @@ async function webauthnLogin(server) {
     const res = await api.account.loginFinish(
       server, window.location.origin, start.challenge_id, encodeCredential(credential));
     api.account.setToken(res.session_token);
-    toast('Signed in', 'ok');
+    toast('Passkey verified — sign in to your vault below', 'ok');
     render();
   } catch (e) {
     if (e.code === 'no_passkeys') {
