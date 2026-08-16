@@ -2022,24 +2022,45 @@ async function webauthnLogin(server) {
 // expires in 10 minutes (server-side); copy buttons wire via delegation-
 // style data attributes because the host containers differ.
 function pairCodeHtml(code) {
-  const cmd = `engram pair ${code}`;
+  const base = `engram pair ${code}`;
   return `
     <div class="settings-note">
       <strong>Pair this machine within 10 minutes:</strong><br>
+      <label class="faint" for="pair-name">Device name (optional — shown in the roster):</label>
+      <input id="pair-name" type="text" maxlength="128"
+        placeholder="e.g. MacBook Air, home box" style="width:100%;margin:0.25rem 0 0.75rem;">
       <div class="pair-code mono">${esc(code)}</div>
-      <div class="pair-command mono">${esc(cmd)}</div>
+      <div class="pair-command mono" id="pair-cmd">${esc(base)}</div>
       <div class="faint">Run the command on the machine. The device appears in Account &amp; Sync → Devices after its first sync. Codes are single-use; this one expires in 10 minutes.</div>
     </div>
     <div class="mutation" style="display:flex;gap:0.5rem;padding:0 1rem 1rem;flex-wrap:wrap;">
       <button class="btn btn-sm" data-copy="${esc(code)}">Copy code</button>
-      <button class="btn btn-sm" data-copy="${esc(cmd)}">Copy command</button>
+      <button class="btn btn-sm" data-copy-cmd="${esc(base)}">Copy command</button>
     </div>`;
 }
 
+// The copy-command button reads the name input at click time so the copied
+// command always matches what the user sees. Names are trimmed, stripped of
+// shell-significant characters, and capped at the relay's 128-char limit.
+function pairCommand(base, nameInput) {
+  const nm = (nameInput?.value || '').trim().replace(/["\\`$]/g, '').slice(0, 128);
+  return nm ? `${base} --name "${nm}"` : base;
+}
+
 function wirePairCodeCopies(el) {
+  const nameInput = el.querySelector('#pair-name');
+  const cmdEl = el.querySelector('#pair-cmd');
+  const base = el.querySelector('[data-copy-cmd]')?.getAttribute('data-copy-cmd') || '';
+  nameInput?.addEventListener('input', () => { if (cmdEl) cmdEl.textContent = pairCommand(base, nameInput); });
   el.querySelectorAll('[data-copy]').forEach(b => {
     b.onclick = async () => {
       try { await navigator.clipboard.writeText(b.getAttribute('data-copy')); toast('Copied', 'ok'); }
+      catch { toast('Copy failed — copy the text manually', 'error'); }
+    };
+  });
+  el.querySelectorAll('[data-copy-cmd]').forEach(b => {
+    b.onclick = async () => {
+      try { await navigator.clipboard.writeText(pairCommand(base, nameInput)); toast('Copied', 'ok'); }
       catch { toast('Copy failed — copy the text manually', 'error'); }
     };
   });
