@@ -73,6 +73,10 @@ engram.ellmstack.dev {
 		root * /srv/engram/vault
 		try_files {path} /index.html
 		file_server
+		# The SPA is a no-build static bundle; without this, browsers
+		# heuristic-cache main.js and users keep seeing stale UIs after
+		# deploys (hit repeatedly). Always revalidate.
+		header Cache-Control "no-cache"
 	}
 
 	# ── Public landing page ─────────────────────────────────────────────────
