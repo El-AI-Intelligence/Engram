@@ -204,7 +204,7 @@ pub fn build_webauthn(rp_id: &str, origin: &str) -> anyhow::Result<Webauthn> {
         .map_err(|e| anyhow::anyhow!("invalid --origin {origin:?}: {e}"))?;
     WebauthnBuilder::new(rp_id, &origin_url)
         .map_err(|e| anyhow::anyhow!("webauthn setup failed for rp_id {rp_id:?}: {e}"))?
-        .rp_name("Engram Sync")
+        .rp_name("Engram")
         .build()
         .map_err(|e| anyhow::anyhow!("webauthn build failed: {e}"))
 }

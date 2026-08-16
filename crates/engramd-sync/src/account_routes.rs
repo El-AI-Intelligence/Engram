@@ -69,9 +69,13 @@ async fn register_start(
         .clone()
         .unwrap_or_else(|| user_unique_id.to_string());
 
+    // Credential label in password managers: a short branded slice of the
+    // account id keeps every account's passkey distinct (all-accounts-
+    // share-"engram-account" made managers show identical entries).
+    let username = format!("engram-{}", &account_id[..8.min(account_id.len())]);
     let (mut challenge, reg_state) = state
         .webauthn
-        .start_passkey_registration(user_unique_id, "engram-account", "Engram Account", None)
+        .start_passkey_registration(user_unique_id, &username, "Engram Account", None)
         .map_err(|e| err_json(500, "webauthn_error", &e.to_string()))?;
 
     // Belt-and-braces: 0.5's passkey registration already requests resident
