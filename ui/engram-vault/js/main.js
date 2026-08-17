@@ -227,6 +227,10 @@ const VAULT_CREDS_KEY = 'engram-vault-creds';
 // the Add-device wizard exactly once, right after sign-up — a passkey
 // LOGIN lands back on the vault sign-in form, not on the wizard.
 const VAULT_JUST_REGISTERED_KEY = 'engram-just-registered';
+// Set when a pairing code is minted this visit: the login screen then
+// polls the account's vaults and auto-advances to the unlock picker the
+// moment the paired device registers on the relay.
+const PAIR_POLL_KEY = 'engram-pair-poll';
 
 function getCreds() {
   return sessionStorage.getItem(VAULT_CREDS_KEY);
@@ -966,6 +970,7 @@ route('/login', () => {
           const res = await api.account.pairCodes(PAIR_CODE_SERVER);
           el.innerHTML = pairCodeHtml(res.code);
           wirePairCodeCopies(el);
+          sessionStorage.setItem(PAIR_POLL_KEY, '1');
         } catch (e) {
           if (e.status === 401) {
             api.account.setToken(null);
@@ -1218,6 +1223,7 @@ route('/login', () => {
                 const res = await api.account.pairCodes(PAIR_CODE_SERVER);
                 once.innerHTML = pairCodeHtml(res.code);
                 wirePairCodeCopies(once);
+                sessionStorage.setItem(PAIR_POLL_KEY, '1');
               } catch (e) {
                 if (e.status === 401) {
                   api.account.setToken(null);
@@ -1319,6 +1325,31 @@ route('/login', () => {
   // via hasAuth(); this screen stays the account front door.
   if (sessionStorage.getItem(VAULT_JUST_REGISTERED_KEY) === '1') renderLoginView('pair');
   else renderLoginView('account');
+
+  // Pairing auto-advance: once a code is minted this visit, watch the
+  // account's vaults — the moment the paired device registers on the
+  // relay, move straight into the unlock picker. 401 = session died;
+  // stop watching and fall back to the signin form.
+  const poll = setInterval(async () => {
+    if (sessionStorage.getItem(PAIR_POLL_KEY) !== '1') return;
+    try {
+      const vaults = await unlock.listVaults(PAIR_CODE_SERVER);
+      if (vaults.length > 0) {
+        sessionStorage.removeItem(PAIR_POLL_KEY);
+        clearInterval(poll);
+        toast('Device paired — vault synced', 'ok');
+        navigate('#/unlock');
+      }
+    } catch (e) {
+      if (e && e.status === 401) {
+        sessionStorage.removeItem(PAIR_POLL_KEY);
+        clearInterval(poll);
+        api.account.setToken(null);
+        renderLoginView('account');
+      }
+    }
+  }, 3000);
+  currentCleanup = () => clearInterval(poll);
 });
 
 // ── Password reset link (from the reset email: #/reset/{token}) ────────────
