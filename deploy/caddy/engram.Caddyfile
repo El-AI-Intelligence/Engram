@@ -116,16 +116,18 @@ engram.ellmstack.dev {
 		file_server
 	}
 
+	# Site-level (matcher-less) header block: applies to ALL paths. (A `header /`
+	# directive only matches the literal root path — empirically /app never got
+	# the CSP until it moved here.) script-src 'wasm-unsafe-eval' allows
+	# WebAssembly.instantiate for the vendored hash-wasm Argon2id (browser
+	# unlock view); connect-src lists the sync relay the browser calls
+	# directly. Hosted-shell caveat: custom-relay users are CSP-bound to the
+	# relays listed here.
 	header {
 		X-Frame-Options "DENY"
 		X-Content-Type-Options "nosniff"
 		Referrer-Policy "strict-origin-when-cross-origin"
 		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		Content-Security-Policy "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; img-src 'self' data:; connect-src 'self' https://sync.ellmstack.dev; font-src 'self' https://fonts.gstatic.com; form-action 'self'; frame-ancestors 'none'; base-uri 'self'"
 	}
-
-	# script-src 'wasm-unsafe-eval' allows WebAssembly.instantiate for the
-	# vendored hash-wasm Argon2id (browser unlock view); connect-src lists the
-	# sync relay the browser calls directly. Hosted-shell caveat: custom-relay
-	# users are CSP-bound to the relays listed here.
-	header / Content-Security-Policy "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; img-src 'self' data:; connect-src 'self' https://sync.ellmstack.dev; font-src 'self' https://fonts.gstatic.com; form-action 'self'; frame-ancestors 'none'; base-uri 'self'"
 }
