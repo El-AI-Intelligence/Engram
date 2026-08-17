@@ -583,6 +583,7 @@ async fn main() -> anyhow::Result<()> {
                 .allow_methods([
                     axum::http::Method::GET,
                     axum::http::Method::POST,
+                    axum::http::Method::PUT,
                     axum::http::Method::DELETE,
                 ])
                 .allow_headers([
