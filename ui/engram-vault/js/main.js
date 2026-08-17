@@ -1151,6 +1151,7 @@ route('/login', () => {
               e.preventDefault();
               try { await api.account.logout(PAIR_CODE_SERVER); } catch {}
               api.account.setToken(null);
+              unlock.signOut();
               toast('Signed out', 'ok');
               renderLoginView('account');
             };
@@ -1404,7 +1405,7 @@ route('/unlock', async () => {
         e.preventDefault();
         try { await api.account.logout(relay); } catch {}
         api.account.setToken(null);
-        unlock.lock();
+        unlock.signOut();
         toast('Signed out', 'ok');
         navigate('#/login');
       };
@@ -1549,7 +1550,7 @@ route('/unlock', async () => {
     document.getElementById('unlock-list-signout').onclick = async () => {
       try { await api.account.logout(relay); } catch {}
       api.account.setToken(null);
-      unlock.lock();
+      unlock.signOut();
       toast('Signed out', 'ok');
       navigate('#/login');
     };

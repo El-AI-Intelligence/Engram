@@ -52,12 +52,19 @@ export function getMemory(id) {
 
 export function lock() {
   state = null;
+}
+
+// Sign-out: wipe the vault state AND every account key. A vault lock alone
+// (lock()) keeps A — open-by-default vaults re-open without prompting while
+// the session lasts; only signing out destroys the account keys.
+export function signOut() {
+  lock();
   accountKeys = new Map();
 }
 
 // ── Account key A (in-memory only) ──────────────────────────────────────────
 // A is unwrapped once per sign-in from the password or recovery wrap. It is
-// NEVER persisted and is wiped on lock()/sign-out. Keyed by account_id so a
+// NEVER persisted and dies only on signOut(). Keyed by account_id so a
 // password change in one tab cannot clash with another account's A.
 
 let accountKeys = new Map();  // account_id → Uint8Array(32)
@@ -234,6 +241,11 @@ async function pullAll(relay, vaultId, onProgress) {
 async function doUnlock(relay, vaultId, encRaw, hmacRaw, blobs, onProgress) {
   const encKey = await crypto.subtle.importKey('raw', encRaw, { name: 'AES-GCM' }, false, ['decrypt']);
   const hmacKey = await crypto.subtle.importKey('raw', hmacRaw, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  // Keep our own copies while the vault is open: "open by default" wraps
+  // them under the account key A. They die with state on lock()/signOut() —
+  // same lifetime as the decrypted memories themselves.
+  const keptEnc = encRaw.slice(0, 32);
+  const keptHmac = hmacRaw.slice(0, 32);
   encRaw.fill(0); hmacRaw.fill(0);
 
   // Verify every blob; a mismatch is counted and skipped — one corrupt blob
@@ -290,8 +302,16 @@ async function doUnlock(relay, vaultId, encRaw, hmacRaw, blobs, onProgress) {
     tombstones,
     memoryCount: memories.size,
   };
-  state = { vaultId, memories, meta };
+  state = { vaultId, memories, meta, keys: { encRaw: keptEnc, hmacRaw: keptHmac } };
   return meta;
+}
+
+// Raw 32B key halves for the OPEN vault (copies) — used to build the
+// composite K for "open by default" wrapping. null when locked.
+export function getVaultKeys() {
+  return state && state.keys
+    ? { encRaw: state.keys.encRaw.slice(), hmacRaw: state.keys.hmacRaw.slice() }
+    : null;
 }
 
 export async function unlock(relay, vaultId, passphrase, onProgress) {
