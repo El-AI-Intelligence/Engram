@@ -6,7 +6,28 @@ import { MemoryGraph } from './graph.js';
 import * as unlock from './unlock.js';
 import { BIP39_WORDS } from './vendor/bip39-english.js';
 
-const API = '';  // relative to origin — Caddy reverse-proxies to localhost:8787
+// Daemon base, resolved per call. On the box console the SPA is served by
+// Caddy, which reverse-proxies these paths to the local engramd — relative
+// works there. On the public site there is no proxy: the browser talks to
+// the user's own loopback daemon (the `engram handoff` tunnel target).
+// A localStorage override ('engram-daemon-base') wins when set.
+function daemonApiBase() {
+  const saved = localStorage.getItem('engram-daemon-base');
+  if (saved) return saved;
+  if (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1' || window.location.hostname === '[::1]') return '';
+  if (hasAuth()) return '';  // box console: same-origin via Caddy
+  return 'http://127.0.0.1:8799';  // public site: the user's loopback daemon
+}
+
+// Chrome 142+ Local Network Access: a public site fetching a loopback
+// daemon must declare the target address space, and the daemon's preflight
+// must carry Access-Control-Allow-Private-Network:true (origin-gated) —
+// both already wired on the daemon for the handoff route.
+function daemonFetch(path, opts = {}) {
+  const base = daemonApiBase();
+  const isLoopback = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?/.test(base);
+  return fetch(base + path, isLoopback ? { ...opts, targetAddressSpace: 'loopback' } : opts);
+}
 
 // ── Theme toggle ───────────────────────────────────────────────────────────
 
@@ -34,14 +55,14 @@ const API = '';  // relative to origin — Caddy reverse-proxies to localhost:87
 // ── API client ────────────────────────────────────────────────────────────
 
 async function get(path) {
-  const r = await fetch(API + path, { headers: authHeaders() });
+  const r = await daemonFetch(path, { headers: authHeaders() });
   if (r.status === 401) onApi401(r);
   if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
   return r.json();
 }
 
 async function post(path, body = {}) {
-  const r = await fetch(API + path, {
+  const r = await daemonFetch(path, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify(body),
@@ -93,7 +114,7 @@ const api = {
     ground: (id) => post('/memories/' + id + '/ground'),
     markNoise: (id) => post('/memories/' + id + '/mark-noise'),
     delete: async (id) => {
-      const r = await fetch(API + '/memories/' + id, { method: 'DELETE', headers: authHeaders() });
+      const r = await daemonFetch('/memories/' + id, { method: 'DELETE', headers: authHeaders() });
       if (r.status === 401) onApi401(r);
     },
     annotations: (id) => get('/memories/' + id + '/annotations'),
@@ -101,7 +122,7 @@ const api = {
   },
   annotations: {
     delete: async (id) => {
-      const r = await fetch(API + '/annotations/' + id, { method: 'DELETE', headers: authHeaders() });
+      const r = await daemonFetch('/annotations/' + id, { method: 'DELETE', headers: authHeaders() });
       if (r.status === 401) onApi401(r);
     },
   },
@@ -113,7 +134,7 @@ const api = {
     list: () => get('/searches'),
     create: (s) => post('/searches', s),
     delete: async (id) => {
-      const r = await fetch(API + '/searches/' + id, { method: 'DELETE', headers: authHeaders() });
+      const r = await daemonFetch('/searches/' + id, { method: 'DELETE', headers: authHeaders() });
       if (r.status === 401) onApi401(r);
     },
   },
@@ -135,7 +156,7 @@ const api = {
   config: {
     get: () => get('/config'),
     update: async (c) => {
-      const r = await fetch(API + '/config', { method: 'PATCH', headers: { 'Content-Type': 'application/json', ...authHeaders() }, body: JSON.stringify(c) });
+      const r = await daemonFetch('/config', { method: 'PATCH', headers: { 'Content-Type': 'application/json', ...authHeaders() }, body: JSON.stringify(c) });
       if (r.status === 401) onApi401(r);
       return r;  // callers inspect r.ok themselves (sync key save)
     },
@@ -201,7 +222,7 @@ const api = {
     // Structured daemon errors (409 digest_disabled / llm_not_configured)
     // carry a readable message — surface it instead of "409 Conflict".
     weekly: async (days = 7, prose = false) => {
-      const r = await fetch(API + '/digest/weekly?days=' + days + (prose ? '&prose=1' : ''), { headers: authHeaders() });
+      const r = await daemonFetch('/digest/weekly?days=' + days + (prose ? '&prose=1' : ''), { headers: authHeaders() });
       if (r.status === 401) onApi401(r);
       if (!r.ok) {
         let msg = `${r.status} ${r.statusText}`;
@@ -397,16 +418,14 @@ async function render() {
   // from the relay, decrypted in the browser, so box creds are irrelevant.
   // /reset/{token} is also gate-exempt: the reset email links to it and the
   // recipient may not be signed in anywhere.
-  // The box-console nav only makes sense with box creds; account users
-  // clicking it bounce off this gate into the unlock picker — a popup
-  // loop. Sync nav visibility with the creds state on every render.
+  // The full tab bar is the product — box console users get it via box
+  // creds, account users on the public site get it against their own
+  // loopback daemon (see daemonApiBase). Only signed-out strangers get
+  // no nav: the gate below bounces them to login.
   const mainNav = document.getElementById('main-nav');
-  if (mainNav) mainNav.style.display = hasAuth() ? '' : 'none';
-  if (!hasAuth() && hash !== '/login' && hash !== '/unlock' && hash !== '/settings' && !hash.startsWith('/reset/') && !hash.startsWith('/handoff/')) {
-    // Account users land back on the vault view; strangers on the login
-    // screen. (No login round-trip: login auto-forwards signed-in accounts
-    // to #/unlock anyway, and each hop could trigger a lock.)
-    navigate(api.account.token() ? '#/unlock' : '#/login');
+  if (mainNav) mainNav.style.display = (hasAuth() || api.account.token()) ? '' : 'none';
+  if (!hasAuth() && !api.account.token() && hash !== '/login' && hash !== '/unlock' && hash !== '/settings' && !hash.startsWith('/reset/') && !hash.startsWith('/handoff/')) {
+    navigate('#/login');
     return;
   }
 
@@ -1318,7 +1337,7 @@ route('/login', () => {
         const b64 = btoa(unescape(encodeURIComponent(user + ':' + pass)));
         btn.disabled = true;
         try {
-          const r = await fetch(API + '/health', { headers: { Authorization: 'Basic ' + b64 } });
+          const r = await daemonFetch('/health', { headers: { Authorization: 'Basic ' + b64 } });
           if (r.ok) {
             setCreds(b64);
             sessionStorage.removeItem(VAULT_JUST_REGISTERED_KEY);
