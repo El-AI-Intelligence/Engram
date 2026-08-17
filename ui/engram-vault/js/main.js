@@ -3,6 +3,7 @@
 // ==========================================================================
 
 import { MemoryGraph } from './graph.js';
+import * as unlock from './unlock.js';
 
 const API = '';  // relative to origin — Caddy reverse-proxies to localhost:8787
 
@@ -225,11 +226,12 @@ function authHeaders() {
 }
 
 // Any API 401 means the stored credentials stopped working — drop them and
-// return to the login screen.
+// return to the login screen. The unlock view is exempt: it never calls the
+// daemon with box creds, and its account session is managed separately.
 function onApi401(r) {
   clearCreds();
   const hash = (window.location.hash || '#/').replace(/^#/, '');
-  if (hash !== '/login') navigate('#/login');
+  if (hash !== '/login' && hash !== '/unlock') navigate('#/login');
 }
 
 // ── Router ────────────────────────────────────────────────────────────────
@@ -253,7 +255,9 @@ async function render() {
   if (currentCleanup) { currentCleanup(); currentCleanup = null; }
 
   // Vault gate: everything except the login screen requires credentials.
-  if (!hasAuth() && hash !== '/login') { navigate('#/login'); return; }
+  // The unlock view is also gate-exempt — it reads a synced vault straight
+  // from the relay, decrypted in the browser, so box creds are irrelevant.
+  if (!hasAuth() && hash !== '/login' && hash !== '/unlock') { navigate('#/login'); return; }
 
   // Highlight nav
   document.querySelectorAll('.nav a').forEach(a => {
@@ -745,6 +749,7 @@ route('/login', () => {
               <div class="login-alt">
                 <p class="faint">New here? <a href="#" id="login-register">Create an Engram account</a> — it's how your devices sync.</p>
                 <p class="faint">Already have an account? <a href="#" id="login-passkey">Sign in with a passkey</a>.</p>
+                <p class="faint">Just viewing? <a href="#/unlock">Unlock a synced vault in this browser</a> — read-only, decrypted locally.</p>
               </div>
             </div>
           </div>
@@ -803,10 +808,12 @@ route('/login', () => {
                 <div class="faint">✓ Signed in as <span class="mono">${esc((acct.account_id || '').slice(0, 13))}…</span></div>
                 <div class="mutation" style="padding:0;">
                   <button class="btn btn-sm" id="login-pair">Pair this machine</button>
+                  <button class="btn btn-sm" id="login-unlock">Unlock vault</button>
                   <button class="btn btn-sm" id="login-acct-logout">Sign out</button>
                 </div>
                 <div id="login-pair-once"></div>
               </div>`;
+            document.getElementById('login-unlock').onclick = () => navigate('#/unlock');
             document.getElementById('login-pair').onclick = async () => {
               const once = document.getElementById('login-pair-once');
               once.innerHTML = '<div class="faint">Requesting a pairing code…</div>';
@@ -862,6 +869,237 @@ route('/login', () => {
       }
     } catch {}
   })();
+});
+
+// ── Unlock (read-only synced vault, decrypted in the browser) ──────────────
+// Gate-exempt view: pulls the account's encrypted blobs from the relay and
+// decrypts client-side with the vault passphrase (js/unlock.js). Requires an
+// account session (for pull); passphrase/keys never leave this tab and are
+// wiped on lock/sign-out/reload.
+
+route('/unlock', async () => {
+  const app = document.getElementById('app');
+  let relay = null;
+
+  // Relay base: daemon config for custom-relay users. This view is
+  // gate-exempt, so the config read can 401 (no box creds in this tab) —
+  // fall back to the hosted relay in that case.
+  async function relayUrl() {
+    try {
+      const cfg = await api.config.get();
+      if (cfg && cfg.sync && cfg.sync.server_url) return cfg.sync.server_url;
+    } catch {}
+    return 'https://sync.ellmstack.dev';
+  }
+
+  function signedOut() {
+    app.innerHTML = `
+      <div class="page">
+        <div class="panel" style="max-width:34rem;margin:2rem auto;">
+          <div class="panel-header">Unlock a synced vault</div>
+          <p class="faint" style="margin:0 1rem;">
+            Read-only view of a vault synced to your Engram account — the vault
+            passphrase decrypts everything in this browser. Nothing leaves this
+            tab; the relay only ever sees ciphertext.
+          </p>
+          <div class="mutation" style="padding:1rem;">
+            <button class="btn btn-primary" id="unlock-signin">Sign in with your account</button>
+          </div>
+        </div>
+      </div>`;
+    document.getElementById('unlock-signin').onclick = () => navigate('#/login');
+  }
+
+  function picker() {
+    app.innerHTML = '<div class="loading">Loading vaults…</div>';
+    unlock.listVaults(relay).then(vaults => {
+      if (!vaults.length) {
+        app.innerHTML = '<div class="error-panel"><p>No synced vaults for this account yet. Pair a device to start syncing.</p></div>';
+        return;
+      }
+      app.innerHTML = `
+        <div class="page">
+          <div class="panel" style="max-width:40rem;margin:2rem auto;">
+            <div class="panel-header">Unlock a synced vault</div>
+            <div class="unlock-vaults">
+              ${vaults.map(v => `
+                <div class="unlock-vault-row">
+                  <div>
+                    <div class="mono">${esc(v.vault_id)}</div>
+                    <div class="faint">${v.blob_count} encrypted ${v.blob_count === 1 ? 'blob' : 'blobs'} · synced ${ago(v.latest_sync)}</div>
+                  </div>
+                  <button class="btn btn-primary btn-sm" data-unlock-vault="${esc(v.vault_id)}">Unlock</button>
+                </div>`).join('')}
+            </div>
+            <div class="unlock-footer">
+              <span class="faint">Read-only — nothing leaves this browser.</span>
+              <a href="#" id="unlock-signout">Sign out of account</a>
+            </div>
+          </div>
+        </div>`;
+      app.querySelectorAll('[data-unlock-vault]').forEach(btn => {
+        btn.onclick = () => passphrase(btn.getAttribute('data-unlock-vault'));
+      });
+      document.getElementById('unlock-signout').onclick = async (e) => {
+        e.preventDefault();
+        try { await api.account.logout(relay); } catch {}
+        api.account.setToken(null);
+        unlock.lock();
+        toast('Signed out', 'ok');
+        navigate('#/login');
+      };
+    }).catch(e => {
+      if (e.status === 401) {
+        toast('Account session expired — sign in again', 'error');
+        signedOut();
+        return;
+      }
+      app.innerHTML = `<div class="error-panel"><p>${esc(e.message)}</p></div>`;
+    });
+  }
+
+  function passphrase(vaultId) {
+    app.innerHTML = `
+      <div class="page">
+        <div class="panel" style="max-width:34rem;margin:2rem auto;">
+          <div class="panel-header">Unlock <span class="mono">${esc(vaultId)}</span></div>
+          <div class="unlock-form">
+            <p class="faint" style="margin:0 0 0.6rem;">Enter the vault passphrase — used only in this tab, never saved.</p>
+            <input id="unlock-pass" type="password" placeholder="Vault passphrase" autocomplete="off" autocapitalize="off" spellcheck="false">
+            <div id="unlock-progress"></div>
+            <div class="mutation">
+              <button class="btn btn-primary" id="unlock-go">Unlock</button>
+              <button class="btn" id="unlock-back">Back</button>
+            </div>
+          </div>
+        </div>
+      </div>`;
+    const progress = document.getElementById('unlock-progress');
+    const go = async () => {
+      const pass = document.getElementById('unlock-pass').value;
+      if (!pass) return;
+      const btn = document.getElementById('unlock-go');
+      btn.disabled = true;
+      try {
+        await unlock.unlock(relay, vaultId, pass, (p) => {
+          if (p.stage === 'pulling') progress.innerHTML = `<div class="faint">Downloading encrypted blobs… ${p.fetched}</div>`;
+          else if (p.stage === 'deriving') progress.innerHTML = `<div class="faint">Deriving keys… (${p.step}/2) — a few seconds</div>`;
+          else if (p.stage === 'verifying') progress.innerHTML = `<div class="faint">Verifying ${p.done}/${p.total}…</div>`;
+        });
+        list();
+      } catch (e) {
+        if (e.status === 401) {
+          toast('Account session expired — sign in again', 'error');
+          signedOut();
+          return;
+        }
+        progress.innerHTML = `<div class="error-panel"><p>${esc(e.message)}</p></div>`;
+        btn.disabled = false;
+      }
+    };
+    document.getElementById('unlock-go').onclick = go;
+    document.getElementById('unlock-pass').onkeydown = (e) => { if (e.key === 'Enter') go(); };
+    document.getElementById('unlock-pass').focus();
+    document.getElementById('unlock-back').onclick = () => picker();
+  }
+
+  function detail(m) {
+    app.insertAdjacentHTML('beforeend', `
+      <div class="modal-overlay" id="unlock-detail">
+        <div class="modal detail-modal">
+          <div class="detail-card">
+            <div class="detail-header">
+              ${layerIcon(m.layer)} <span class="detail-layer">${(m.layer || '').toUpperCase()} MEMORY</span>
+              ${strengthBar(m.strength || 0)}
+              <span class="faint ml-auto mono">${esc(m.id)}</span>
+            </div>
+            <div class="detail-content">${esc(m.content || '')}</div>
+            <div class="detail-meta">
+              <div class="meta-row"><span class="faint">Valence</span> ${valenceLabel(m.valence || 0)}</div>
+              <div class="meta-row"><span class="faint">Created</span> ${m.created_at ? new Date(m.created_at).toLocaleString() : '?'} · ${ago(m.created_at)}</div>
+              ${m.modified_at ? `<div class="meta-row"><span class="faint">Modified</span> ${new Date(m.modified_at).toLocaleString()}</div>` : ''}
+              <div class="meta-row"><span class="faint">Last retrieved</span> ${m.last_retrieved ? ago(m.last_retrieved) : 'never'}</div>
+              <div class="meta-row"><span class="faint">Retrievals</span> ${m.retrievals || 0}</div>
+              ${m.occurred_at ? `<div class="meta-row"><span class="faint">Occurred</span> ${new Date(m.occurred_at).toLocaleString()}</div>` : ''}
+              <div class="meta-row"><span class="faint">Source</span> ${sourceIcon(m.source)} ${m.source || '?'}</div>
+              <div class="meta-row"><span class="faint">Project</span> ${m.project || '—'}</div>
+              ${m.scope ? `<div class="meta-row"><span class="faint">Scope</span> ${esc(m.scope)}</div>` : ''}
+              ${m.privacy_level ? `<div class="meta-row"><span class="faint">Privacy</span> ${esc(m.privacy_level)}</div>` : ''}
+              ${m.content_type ? `<div class="meta-row"><span class="faint">Type</span> ${esc(m.content_type)}</div>` : ''}
+              ${m.context ? `<div class="meta-row"><span class="faint">Context</span> ${esc(String(m.context).slice(0, 300))}</div>` : ''}
+              <div class="meta-row">${tagList(m.tags)}</div>
+            </div>
+          </div>
+          <div class="mutation">
+            <button class="btn" id="unlock-detail-close">Close</button>
+          </div>
+        </div>
+      </div>`);
+    const overlay = document.getElementById('unlock-detail');
+    document.getElementById('unlock-detail-close').onclick = () => overlay.remove();
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
+  }
+
+  function list() {
+    const meta = unlock.getMeta();
+    const memories = unlock.getMemories();
+    const skipped = meta.hmacFailed + meta.corrupt;
+    app.innerHTML = `
+      <div class="page">
+        <div class="unlock-header">
+          <span class="mono">${esc(meta.vaultId)}</span>
+          <span class="faint">${meta.memoryCount} memories · ${meta.verified} verified${skipped ? ` · ${skipped} skipped` : ''}</span>
+          <span class="unlock-header-actions">
+            <button class="btn btn-sm" id="unlock-lock">Lock</button>
+            <button class="btn btn-sm" id="unlock-list-signout">Sign out</button>
+          </span>
+        </div>
+        ${skipped > 0 ? `
+          <div class="unlock-warning">
+            ${skipped} blob${skipped === 1 ? '' : 's'} failed integrity checks and ${skipped === 1 ? 'was' : 'were'} skipped.
+            This can mean an old client wrote a different blob format — they stay out of view, nothing else is affected.
+          </div>` : ''}
+        <div id="unlock-list" class="unlock-list">
+          ${memories.map(m => `
+            <div class="memory-card" data-unlock-id="${esc(m.id)}">
+              <div class="card-top">
+                ${layerIcon(m.layer)}
+                <span class="card-source">${sourceIcon(m.source)} ${m.source || '?'}</span>
+                ${strengthBar(m.strength || 0)}
+                <span class="faint ml-auto">${ago(m.created_at)}</span>
+              </div>
+              <div class="card-content">${esc((m.content || '').slice(0, 200))}${(m.content || '').length > 200 ? '…' : ''}</div>
+              <div class="card-footer">
+                ${tagList(m.tags)}
+                ${m.links && m.links.length ? `<span class="faint">→ ${m.links.length} links</span>` : ''}
+                ${m.imagined && !m.grounded ? '<span class="badge badge-quarantined">⚠ quarantined</span>' : ''}
+              </div>
+            </div>
+          `).join('')}
+        </div>
+      </div>`;
+    document.getElementById('unlock-list').addEventListener('click', (e) => {
+      const card = e.target.closest('[data-unlock-id]');
+      if (card) detail(unlock.getMemory(card.getAttribute('data-unlock-id')));
+    });
+    document.getElementById('unlock-lock').onclick = () => {
+      unlock.lock();
+      picker();
+    };
+    document.getElementById('unlock-list-signout').onclick = async () => {
+      try { await api.account.logout(relay); } catch {}
+      api.account.setToken(null);
+      unlock.lock();
+      toast('Signed out', 'ok');
+      navigate('#/login');
+    };
+    updateStatus();
+  }
+
+  if (unlock.isUnlocked()) { list(); return; }
+  relay = await relayUrl();
+  if (!api.account.token()) { signedOut(); return; }
+  picker();
 });
 
 // ── Dashboard ─────────────────────────────────────────────────────────────

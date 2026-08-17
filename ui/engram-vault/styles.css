@@ -2297,3 +2297,73 @@ body.mobile #capture-btn { display: none !important; }
   line-height: 1.5;
 }
 .digest-prose-cta a { color: var(--accent, #7c5cff); }
+
+/* ── Unlock (read-only synced vault view) ─────────────────────────────────── */
+
+.unlock-vaults {
+  padding: var(--space-3) var(--space-4) 0;
+  display: grid;
+  gap: var(--space-2);
+}
+.unlock-vault-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  background: var(--bg-panel);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-lg);
+  padding: var(--space-3) var(--space-4);
+}
+.unlock-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4) var(--space-4);
+}
+.unlock-footer a { color: var(--semantic); text-decoration: none; }
+.unlock-footer a:hover { text-decoration: underline; }
+
+.unlock-form {
+  padding: 0 var(--space-4) var(--space-4);
+  display: grid;
+  gap: var(--space-3);
+}
+.unlock-form input {
+  background: var(--bg-deep, var(--bg-panel));
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-md, 8px);
+  color: var(--text);
+  padding: 10px 12px;
+  font-size: 14px;
+  outline: none;
+}
+.unlock-form input:focus { border-color: var(--semantic); }
+
+.unlock-header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+  padding: var(--space-2) var(--space-4);
+}
+.unlock-header-actions { margin-left: auto; display: flex; gap: var(--space-2); }
+
+.unlock-list {
+  padding: var(--space-2) var(--space-4) var(--space-4);
+  display: grid;
+  gap: var(--space-2);
+}
+.unlock-list .memory-card { text-decoration: none; cursor: pointer; }
+
+.unlock-warning {
+  margin: var(--space-2) var(--space-4) 0;
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--warning, #d9a441);
+  border-radius: var(--radius-lg);
+  color: var(--warning, #d9a441);
+  font-size: 13.5px;
+}
+
+.detail-modal { width: min(680px, 94vw); max-height: 86vh; overflow-y: auto; }

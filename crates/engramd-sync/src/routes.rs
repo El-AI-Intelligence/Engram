@@ -245,16 +245,37 @@ async fn push(
 }
 
 /// Pull blobs updated since a given timestamp.
+///
+/// Auth: API key first (existing behavior). On 401 ONLY, falls back to an
+/// account session token — vault visibility then derives from the account's
+/// keys (an unscoped key makes every vault visible). A 429 must never fall
+/// through to the session path, or a rate-limited key would bypass its
+/// limiter.
 async fn pull(
     State(state): State<SyncState>,
     headers: HeaderMap,
     Path(vault_id): Path<String>,
     Query(req): Query<PullRequest>,
 ) -> Result<Json<PullResponse>, (StatusCode, Json<serde_json::Value>)> {
-    // Auth + rate limit
-    let key = authenticate(&state, &headers).await?;
-    authorize_vault(&key, &vault_id)?;
+    match authenticate(&state, &headers).await {
+        Ok(key) => authorize_vault(&key, &vault_id)?,
+        Err((status, _body)) if status == StatusCode::UNAUTHORIZED => {
+            let account_id = crate::account_routes::authenticate_session(&state, &headers).await?;
+            let scope = crate::account_routes::account_vault_scope(&state, &account_id).await?;
+            authorize_scope(&scope, &vault_id)?;
+            rate_limit_session(&state, &account_id).await?;
+        }
+        Err(e) => return Err(e),
+    }
+    pull_blobs(&state, &vault_id, req).await
+}
 
+/// The SQL body of `pull` — shared by the API-key and session auth paths.
+async fn pull_blobs(
+    state: &SyncState,
+    vault_id: &str,
+    req: PullRequest,
+) -> Result<Json<PullResponse>, (StatusCode, Json<serde_json::Value>)> {
     let conn = state.conn.lock().await;
     let limit = req.limit.min(1000);
     // Normalize: empty-string since → None
@@ -736,6 +757,44 @@ fn authorize_vault(
     }
 }
 
+/// Scope check for session-authenticated pulls: `None` = unscoped (any vault).
+fn authorize_scope(
+    scope: &Option<HashSet<String>>,
+    vault_id: &str,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    match scope {
+        None => Ok(()),
+        Some(vaults) if vaults.contains(vault_id) => Ok(()),
+        Some(_) => Err(err_json(403, "session is not authorized for this vault")),
+    }
+}
+
+/// Rate-limit a session-authenticated pull at the account's fastest key rate
+/// (fallback 100 req/s). Bucket name can't collide with key-hash buckets.
+async fn rate_limit_session(
+    state: &SyncState,
+    account_id: &str,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    let conn = state.conn.lock().await;
+    let rate: Option<f64> = conn
+        .query_row(
+            "SELECT MAX(rate) FROM api_keys WHERE account_id = ?1 AND revoked = 0",
+            rusqlite::params![account_id],
+            |r| r.get(0),
+        )
+        .ok();
+    drop(conn);
+    let entry = Arc::new(ApiKeyEntry {
+        rate: rate.unwrap_or(100.0).max(1.0),
+        vaults: None,
+        admin_vaults: HashSet::new(),
+        account_id: Some(account_id.to_string()),
+    });
+    rate_limit(state, format!("acct-session:{account_id}"), entry)
+        .await
+        .map(|_| ())
+}
+
 /// Admin check: unscoped keys are the legacy superuser; scoped keys must
 /// carry the `+admin` suffix for this vault.
 fn vault_admin(key: &AuthenticatedKey, vault_id: &str) -> bool {
@@ -799,6 +858,10 @@ mod tests {
              CREATE TABLE device_labels (
                  vault_id TEXT NOT NULL, device_id TEXT NOT NULL, label TEXT NOT NULL,
                  updated_at TEXT NOT NULL, PRIMARY KEY (vault_id, device_id)
+             );
+             CREATE TABLE sessions (
+                 token_hash BLOB PRIMARY KEY, account_id TEXT NOT NULL,
+                 created_at TEXT NOT NULL, expires_at TEXT NOT NULL
              );",
         )
         .unwrap();
@@ -982,6 +1045,155 @@ mod tests {
             Json(PushRequest { blobs }),
         )
         .await
+    }
+
+    // ── Session pull fallback ────────────────────────────────────────────
+
+    async fn seed_session(state: &SyncState, account_id: &str, token: &str) {
+        let conn = state.conn.lock().await;
+        conn.execute(
+            "INSERT OR IGNORE INTO accounts (id, created_at) VALUES (?1, 'now')",
+            rusqlite::params![account_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions (token_hash, account_id, created_at, expires_at) \
+             VALUES (?1, ?2, 'now', '2999-01-01T00:00:00Z')",
+            rusqlite::params![crate::auth::hash_token(token).to_vec(), account_id],
+        )
+        .unwrap();
+    }
+
+    async fn do_session_pull(
+        state: &SyncState,
+        token: &str,
+        vault: &str,
+    ) -> Result<axum::Json<PullResponse>, (StatusCode, Json<serde_json::Value>)> {
+        pull(
+            State(state.clone()),
+            bearer(token),
+            Path(vault.to_string()),
+            Query(axiom_engram::sync::PullRequest {
+                since: None,
+                limit: 1000,
+            }),
+        )
+        .await
+    }
+
+    async fn seed_blob(state: &SyncState, vault: &str, mid: &str) {
+        let conn = state.conn.lock().await;
+        conn.execute(
+            "INSERT INTO sync_blobs (vault_id, memory_id, device_id, vector_clock, ciphertext, hmac, created_at, deleted) \
+             VALUES (?1, ?2, 'dev-1', 1, 'x', 'h', 'now', 0)",
+            rusqlite::params![vault, mid],
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn pull_with_session_unscoped_account_ok() {
+        let state = test_state();
+        seed_account(&state, "acct-1", 0, 0).await;
+        seed_account_key(&state, "acct-1", None, "en_unscoped").await;
+        seed_session(&state, "acct-1", "tok-1").await;
+        seed_blob(&state, "vault-a", "m1").await;
+        let res = do_session_pull(&state, "tok-1", "vault-a")
+            .await
+            .expect("session pull ok");
+        assert_eq!(res.blobs.len(), 1);
+        assert_eq!(res.blobs[0].memory_id, "m1");
+        assert!(!res.has_more);
+    }
+
+    #[tokio::test]
+    async fn pull_with_session_scoped_account_forbidden_for_other_vault() {
+        let state = test_state();
+        seed_account(&state, "acct-1", 0, 0).await;
+        seed_account_key(&state, "acct-1", Some("vault-a"), "en_scoped").await;
+        seed_session(&state, "acct-1", "tok-1").await;
+        seed_blob(&state, "vault-b", "m1").await;
+        let err = do_session_pull(&state, "tok-1", "vault-b")
+            .await
+            .expect_err("scoped session can't read other vaults");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn pull_with_session_invalid_token_returns_401() {
+        let state = test_state();
+        // An existing account key keeps the loopback wildcard off, so the
+        // bogus token is genuinely rejected (not wildcarded).
+        seed_account(&state, "acct-1", 0, 0).await;
+        seed_account_key(&state, "acct-1", None, "en_other").await;
+        let err = do_session_pull(&state, "nope", "vault-a")
+            .await
+            .expect_err("bad session token → 401");
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn pull_with_api_key_still_works() {
+        let state = test_state();
+        seed_account(&state, "acct-1", 0, 0).await;
+        seed_account_key(&state, "acct-1", Some("vault-a"), "en_0123456789012345678901234567890123456789").await;
+        seed_blob(&state, "vault-a", "m1").await;
+        let res = do_session_pull(&state, "en_0123456789012345678901234567890123456789", "vault-a")
+            .await
+            .expect("api key pull unaffected");
+        assert_eq!(res.blobs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn pull_rate_limited_api_key_does_not_fallback_to_session() {
+        let state = test_state();
+        seed_account(&state, "acct-1", 0, 0).await;
+        seed_session(&state, "acct-1", "tok-1").await;
+        // rate 1.0: first request passes, second is 429 — and must NOT fall
+        // through to the (valid) session path.
+        {
+            let conn = state.conn.lock().await;
+            conn.execute(
+                "INSERT INTO api_keys (id, account_id, key_hash, key_prefix, rate, vault_id, created_at, revoked) \
+                 VALUES ('k1', 'acct-1', ?1, 'en_', 1.0, NULL, 'now', 0)",
+                rusqlite::params![crate::auth::hash_key("en_slow").to_vec()],
+            )
+            .unwrap();
+        }
+        seed_blob(&state, "vault-a", "m1").await;
+        let first = do_session_pull(&state, "en_slow", "vault-a")
+            .await
+            .expect("first pull passes");
+        assert_eq!(first.blobs.len(), 1);
+        let err = do_session_pull(&state, "en_slow", "vault-a")
+            .await
+            .expect_err("second pull is rate limited");
+        assert_eq!(err.0, StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn pull_session_rate_limited() {
+        let state = test_state();
+        seed_account(&state, "acct-1", 0, 0).await;
+        seed_session(&state, "acct-1", "tok-1").await;
+        {
+            let conn = state.conn.lock().await;
+            conn.execute(
+                "INSERT INTO api_keys (id, account_id, key_hash, key_prefix, rate, vault_id, created_at, revoked) \
+                 VALUES ('k1', 'acct-1', ?1, 'en_', 1.0, NULL, 'now', 0)",
+                rusqlite::params![crate::auth::hash_key("en_slow").to_vec()],
+            )
+            .unwrap();
+        }
+        seed_blob(&state, "vault-a", "m1").await;
+        let first = do_session_pull(&state, "tok-1", "vault-a")
+            .await
+            .expect("first session pull passes");
+        assert_eq!(first.blobs.len(), 1);
+        let err = do_session_pull(&state, "tok-1", "vault-a")
+            .await
+            .expect_err("second session pull is rate limited");
+        assert_eq!(err.0, StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[tokio::test]

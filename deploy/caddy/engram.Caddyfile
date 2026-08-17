@@ -123,5 +123,9 @@ engram.ellmstack.dev {
 		Strict-Transport-Security "max-age=31536000; includeSubDomains"
 	}
 
-	header / Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; img-src 'self' data:; connect-src 'self'; font-src 'self' https://fonts.gstatic.com; form-action 'self'; frame-ancestors 'none'; base-uri 'self'"
+	# script-src 'wasm-unsafe-eval' allows WebAssembly.instantiate for the
+	# vendored hash-wasm Argon2id (browser unlock view); connect-src lists the
+	# sync relay the browser calls directly. Hosted-shell caveat: custom-relay
+	# users are CSP-bound to the relays listed here.
+	header / Content-Security-Policy "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; img-src 'self' data:; connect-src 'self' https://sync.ellmstack.dev; font-src 'self' https://fonts.gstatic.com; form-action 'self'; frame-ancestors 'none'; base-uri 'self'"
 }

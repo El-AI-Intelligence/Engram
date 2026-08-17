@@ -15,6 +15,7 @@
 
 use crate::auth::{self, SESSION_TTL};
 use crate::SyncState;
+use std::collections::HashSet;
 use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
@@ -36,6 +37,7 @@ pub fn router() -> Router<SyncState> {
         .route("/auth/login/finish", post(login_finish))
         .route("/auth/logout", post(logout))
         .route("/account", get(get_account))
+        .route("/account/vaults", get(account_vaults))
         .route("/account/keys", post(create_account_key))
         .route("/account/keys/{key_id}", delete(revoke_account_key))
         .route("/devices/pair-codes", post(mint_pairing_code))
@@ -702,6 +704,102 @@ pub async fn authenticate_session(
     account_id.ok_or_else(|| err_json(401, "invalid_session", "not signed in"))
 }
 
+/// What vaults can this account read? Derived from the account's unrevoked
+/// API keys: `None` means "every vault" (an unscoped key exists), `Some(set)`
+/// means exactly these vaults (scoped keys only). Single source of truth for
+/// both the session-pull fallback and the vault list.
+pub(crate) async fn account_vault_scope(
+    state: &SyncState,
+    account_id: &str,
+) -> Result<Option<HashSet<String>>, ApiError> {
+    let conn = state.conn.lock().await;
+    let unscoped: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM api_keys \
+             WHERE account_id = ?1 AND revoked = 0 AND vault_id IS NULL",
+            rusqlite::params![account_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+    if unscoped > 0 {
+        return Ok(None);
+    }
+    let mut stmt = conn
+        .prepare(
+            "SELECT DISTINCT vault_id FROM api_keys \
+             WHERE account_id = ?1 AND revoked = 0 AND vault_id IS NOT NULL",
+        )
+        .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+    let vaults = stmt
+        .query_map(rusqlite::params![account_id], |r| r.get::<_, String>(0))
+        .map_err(|e| err_json(500, "database_error", &e.to_string()))?
+        .collect::<Result<HashSet<String>, _>>()
+        .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+    Ok(Some(vaults))
+}
+
+/// Vaults this account can unlock in a browser: the distinct vault_ids in
+/// `sync_blobs` that the account's keys authorize, with blob-version counts
+/// and the latest sync time. `blob_count` counts versions, not memories.
+/// Session auth only — a read-only view of the account's sync footprint.
+async fn account_vaults(
+    State(state): State<SyncState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let account_id = authenticate_session(&state, &headers).await?;
+    let scope = account_vault_scope(&state, &account_id).await?;
+
+    let conn = state.conn.lock().await;
+    let vaults: Vec<Value> = match &scope {
+        None => {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT vault_id, COUNT(*) AS blob_count, MAX(created_at) AS latest_sync \
+                     FROM sync_blobs GROUP BY vault_id ORDER BY latest_sync DESC",
+                )
+                .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok(json!({
+                        "vault_id": r.get::<_, String>(0)?,
+                        "blob_count": r.get::<_, i64>(1)?,
+                        "latest_sync": r.get::<_, Option<String>>(2)?,
+                    }))
+                })
+                .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+            rows.collect::<Result<Vec<Value>, _>>()
+                .map_err(|e| err_json(500, "database_error", &e.to_string()))?
+        }
+        Some(ids) => {
+            if ids.is_empty() {
+                Vec::new()
+            } else {
+                let sql = format!(
+                    "SELECT vault_id, COUNT(*) AS blob_count, MAX(created_at) AS latest_sync \
+                     FROM sync_blobs WHERE vault_id IN ({}) \
+                     GROUP BY vault_id ORDER BY latest_sync DESC",
+                    vec!["?"; ids.len()].join(",")
+                );
+                let mut stmt = conn
+                    .prepare(&sql)
+                    .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+                let rows = stmt
+                    .query_map(rusqlite::params_from_iter(ids.iter()), |r| {
+                        Ok(json!({
+                            "vault_id": r.get::<_, String>(0)?,
+                            "blob_count": r.get::<_, i64>(1)?,
+                            "latest_sync": r.get::<_, Option<String>>(2)?,
+                        }))
+                    })
+                    .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+                rows.collect::<Result<Vec<Value>, _>>()
+                    .map_err(|e| err_json(500, "database_error", &e.to_string()))?
+            }
+        }
+    };
+    Ok(Json(json!({ "vaults": vaults })))
+}
+
 // Sync on purpose: callers hold the conn mutex guard (which is !Send) and
 // an await point here would make every handler future non-Send.
 fn mint_and_store_session(
@@ -909,6 +1007,81 @@ mod tests {
             rusqlite::params![crate::auth::hash_token(token).to_vec(), account_id],
         )
         .unwrap();
+    }
+
+    async fn seed_blob(state: &SyncState, vault: &str, mid: &str, created: &str) {
+        let conn = state.conn.lock().await;
+        conn.execute(
+            "INSERT INTO sync_blobs (vault_id, memory_id, device_id, vector_clock, ciphertext, hmac, created_at, deleted) \
+             VALUES (?1, ?2, 'dev-1', 1, 'x', 'h', ?3, 0)",
+            rusqlite::params![vault, mid, created],
+        )
+        .unwrap();
+    }
+
+    // ── Vault list (browser unlock) ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn account_vaults_lists_all_vaults_for_unscoped_account() {
+        let state = test_state();
+        seed_session(&state, "acct-1", "tok-1").await;
+        {
+            let conn = state.conn.lock().await;
+            conn.execute(
+                "INSERT INTO api_keys (id, account_id, key_hash, key_prefix, rate, vault_id, created_at, revoked) \
+                 VALUES ('k1', 'acct-1', ?1, 'en_', 100, NULL, 'now', 0)",
+                rusqlite::params![auth::hash_key("en_unscoped").to_vec()],
+            )
+            .unwrap();
+        }
+        seed_blob(&state, "vault-a", "m1", "2026-01-01T00:00:00Z").await;
+        seed_blob(&state, "vault-a", "m2", "2026-02-01T00:00:00Z").await;
+        seed_blob(&state, "vault-b", "m3", "2026-01-15T00:00:00Z").await;
+
+        let res = account_vaults(State(state.clone()), bearer("tok-1"))
+            .await
+            .expect("valid session");
+        let vaults = res.0["vaults"].as_array().expect("vaults array");
+        assert_eq!(vaults.len(), 2);
+        let a = vaults.iter().find(|v| v["vault_id"] == "vault-a").unwrap();
+        assert_eq!(a["blob_count"], 2);
+        assert_eq!(a["latest_sync"], "2026-02-01T00:00:00Z");
+        let b = vaults.iter().find(|v| v["vault_id"] == "vault-b").unwrap();
+        assert_eq!(b["blob_count"], 1);
+    }
+
+    #[tokio::test]
+    async fn account_vaults_lists_only_scoped_vault() {
+        let state = test_state();
+        seed_session(&state, "acct-1", "tok-1").await;
+        {
+            let conn = state.conn.lock().await;
+            conn.execute(
+                "INSERT INTO api_keys (id, account_id, key_hash, key_prefix, rate, vault_id, created_at, revoked) \
+                 VALUES ('k1', 'acct-1', ?1, 'en_', 100, 'vault-a', 'now', 0)",
+                rusqlite::params![auth::hash_key("en_scoped").to_vec()],
+            )
+            .unwrap();
+        }
+        seed_blob(&state, "vault-a", "m1", "2026-01-01T00:00:00Z").await;
+        seed_blob(&state, "vault-b", "m2", "2026-01-01T00:00:00Z").await;
+
+        let res = account_vaults(State(state.clone()), bearer("tok-1"))
+            .await
+            .expect("valid session");
+        let vaults = res.0["vaults"].as_array().expect("vaults array");
+        assert_eq!(vaults.len(), 1);
+        assert_eq!(vaults[0]["vault_id"], "vault-a");
+        assert_eq!(vaults[0]["blob_count"], 1);
+    }
+
+    #[tokio::test]
+    async fn account_vaults_requires_valid_session() {
+        let state = test_state();
+        let err = account_vaults(State(state), HeaderMap::new())
+            .await
+            .expect_err("no session → 401");
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
     }
 
     fn bearer(token: &str) -> HeaderMap {
