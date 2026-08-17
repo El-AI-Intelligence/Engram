@@ -48,11 +48,19 @@ pub fn router() -> Router<SyncState> {
         .route("/account/passkeys", get(account_passkeys))
         .route("/account/passkeys/{credential_id}", delete(delete_account_passkey))
         .route("/account/wraps", get(account_wraps))
-        .route("/account/wraps/password", put(put_password_wrap))
-        .route("/account/wraps/recovery", put(put_recovery_wrap))
+        .route(
+            "/account/wraps/password",
+            put(put_password_wrap).get(get_password_wrap),
+        )
+        .route(
+            "/account/wraps/recovery",
+            put(put_recovery_wrap).get(get_recovery_wrap),
+        )
         .route(
             "/account/vaults/{vault_id}/wrap",
-            put(put_vault_wrap).delete(delete_vault_wrap),
+            put(put_vault_wrap)
+                .delete(delete_vault_wrap)
+                .get(get_vault_wrap),
         )
         .route("/devices/pair-codes", post(mint_pairing_code))
         .route("/devices/pair", post(redeem_pairing_code))
@@ -1143,6 +1151,95 @@ async fn account_wraps(
         "recovery_wrap": recovery_wrap_generation.is_some(),
         "recovery_wrap_generation": recovery_wrap_generation,
         "open_vaults": open_vaults,
+    })))
+}
+
+/// Fetch the password envelope blob (ciphertext only). Signin needs it to
+/// unwrap A client-side. Serving it to a valid session leaks nothing the
+/// session doesn't already imply — it is AES-GCM output under a key derived
+/// from the password in the browser, and the relay cannot open it.
+async fn get_password_wrap(
+    State(state): State<SyncState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let account_id = authenticate_session(&state, &headers).await?;
+    crate::routes::rate_limit_session(&state, &account_id).await?;
+    let conn = state.conn.lock().await;
+    let row = conn
+        .query_row(
+            "SELECT wrapped_a, salt_pw, generation FROM account_key_wraps WHERE account_id = ?1",
+            rusqlite::params![account_id],
+            |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?, r.get::<_, i64>(2)?)),
+        )
+        .optional()
+        .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+    let Some((wrapped_a, salt_pw, generation)) = row else {
+        return Err(err_json(404, "no_password_wrap", "this account has no password wrap"));
+    };
+    let b64 = |b: Vec<u8>| base64::engine::general_purpose::STANDARD.encode(b);
+    Ok(Json(json!({
+        "wrapped_a": b64(wrapped_a),
+        "salt_pw": b64(salt_pw),
+        "generation": generation,
+    })))
+}
+
+/// Fetch the recovery envelope blob (ciphertext only) — same trust story as
+/// the password wrap. The recovery phrase itself is never stored anywhere.
+async fn get_recovery_wrap(
+    State(state): State<SyncState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let account_id = authenticate_session(&state, &headers).await?;
+    crate::routes::rate_limit_session(&state, &account_id).await?;
+    let conn = state.conn.lock().await;
+    let row = conn
+        .query_row(
+            "SELECT wrapped_a_rec, salt_rec, generation FROM recovery_key_wraps WHERE account_id = ?1",
+            rusqlite::params![account_id],
+            |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?, r.get::<_, i64>(2)?)),
+        )
+        .optional()
+        .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+    let Some((wrapped_a_rec, salt_rec, generation)) = row else {
+        return Err(err_json(404, "no_recovery_wrap", "this account has no recovery wrap"));
+    };
+    let b64 = |b: Vec<u8>| base64::engine::general_purpose::STANDARD.encode(b);
+    Ok(Json(json!({
+        "wrapped_a_rec": b64(wrapped_a_rec),
+        "salt_rec": b64(salt_rec),
+        "generation": generation,
+    })))
+}
+
+/// Fetch a vault's A-wrapped keys (ciphertext only). Scoped like every
+/// vault listing: the session must hold an API key authorizing the vault.
+async fn get_vault_wrap(
+    State(state): State<SyncState>,
+    headers: HeaderMap,
+    Path(vault_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let account_id = authenticate_session(&state, &headers).await?;
+    let scope = account_vault_scope(&state, &account_id).await?;
+    crate::routes::authorize_scope(&scope, &vault_id)?;
+    crate::routes::rate_limit_session(&state, &account_id).await?;
+    let conn = state.conn.lock().await;
+    let row = conn
+        .query_row(
+            "SELECT wrapped_k, generation FROM vault_key_wraps \
+             WHERE account_id = ?1 AND vault_id = ?2 AND kind = 'account'",
+            rusqlite::params![account_id, vault_id],
+            |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, i64>(1)?)),
+        )
+        .optional()
+        .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+    let Some((wrapped_k, generation)) = row else {
+        return Err(err_json(404, "no_vault_wrap", "this vault is locked (no account wrap)"));
+    };
+    Ok(Json(json!({
+        "vault_id": vault_id,
+        "wrapped_k": base64::engine::general_purpose::STANDARD.encode(wrapped_k),
+        "generation": generation,
     })))
 }
 
@@ -2299,6 +2396,79 @@ mod tests {
         assert_eq!(body["open_vaults"].as_array().unwrap().len(), 0);
         assert_eq!(audit_count(&state, "acct-1", "password_wrap_put").await, 2);
         assert_eq!(audit_count(&state, "acct-1", "recovery_wrap_put").await, 1);
+
+        // The signin flow reads the blobs back through the GET endpoints.
+        let res = get_password_wrap(State(state.clone()), bearer("tok-1"))
+            .await
+            .expect("password blob get");
+        assert_eq!(res.0["wrapped_a"], wrapped_a.as_str());
+        assert_eq!(res.0["salt_pw"], salt_pw.as_str());
+        assert_eq!(res.0["generation"], 2);
+        let res = get_recovery_wrap(State(state.clone()), bearer("tok-1"))
+            .await
+            .expect("recovery blob get");
+        assert_eq!(res.0["wrapped_a_rec"], wrapped_rec.as_str());
+        assert_eq!(res.0["salt_rec"], salt_rec.as_str());
+        assert_eq!(res.0["generation"], 1);
+    }
+
+    #[tokio::test]
+    async fn wrap_gets_404_without_rows() {
+        let state = test_state();
+        seed_session(&state, "acct-1", "tok-1").await;
+        let err = get_password_wrap(State(state.clone()), bearer("tok-1"))
+            .await
+            .expect_err("no password wrap");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+        assert_eq!(err.1["code"], "no_password_wrap");
+        let err = get_recovery_wrap(State(state), bearer("tok-1"))
+            .await
+            .expect_err("no recovery wrap");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+        assert_eq!(err.1["code"], "no_recovery_wrap");
+    }
+
+    #[tokio::test]
+    async fn get_vault_wrap_scopes_and_roundtrips() {
+        let state = test_state();
+        seed_session(&state, "acct-1", "tok-1").await;
+        seed_session(&state, "acct-2", "tok-2").await;
+        seed_unscoped_key(&state, "acct-1", "k1").await;
+        let wrapped_k = base64::engine::general_purpose::STANDARD.encode(b"wrapped-k-bytes");
+        let res = put_vault_wrap(
+            State(state.clone()),
+            bearer("tok-1"),
+            Path("vault-a".to_string()),
+            Json(json!({"wrapped_k": wrapped_k})),
+        )
+        .await
+        .expect("put wrap");
+        assert_eq!(res.0["open"], true);
+
+        // The owner reads the blob back; an unrelated session is 403 (scope).
+        let res = get_vault_wrap(
+            State(state.clone()),
+            bearer("tok-1"),
+            Path("vault-a".to_string()),
+        )
+        .await
+        .expect("owner");
+        assert_eq!(res.0["wrapped_k"], wrapped_k.as_str());
+        assert_eq!(res.0["generation"], 1);
+        let err = get_vault_wrap(
+            State(state.clone()),
+            bearer("tok-2"),
+            Path("vault-a".to_string()),
+        )
+        .await
+        .expect_err("cross-account scope");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        // In scope but no wrap row = the vault is locked → 404, not 403.
+        let err = get_vault_wrap(State(state), bearer("tok-1"), Path("vault-b".to_string()))
+            .await
+            .expect_err("locked vault");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+        assert_eq!(err.1["code"], "no_vault_wrap");
     }
 
     #[tokio::test]

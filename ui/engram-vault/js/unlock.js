@@ -14,6 +14,14 @@
 //   HMAC   HMAC-SHA256 over vault_id ‖ memory_id ‖ device_id ‖
 //          vector_clock(LE64) ‖ ciphertext b64 ‖ deleted(u8) ‖ created_at.
 //
+// Accounts (1.2) share this KDF and cipher convention:
+//   deriveWithSalt(passphrase, salt) — same Argon2id params with an explicit
+//   salt, for the account password / recovery-phrase wraps. Deliberately NOT
+//   the server's login-hash params (m=19MiB, t=2, p=1): a leaked password
+//   hash yields no wrap key material.
+//   wrapKey / unwrapKey — AES-GCM envelopes for account key A and vault K
+//   (composite K = enc_key‖hmac_key‖vault_id, see account_routes.rs).
+//
 // Self-contained: main.js imports this module, never the reverse. The one
 // shared key with main.js is the session token storage key.
 // ==========================================================================
@@ -44,6 +52,30 @@ export function getMemory(id) {
 
 export function lock() {
   state = null;
+  accountKeys = new Map();
+}
+
+// ── Account key A (in-memory only) ──────────────────────────────────────────
+// A is unwrapped once per sign-in from the password or recovery wrap. It is
+// NEVER persisted and is wiped on lock()/sign-out. Keyed by account_id so a
+// password change in one tab cannot clash with another account's A.
+
+let accountKeys = new Map();  // account_id → Uint8Array(32)
+
+export function setAccountKey(accountId, keyBytes) {
+  if (!accountId) throw new Error('Account id required.');
+  if (!keyBytes || keyBytes.length !== 32) throw new Error('Account key must be 32 bytes.');
+  accountKeys.set(accountId, new Uint8Array(keyBytes));
+}
+
+export function getAccountKey(accountId) {
+  const k = accountKeys.get(accountId);
+  return k ? new Uint8Array(k) : null;  // copy — callers own their slice
+}
+
+export function clearAccountKey(accountId) {
+  if (accountId) accountKeys.delete(accountId);
+  else accountKeys = new Map();
 }
 
 // ── Relay fetch (session token) ────────────────────────────────────────────
@@ -100,13 +132,47 @@ async function deriveKey(tag, passphrase) {
   return new Uint8Array(await argon2id({ password: passphrase, salt, outputType: 'binary', ...KDF }));
 }
 
+// Same Argon2id params, explicit salt — for the account password /
+// recovery-phrase wrap keys. The salt comes from the relay row (16-64 bytes).
+export async function deriveWithSalt(passphrase, saltBytes) {
+  if (!saltBytes || saltBytes.length < 16) throw new Error('Salt must be at least 16 bytes.');
+  return new Uint8Array(await argon2id({ password: passphrase, salt: saltBytes, outputType: 'binary', ...KDF }));
+}
+
 // ── base64 (standard, padded) ──────────────────────────────────────────────
 
-function b64decode(s) {
+export function b64encode(bytes) {
+  let bin = '';
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin);
+}
+
+export function b64decode(s) {
   const bin = atob(s);
   const out = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
   return out;
+}
+
+// ── AES-GCM envelopes (account key A, vault key K) ──────────────────────────
+// Same nonce-prefix convention as sync blobs: 12 random bytes ‖ ct+tag. The
+// relay stores only these ciphertexts; it can never open them.
+
+export async function wrapKey(keyBytes, plaintext) {
+  const key = await crypto.subtle.importKey('raw', keyBytes, { name: 'AES-GCM' }, false, ['encrypt']);
+  const nonce = crypto.getRandomValues(new Uint8Array(12));
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv: nonce }, key, plaintext));
+  const out = new Uint8Array(12 + ct.length);
+  out.set(nonce, 0);
+  out.set(ct, 12);
+  return out;
+}
+
+export async function unwrapKey(keyBytes, wrapped) {
+  const key = await crypto.subtle.importKey('raw', keyBytes, { name: 'AES-GCM' }, false, ['decrypt']);
+  const pt = await crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv: wrapped.subarray(0, 12) }, key, wrapped.subarray(12));
+  return new Uint8Array(pt);
 }
 
 // ── HMAC verify — byte-exact with compute_hmac in sync_client.rs ───────────
@@ -157,19 +223,15 @@ async function pullAll(relay, vaultId, onProgress) {
 }
 
 // ── Unlock ─────────────────────────────────────────────────────────────────
+//
+// unlock()          — passphrase path (existing behavior, unchanged).
+// unlockWithKeys()  — key path for open-by-default vaults: the caller holds
+//                     the raw 32B enc/hmac keys (composite K unwrapped under
+//                     the account key A) and skips the KDF entirely.
+// Both share doUnlock (pull→verify→decrypt) and both wipe the raw key
+// arrays after import.
 
-export async function unlock(relay, vaultId, passphrase, onProgress) {
-  if (!relay || !vaultId || !passphrase) throw new Error('Relay, vault and passphrase are required.');
-
-  const blobs = await pullAll(relay, vaultId, onProgress);
-
-  // Two Argon2id derivations SEQUENTIALLY — 2×64 MiB concurrent would peak at
-  // 128 MiB of WASM memory on low-end devices.
-  if (onProgress) onProgress({ stage: 'deriving', step: 1 });
-  const encRaw = await deriveKey(ENC_TAG, passphrase);
-  if (onProgress) onProgress({ stage: 'deriving', step: 2 });
-  const hmacRaw = await deriveKey(HMAC_TAG, passphrase);
-
+async function doUnlock(relay, vaultId, encRaw, hmacRaw, blobs, onProgress) {
   const encKey = await crypto.subtle.importKey('raw', encRaw, { name: 'AES-GCM' }, false, ['decrypt']);
   const hmacKey = await crypto.subtle.importKey('raw', hmacRaw, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
   encRaw.fill(0); hmacRaw.fill(0);
@@ -186,7 +248,7 @@ export async function unlock(relay, vaultId, passphrase, onProgress) {
     }
   }
 
-  // Every blob failing the HMAC = the passphrase can't be right.
+  // Every blob failing the HMAC = the key material can't be right.
   if (blobs.length > 0 && hmacFailed === blobs.length) {
     throw new Error('Passphrase does not match this vault.');
   }
@@ -230,4 +292,29 @@ export async function unlock(relay, vaultId, passphrase, onProgress) {
   };
   state = { vaultId, memories, meta };
   return meta;
+}
+
+export async function unlock(relay, vaultId, passphrase, onProgress) {
+  if (!relay || !vaultId || !passphrase) throw new Error('Relay, vault and passphrase are required.');
+
+  const blobs = await pullAll(relay, vaultId, onProgress);
+
+  // Two Argon2id derivations SEQUENTIALLY — 2×64 MiB concurrent would peak at
+  // 128 MiB of WASM memory on low-end devices.
+  if (onProgress) onProgress({ stage: 'deriving', step: 1 });
+  const encRaw = await deriveKey(ENC_TAG, passphrase);
+  if (onProgress) onProgress({ stage: 'deriving', step: 2 });
+  const hmacRaw = await deriveKey(HMAC_TAG, passphrase);
+
+  return doUnlock(relay, vaultId, encRaw, hmacRaw, blobs, onProgress);
+}
+
+export async function unlockWithKeys(relay, vaultId, keys, onProgress) {
+  if (!relay || !vaultId || !keys || !keys.encRaw || !keys.hmacRaw) {
+    throw new Error('Relay, vault and sync keys are required.');
+  }
+  const blobs = await pullAll(relay, vaultId, onProgress);
+  // doUnlock imports then zeroes encRaw/hmacRaw — callers hand over
+  // ownership (slice your composite K into fresh arrays before calling).
+  return doUnlock(relay, vaultId, keys.encRaw, keys.hmacRaw, blobs, onProgress);
 }

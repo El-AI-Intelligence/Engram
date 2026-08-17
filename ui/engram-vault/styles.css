@@ -1476,6 +1476,26 @@ input[type="file"] { font-size: var(--text-sm); color: var(--text-muted); }
 .login-alt a { color: var(--semantic); text-decoration: none; }
 .login-alt a:hover { text-decoration: underline; }
 
+/* Account recovery phrase (shown exactly once at key setup) */
+.recovery-phrase {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  background: var(--bg-raised);
+  border: 1px solid var(--semantic);
+  border-radius: 8px;
+  padding: 12px;
+  margin: 12px 0;
+  user-select: all;
+}
+.recovery-word {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 14px;
+  padding: 3px 8px;
+  border-radius: 5px;
+  background: var(--bg);
+}
+
 /* WARP-style pairing code (Add-device wizard + Account & Sync) */
 .pair-code {
   font-size: 26px;

@@ -4,6 +4,7 @@
 
 import { MemoryGraph } from './graph.js';
 import * as unlock from './unlock.js';
+import { BIP39_WORDS } from './vendor/bip39-english.js';
 
 const API = '';  // relative to origin — Caddy reverse-proxies to localhost:8787
 
@@ -63,8 +64,10 @@ async function acctReq(server, path, opts = {}) {
     let code = null, msg = `${r.status} ${r.statusText}`;
     try {
       const b = await r.json();
-      code = b?.error?.code || null;
-      if (b?.error?.error) msg = b.error.error;
+      // Account routes use the flat {code, error} shape; pull/device routes
+      // nest under `error`. Handle both.
+      if (typeof b?.error === 'string') { code = b.code ?? null; msg = b.error; }
+      else if (b?.error?.error) { code = b?.error?.code || null; msg = b.error.error; }
     } catch {}
     const e = new Error(msg);
     e.status = r.status;
@@ -75,6 +78,7 @@ async function acctReq(server, path, opts = {}) {
 }
 const acctGet = (server, path) => acctReq(server, path);
 const acctPost = (server, path, body) => acctReq(server, path, { method: 'POST', body: JSON.stringify(body || {}) });
+const acctPut = (server, path, body) => acctReq(server, path, { method: 'PUT', body: JSON.stringify(body || {}) });
 const acctDel = (server, path) => acctReq(server, path, { method: 'DELETE' });
 
 const api = {
@@ -158,6 +162,37 @@ const api = {
     createKey: (server, vaultId) => acctPost(server, '/account/keys', vaultId ? { vault_id: vaultId } : {}),
     revokeKey: (server, keyId) => acctDel(server, '/account/keys/' + encodeURIComponent(keyId)),
     pairCodes: (server) => acctPost(server, '/devices/pair-codes', {}),
+    // ── Email+password account routes (password_routes.rs) ────────────────
+    signup: (server, email, password) => acctPost(server, '/auth/signup', { email, password }),
+    signin: (server, email, password) => acctPost(server, '/auth/signin', { email, password }),
+    resetRequest: (server, email) => acctPost(server, '/auth/reset/request', { email }),
+    resetConfirm: (server, token, newPassword) => acctPost(server, '/auth/reset/confirm', { token, new_password: newPassword }),
+    // ── Zero-knowledge envelopes (account_routes.rs) ──────────────────────
+    credentials: (server) => acctGet(server, '/account/credentials'),
+    changePassword: (server, currentPassword, newPassword) =>
+      acctPost(server, '/account/password', { current_password: currentPassword, new_password: newPassword }),
+    passkeys: (server) => acctGet(server, '/account/passkeys'),
+    // Detaching a passkey is a credential mutation: password accounts must
+    // verify their password fresh, in this request (server-enforced).
+    detachPasskey: (server, credentialId, password) =>
+      acctReq(server, '/account/passkeys/' + encodeURIComponent(credentialId),
+        { method: 'DELETE', body: JSON.stringify(password ? { password } : {}) }),
+    wraps: (server) => acctGet(server, '/account/wraps'),
+    getPasswordWrap: (server) => acctGet(server, '/account/wraps/password'),
+    putPasswordWrap: (server, wrappedA, saltPw) =>
+      acctPut(server, '/account/wraps/password', { wrapped_a: wrappedA, salt_pw: saltPw }),
+    getRecoveryWrap: (server) => acctGet(server, '/account/wraps/recovery'),
+    putRecoveryWrap: (server, wrappedARec, saltRec) =>
+      acctPut(server, '/account/wraps/recovery', { wrapped_a_rec: wrappedARec, salt_rec: saltRec }),
+    getVaultWrap: (server, vaultId) =>
+      acctGet(server, '/account/vaults/' + encodeURIComponent(vaultId) + '/wrap'),
+    putVaultWrap: (server, vaultId, wrappedK) =>
+      acctPut(server, '/account/vaults/' + encodeURIComponent(vaultId) + '/wrap', { wrapped_k: wrappedK }),
+    // Locking a vault gates key access: password accounts verify their
+    // password fresh, in this request (server-enforced).
+    deleteVaultWrap: (server, vaultId, password) =>
+      acctReq(server, '/account/vaults/' + encodeURIComponent(vaultId) + '/wrap',
+        { method: 'DELETE', body: JSON.stringify(password ? { password } : {}) }),
   },
   sync: {
     now: () => post('/sync/now'),
@@ -231,7 +266,7 @@ function authHeaders() {
 function onApi401(r) {
   clearCreds();
   const hash = (window.location.hash || '#/').replace(/^#/, '');
-  if (hash !== '/login' && hash !== '/unlock') navigate('#/login');
+  if (hash !== '/login' && hash !== '/unlock' && !hash.startsWith('/reset/')) navigate('#/login');
 }
 
 // ── Router ────────────────────────────────────────────────────────────────
@@ -257,7 +292,9 @@ async function render() {
   // Vault gate: everything except the login screen requires credentials.
   // The unlock view is also gate-exempt — it reads a synced vault straight
   // from the relay, decrypted in the browser, so box creds are irrelevant.
-  if (!hasAuth() && hash !== '/login' && hash !== '/unlock') { navigate('#/login'); return; }
+  // /reset/{token} is also gate-exempt: the reset email links to it and the
+  // recipient may not be signed in anywhere.
+  if (!hasAuth() && hash !== '/login' && hash !== '/unlock' && !hash.startsWith('/reset/')) { navigate('#/login'); return; }
 
   // Highlight nav
   document.querySelectorAll('.nav a').forEach(a => {
@@ -652,31 +689,179 @@ route('/login', () => {
   // daemon's configured server_url for custom-relay users.
   const PAIR_CODE_SERVER = 'https://sync.ellmstack.dev';
 
+  // ── Account key A (email+password accounts) ──────────────────────────────
+  // A (32 random bytes) is generated client-side, shown ONCE as a 12-word
+  // recovery phrase, and wrapped twice: under the password and under the
+  // phrase. The relay stores only the AES-GCM ciphertexts — it can never
+  // open them (zero-knowledge preserved). The phrase is never sent anywhere
+  // in full; only its ciphertext and a random salt reach the relay.
+
+  function generateRecoveryPhrase() {
+    // 12 random words from the official BIP39 list (2048 words). 2048
+    // divides 2^32 exactly, so `rnd[i] % 2048` has no modulo bias.
+    const rnd = new Uint32Array(12);
+    crypto.getRandomValues(rnd);
+    const words = [];
+    for (let i = 0; i < 12; i++) words.push(BIP39_WORDS[rnd[i] % 2048]);
+    return words;
+  }
+
+  async function storeAccountKeyWraps(server, accountId, A, password, phraseWords) {
+    const phrase = phraseWords.join(' ');
+    const saltPw = crypto.getRandomValues(new Uint8Array(16));
+    const saltRec = crypto.getRandomValues(new Uint8Array(16));
+    const wkPw = await unlock.deriveWithSalt(password, saltPw);
+    const wkRec = await unlock.deriveWithSalt(phrase, saltRec);
+    try {
+      const wrappedA = await unlock.wrapKey(wkPw, A);
+      const wrappedARec = await unlock.wrapKey(wkRec, A);
+      // Recovery wrap first: the phrase is the most precious credential.
+      await api.account.putRecoveryWrap(server, unlock.b64encode(wrappedARec), unlock.b64encode(saltRec));
+      await api.account.putPasswordWrap(server, unlock.b64encode(wrappedA), unlock.b64encode(saltPw));
+    } finally {
+      wkPw.fill(0); wkRec.fill(0);
+    }
+    unlock.setAccountKey(accountId, A);
+  }
+
+  // "Save this phrase" interstitial — shown right after signup, and after
+  // any signin that finds the account has no key wraps yet (aborted signup).
+  // onDone runs AFTER the wraps are stored server-side.
+  function renderPhraseGate(server, accountId, email, password, onDone) {
+    const words = generateRecoveryPhrase();
+    app.innerHTML = `
+      <div class="modal-overlay">
+        <div class="modal login-modal">
+          <div class="login-brand"><span class="brand-gem">◆</span> Engram Vault</div>
+          <div class="modal-body">
+            <p style="margin-top:0;">This is your <strong>account recovery phrase</strong> — the only way back into your vaults if you forget your password. <strong>Write it down now.</strong> It is shown exactly once and is never stored anywhere.</p>
+            <div class="recovery-phrase">${words.map(w => `<span class="recovery-word">${w}</span>`).join('')}</div>
+            <div class="mutation">
+              <button class="btn btn-sm" id="phrase-copy">Copy phrase</button>
+            </div>
+            <p class="faint">To prove you saved it, type the first and last words:</p>
+            <input id="phrase-w1" type="text" placeholder="Word 1" autocomplete="off" autocapitalize="off" spellcheck="false">
+            <input id="phrase-w12" type="text" placeholder="Word 12" autocomplete="off" autocapitalize="off" spellcheck="false">
+            <div id="phrase-error"></div>
+            <div class="mutation">
+              <button class="btn btn-primary" id="phrase-go">I saved it — continue</button>
+            </div>
+          </div>
+        </div>
+      </div>`;
+    document.getElementById('phrase-copy').onclick = async () => {
+      try { await navigator.clipboard.writeText(words.join(' ')); toast('Phrase copied', 'ok'); }
+      catch { toast('Copy blocked by the browser — type it manually', 'error'); }
+    };
+    document.getElementById('phrase-go').onclick = async () => {
+      const a = document.getElementById('phrase-w1').value.trim().toLowerCase();
+      const b = document.getElementById('phrase-w12').value.trim().toLowerCase();
+      if (a !== words[0] || b !== words[11]) {
+        document.getElementById('phrase-error').innerHTML =
+          `<div class="error-panel"><p>Those words don't match. Check the phrase above.</p></div>`;
+        return;
+      }
+      const btn = document.getElementById('phrase-go');
+      btn.disabled = true;
+      try {
+        const A = crypto.getRandomValues(new Uint8Array(32));
+        await storeAccountKeyWraps(server, accountId, A, password, words);
+        A.fill(0);
+        onDone();
+      } catch (e) {
+        btn.disabled = false;
+        document.getElementById('phrase-error').innerHTML = `<div class="error-panel"><p>${esc(e.message)}</p></div>`;
+      }
+    };
+  }
+
+  // After signin: put A in memory if the password opens the wrap. Returns
+  // 'ok' (A in memory), 'setup' (no wraps yet — aborted signup), or
+  // 'recovery' (the wrap exists but this password can't open it — the
+  // classic post-reset state).
+  async function acquireAccountKey(server, accountId, password) {
+    const wraps = await api.account.wraps(server);
+    if (!wraps.password_wrap) return 'setup';
+    try {
+      const blob = await api.account.getPasswordWrap(server);
+      const wk = await unlock.deriveWithSalt(password, unlock.b64decode(blob.salt_pw));
+      const A = await unlock.unwrapKey(wk, unlock.b64decode(blob.wrapped_a));
+      wk.fill(0);
+      unlock.setAccountKey(accountId, A);
+      A.fill(0);
+      return 'ok';
+    } catch {
+      return 'recovery';
+    }
+  }
+
+  // Post-reset: the new password cannot open the old password wrap. The
+  // recovery phrase unwraps A, then A is re-wrapped under the new password.
+  function renderRecoveryGate(server, accountId, newPassword) {
+    app.innerHTML = `
+      <div class="modal-overlay">
+        <div class="modal login-modal">
+          <div class="login-brand"><span class="brand-gem">◆</span> Engram Vault</div>
+          <div class="modal-body">
+            <p style="margin-top:0;">Your password changed, but your vault keys are still wrapped under the old one. Enter your <strong>12-word recovery phrase</strong> to re-link them. The phrase is used only in this tab — nothing is sent to the server.</p>
+            <input id="rec-phrase" type="text" placeholder="12-word recovery phrase" autocomplete="off" autocapitalize="off" spellcheck="false">
+            <div id="rec-error"></div>
+            <div class="mutation">
+              <button class="btn btn-primary" id="rec-go">Re-link my vault keys</button>
+              <button class="btn" id="rec-skip">Skip — my vaults stay locked</button>
+            </div>
+          </div>
+        </div>
+      </div>`;
+    const fail = (msg) => {
+      document.getElementById('rec-error').innerHTML = `<div class="error-panel"><p>${esc(msg)}</p></div>`;
+    };
+    document.getElementById('rec-go').onclick = async () => {
+      const phrase = document.getElementById('rec-phrase').value.trim().toLowerCase().replace(/\s+/g, ' ');
+      if (phrase.split(' ').length !== 12) { fail('That is not a 12-word phrase.'); return; }
+      const btn = document.getElementById('rec-go');
+      btn.disabled = true;
+      let A;
+      try {
+        const blob = await api.account.getRecoveryWrap(server);
+        const wk = await unlock.deriveWithSalt(phrase, unlock.b64decode(blob.salt_rec));
+        A = await unlock.unwrapKey(wk, unlock.b64decode(blob.wrapped_a_rec));
+        wk.fill(0);
+      } catch (e) {
+        if (e.status === 404) { fail('No recovery phrase is stored for this account — your vaults stay locked.'); return; }
+        if (e.status === 401) { toast('Account session expired — sign in again', 'error'); signedOut(); return; }
+        btn.disabled = false;
+        fail('That phrase does not match this account.');
+        return;
+      }
+      try {
+        // Re-wrap A under the new password so signin opens vaults again.
+        const saltPw = crypto.getRandomValues(new Uint8Array(16));
+        const wkPw = await unlock.deriveWithSalt(newPassword, saltPw);
+        try {
+          const wrappedA = await unlock.wrapKey(wkPw, A);
+          await api.account.putPasswordWrap(server, unlock.b64encode(wrappedA), unlock.b64encode(saltPw));
+        } finally {
+          wkPw.fill(0);
+        }
+        unlock.setAccountKey(accountId, A);
+        A.fill(0);
+        toast('Vault keys re-linked', 'ok');
+        navigate('#/unlock');
+      } catch (e) {
+        if (e.status === 401) { toast('Account session expired — sign in again', 'error'); signedOut(); return; }
+        btn.disabled = false;
+        fail(e.message);
+      }
+    };
+    document.getElementById('rec-skip').onclick = () => navigate('#/unlock');
+  }
+
   const renderLoginView = (view) => {
     // Any deliberate exit from the wizard (back, sign-out, expired session,
     // passkey login) dismisses it — it must not resurface on the next load.
     if (view !== 'pair') sessionStorage.removeItem(VAULT_JUST_REGISTERED_KEY);
-    if (view === 'register') {
-      app.innerHTML = `
-        <div class="modal-overlay">
-          <div class="modal login-modal">
-            <div class="login-brand"><span class="brand-gem">◆</span> Engram Vault</div>
-            <div class="modal-body">
-              <p class="faint" style="margin-top:0;">Engram accounts are passkeys — no email, no password. The account is how your devices find each other.</p>
-              <div class="mutation">
-                <button class="btn btn-primary" id="reg-create">Create account</button>
-              </div>
-              <div class="login-alt">
-                <p class="faint"><a href="#" id="reg-back">← Back to sign in</a></p>
-              </div>
-            </div>
-          </div>
-        </div>`;
-      // webauthnRegister sets VAULT_JUST_REGISTERED_KEY then calls render()
-      // on success — the login route lands on the 'pair' view exactly once.
-      document.getElementById('reg-create').onclick = () => webauthnRegister(PAIR_CODE_SERVER);
-      document.getElementById('reg-back').onclick = (e) => { e.preventDefault(); renderLoginView('account'); };
-    } else if (view === 'pair') {
+    if (view === 'pair') {
       app.innerHTML = `
         <div class="modal-overlay">
           <div class="modal login-modal">
@@ -732,11 +917,187 @@ route('/login', () => {
           }
         }
       })();
+    } else if (view === 'signin') {
+      // Email + password is the primary credential; the passkey is a faster
+      // secondary way in. On success the account key A is unwrapped from the
+      // password wrap so open vaults need no further prompts.
+      app.innerHTML = `
+        <div class="modal-overlay">
+          <div class="modal login-modal">
+            <div class="login-brand"><span class="brand-gem">◆</span> Engram Vault</div>
+            <div class="modal-body">
+              <p class="faint" style="margin-top:0;">Sign in to your Engram account.</p>
+              <input id="login-email" type="email" placeholder="Email" autocomplete="username" autocapitalize="off" spellcheck="false">
+              <input id="login-password" type="password" placeholder="Password" autocomplete="current-password">
+              <div id="login-error"></div>
+              <div class="mutation">
+                <button class="btn btn-primary" id="login-submit">Sign in</button>
+                <button class="btn" id="login-passkey">Sign in with passkey</button>
+              </div>
+              <div class="login-alt">
+                <p class="faint"><a href="#" id="login-forgot">Forgot your password?</a> · <a href="#" id="login-signup">Create an account</a></p>
+                <p class="faint">Just viewing? <a href="#/unlock">Unlock a synced vault in this browser</a> — read-only, your vault passphrase decrypts it locally.</p>
+                <p class="faint"><a href="#" id="login-operator">Server operator? Sign in to this server's own vault</a> — separate credentials.</p>
+              </div>
+            </div>
+          </div>
+        </div>`;
+      const fail = (msg) => {
+        document.getElementById('login-error').innerHTML = `<div class="error-panel"><p>${esc(msg)}</p></div>`;
+      };
+      const submit = async () => {
+        const email = document.getElementById('login-email').value.trim().toLowerCase();
+        const password = document.getElementById('login-password').value;
+        if (!email || !password) return;
+        const btn = document.getElementById('login-submit');
+        btn.disabled = true;
+        try {
+          const res = await api.account.signin(PAIR_CODE_SERVER, email, password);
+          api.account.setToken(res.session_token);
+          const keyState = await acquireAccountKey(PAIR_CODE_SERVER, res.account_id, password);
+          if (keyState === 'setup') {
+            // Signup was aborted before the wraps landed — create the key now.
+            renderPhraseGate(PAIR_CODE_SERVER, res.account_id, email, password, () => navigate('#/unlock'));
+          } else if (keyState === 'recovery') {
+            renderRecoveryGate(PAIR_CODE_SERVER, res.account_id, password);
+          } else {
+            navigate('#/unlock');
+          }
+        } catch (e) {
+          if (e.status === 401) fail('Incorrect email or password.');
+          else if (e.status === 429) fail('Too many attempts — wait a few minutes.');
+          else fail(e.message);
+          btn.disabled = false;
+        }
+      };
+      document.getElementById('login-submit').onclick = submit;
+      document.getElementById('login-password').onkeydown = (e) => { if (e.key === 'Enter') submit(); };
+      document.getElementById('login-email').focus();
+      document.getElementById('login-passkey').onclick = () => webauthnLogin(PAIR_CODE_SERVER);
+      document.getElementById('login-forgot').onclick = (e) => { e.preventDefault(); renderLoginView('forgot'); };
+      document.getElementById('login-signup').onclick = (e) => { e.preventDefault(); renderLoginView('signup'); };
+      document.getElementById('login-operator').onclick = (e) => { e.preventDefault(); renderLoginView('operator'); };
+    } else if (view === 'signup') {
+      app.innerHTML = `
+        <div class="modal-overlay">
+          <div class="modal login-modal">
+            <div class="login-brand"><span class="brand-gem">◆</span> Engram Vault</div>
+            <div class="modal-body">
+              <p class="faint" style="margin-top:0;">Create your Engram account — an email and a password. Vaults you own open themselves; the password never leaves this browser unhashed, and the relay can't read your data.</p>
+              <input id="signup-email" type="email" placeholder="Email" autocomplete="username" autocapitalize="off" spellcheck="false">
+              <input id="signup-password" type="password" placeholder="Password (12+ characters)" autocomplete="new-password">
+              <input id="signup-confirm" type="password" placeholder="Confirm password" autocomplete="new-password">
+              <div id="signup-error"></div>
+              <div class="mutation">
+                <button class="btn btn-primary" id="signup-go">Create account</button>
+              </div>
+              <div class="login-alt">
+                <p class="faint"><a href="#" id="signup-back">← Back to sign in</a></p>
+              </div>
+            </div>
+          </div>
+        </div>`;
+      const fail = (msg) => {
+        document.getElementById('signup-error').innerHTML = `<div class="error-panel"><p>${esc(msg)}</p></div>`;
+      };
+      const submit = async () => {
+        const email = document.getElementById('signup-email').value.trim().toLowerCase();
+        const password = document.getElementById('signup-password').value;
+        const confirm = document.getElementById('signup-confirm').value;
+        if (!email || !password) return;
+        if (password.length < 12) { fail('Password must be at least 12 characters.'); return; }
+        if (password !== confirm) { fail('Passwords do not match.'); return; }
+        const btn = document.getElementById('signup-go');
+        btn.disabled = true;
+        try {
+          const res = await api.account.signup(PAIR_CODE_SERVER, email, password);
+          api.account.setToken(res.session_token);
+          renderPhraseGate(PAIR_CODE_SERVER, res.account_id, email, password, () => navigate('#/unlock'));
+        } catch (e) {
+          if (e.code === 'email_taken') fail('An account with that email already exists — sign in instead.');
+          else if (e.code === 'weak_password') fail('Password must be 12–128 characters.');
+          else if (e.code === 'invalid_email') fail('Enter a valid email address.');
+          else if (e.status === 429) fail('Too many attempts — wait a few minutes.');
+          else fail(e.message);
+          btn.disabled = false;
+        }
+      };
+      document.getElementById('signup-go').onclick = submit;
+      document.getElementById('signup-confirm').onkeydown = (e) => { if (e.key === 'Enter') submit(); };
+      document.getElementById('signup-email').focus();
+      document.getElementById('signup-back').onclick = (e) => { e.preventDefault(); renderLoginView('signin'); };
+    } else if (view === 'forgot') {
+      // Two paths: email reset link (when the relay has SMTP configured —
+      // `sent: true` is returned regardless of account existence, so we
+      // cannot leak which emails exist), or an operator-issued token pasted
+      // below. Honest copy: the relay cannot recover vault keys either way.
+      app.innerHTML = `
+        <div class="modal-overlay">
+          <div class="modal login-modal">
+            <div class="login-brand"><span class="brand-gem">◆</span> Engram Vault</div>
+            <div class="modal-body">
+              <p class="faint" style="margin-top:0;">Reset your account password. Your vaults stay encrypted — after resetting, your recovery phrase re-links them.</p>
+              <input id="forgot-email" type="email" placeholder="Email" autocomplete="username" autocapitalize="off" spellcheck="false">
+              <div class="mutation">
+                <button class="btn btn-primary" id="forgot-send">Send reset link</button>
+              </div>
+              <div id="forgot-result"></div>
+              <hr>
+              <p class="faint">Have a reset token? (Your server operator can issue one.)</p>
+              <input id="forgot-token" type="text" placeholder="Reset token" autocomplete="off" autocapitalize="off" spellcheck="false">
+              <input id="forgot-newpass" type="password" placeholder="New password (12+ characters)" autocomplete="new-password">
+              <div id="forgot-error"></div>
+              <div class="mutation">
+                <button class="btn" id="forgot-confirm">Reset password</button>
+              </div>
+              <div class="login-alt">
+                <p class="faint"><a href="#" id="forgot-back">← Back to sign in</a></p>
+              </div>
+            </div>
+          </div>
+        </div>`;
+      document.getElementById('forgot-send').onclick = async () => {
+        const email = document.getElementById('forgot-email').value.trim().toLowerCase();
+        if (!email) return;
+        const btn = document.getElementById('forgot-send');
+        const el = document.getElementById('forgot-result');
+        btn.disabled = true;
+        try {
+          const res = await api.account.resetRequest(PAIR_CODE_SERVER, email);
+          if (res.sent) {
+            el.innerHTML = '<div class="settings-note"><div class="faint">✓ If that email has an account, a reset link is on its way. It expires in 30 minutes.</div></div>';
+          } else {
+            el.innerHTML = `<div class="settings-note"><div class="faint">This relay has no email configured. Ask your server operator to run <span class="mono">engramd-sync admin reset-token ${esc(email)}</span> — they will hand you a token to paste below.</div></div>`;
+          }
+        } catch (e) {
+          el.innerHTML = `<div class="error-panel"><p>${esc(e.message)}</p></div>`;
+        } finally {
+          btn.disabled = false;
+        }
+      };
+      document.getElementById('forgot-confirm').onclick = async () => {
+        const token = document.getElementById('forgot-token').value.trim();
+        const np = document.getElementById('forgot-newpass').value;
+        const err = document.getElementById('forgot-error');
+        if (!token || np.length < 12) { err.innerHTML = '<div class="error-panel"><p>Enter the reset token and a new password (12+ characters).</p></div>'; return; }
+        const btn = document.getElementById('forgot-confirm');
+        btn.disabled = true;
+        try {
+          await api.account.resetConfirm(PAIR_CODE_SERVER, token, np);
+          toast('Password reset — sign in with the new one', 'ok');
+          renderLoginView('signin');
+        } catch (e) {
+          if (e.status === 401) err.innerHTML = '<div class="error-panel"><p>That token is invalid or expired.</p></div>';
+          else if (e.code === 'weak_password') err.innerHTML = '<div class="error-panel"><p>Password must be 12–128 characters.</p></div>';
+          else err.innerHTML = `<div class="error-panel"><p>${esc(e.message)}</p></div>`;
+          btn.disabled = false;
+        }
+      };
+      document.getElementById('forgot-back').onclick = (e) => { e.preventDefault(); renderLoginView('signin'); };
     } else if (view === 'account') {
-      // Account-first front door: the passkey IS the account and is the
-      // primary credential. A verified session lands on an account banner;
-      // otherwise the view is passkey-first with the box vault (operator)
-      // and the read-only browser unlock demoted to links below.
+      // Front door: a verified session lands on an account banner;
+      // otherwise email+password signin is the primary credential (the
+      // passkey is a secondary method, attached from Settings → Account).
       if (api.account.token()) {
         app.innerHTML = `
           <div class="modal-overlay">
@@ -802,26 +1163,8 @@ route('/login', () => {
         })();
         return;
       }
-      app.innerHTML = `
-        <div class="modal-overlay">
-          <div class="modal login-modal">
-            <div class="login-brand"><span class="brand-gem">◆</span> Engram Vault</div>
-            <div class="modal-body">
-              <p class="faint" style="margin-top:0;">Your Engram account syncs your vaults across devices — passkey only, no email or password.</p>
-              <div class="login-primary-panel">
-                <button class="btn btn-primary" id="login-passkey">Sign in with passkey</button>
-                <button class="btn" id="login-register">Create an account</button>
-              </div>
-              <div class="login-alt">
-                <p class="faint">Just viewing? <a href="#/unlock">Unlock a synced vault in this browser</a> — read-only, your vault passphrase decrypts it locally.</p>
-                <p class="faint"><a href="#" id="login-operator">Server operator? Sign in to this server's own vault</a> — separate credentials.</p>
-              </div>
-            </div>
-          </div>
-        </div>`;
-      document.getElementById('login-passkey').onclick = () => webauthnLogin(PAIR_CODE_SERVER);
-      document.getElementById('login-register').onclick = () => renderLoginView('register');
-      document.getElementById('login-operator').onclick = () => renderLoginView('operator');
+      renderLoginView('signin');
+      return;
     } else {
       // Operator sign-in: this server's own vault (HTTP basic auth on the
       // box). Deliberately small and demoted — NOT the account flow.
@@ -902,6 +1245,59 @@ route('/login', () => {
       }
     } catch {}
   })();
+});
+
+// ── Password reset link (from the reset email: #/reset/{token}) ────────────
+// Gate-exempt: the recipient may not be signed in anywhere. The token is
+// single-use and 30-minute TTL (server-enforced); a reset revokes all other
+// sessions, so the user lands back on signin afterwards.
+
+route('/reset/:token', (token) => {
+  const app = document.getElementById('app');
+  // The reset email is sent by the hosted relay (same default the login
+  // screen uses); custom-relay deployments mint their own links.
+  const RESET_SERVER = 'https://sync.ellmstack.dev';
+  app.innerHTML = `
+    <div class="modal-overlay">
+      <div class="modal login-modal">
+        <div class="login-brand"><span class="brand-gem">◆</span> Engram Vault</div>
+        <div class="modal-body">
+          <p class="faint" style="margin-top:0;">Choose a new password. After the reset, your recovery phrase re-links your vault keys.</p>
+          <input id="reset-newpass" type="password" placeholder="New password (12+ characters)" autocomplete="new-password">
+          <input id="reset-confirm" type="password" placeholder="Confirm password" autocomplete="new-password">
+          <div id="reset-error"></div>
+          <div class="mutation">
+            <button class="btn btn-primary" id="reset-go">Reset password</button>
+          </div>
+          <div class="login-alt">
+            <p class="faint"><a href="#/login">← Back to sign in</a></p>
+          </div>
+        </div>
+      </div>
+    </div>`;
+  const fail = (msg) => {
+    document.getElementById('reset-error').innerHTML = `<div class="error-panel"><p>${esc(msg)}</p></div>`;
+  };
+  document.getElementById('reset-go').onclick = async () => {
+    const np = document.getElementById('reset-newpass').value;
+    const confirm = document.getElementById('reset-confirm').value;
+    if (np.length < 12) { fail('Password must be 12–128 characters.'); return; }
+    if (np !== confirm) { fail('Passwords do not match.'); return; }
+    const btn = document.getElementById('reset-go');
+    btn.disabled = true;
+    try {
+      await api.account.resetConfirm(RESET_SERVER, decodeURIComponent(token), np);
+      api.account.setToken(null);
+      toast('Password reset — sign in with the new one', 'ok');
+      navigate('#/login');
+    } catch (e) {
+      if (e.status === 401) fail('That link is invalid or has expired — request a new one.');
+      else fail(e.message);
+      btn.disabled = false;
+    }
+  };
+  document.getElementById('reset-confirm').onkeydown = (e) => { if (e.key === 'Enter') document.getElementById('reset-go').click(); };
+  document.getElementById('reset-newpass').focus();
 });
 
 // ── Unlock (read-only synced vault, decrypted in the browser) ──────────────
