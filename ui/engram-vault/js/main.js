@@ -1340,6 +1340,201 @@ route('/unlock', async () => {
     document.getElementById('unlock-signin').onclick = () => navigate('#/login');
   }
 
+  // ── Open-by-default (account key A → vault keys) ────────────────────────
+  // Open vaults decrypt without the vault passphrase: the relay holds the
+  // vault key K = enc_key(32)‖hmac_key(32)‖vault_id(UTF-8) wrapped under
+  // the account key A. A is in memory after password signin; passkey
+  // signins prompt for the account password exactly once.
+
+  let accountIdCache = null;
+  let idleTimer = null;
+
+  async function accountId() {
+    if (!accountIdCache) {
+      const acct = await api.account.get(relay);
+      accountIdCache = acct.account_id;
+    }
+    return accountIdCache;
+  }
+
+  // Inactivity timer for the "lock after N minutes" policy: armed in list()
+  // and re-armed by any activity while the timer policy is active.
+  const onActivity = () => {
+    if (!idleTimer || !unlock.isUnlocked()) return;
+    const mins = parseInt(localStorage.getItem('engram-lock-policy:' + unlock.getMeta().vaultId) || '0', 10);
+    if (!mins) return;
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => { unlock.lock(); toast('Locked after inactivity', 'info'); picker(); }, mins * 60000);
+  };
+  window.addEventListener('pointerdown', onActivity);
+  window.addEventListener('keydown', onActivity);
+
+  // Prompts for the ACCOUNT password (passkey signin: A isn't in this tab
+  // yet). Resolves to A, or null if the user backs out.
+  function accountPasswordOnce() {
+    return new Promise((resolve) => {
+      app.innerHTML = `
+        <div class="page">
+          <div class="panel" style="max-width:34rem;margin:2rem auto;">
+            <div class="panel-header">Enter your account password</div>
+            <div class="unlock-form">
+              <p class="faint" style="margin:0 0 0.6rem;">You signed in with a passkey, so your account key isn't in this tab yet. Enter your <strong>account password</strong> (not a vault passphrase) once — it unlocks every open vault this session.</p>
+              <input id="acct-pass" type="password" placeholder="Account password" autocomplete="current-password">
+              <div id="acct-pass-error"></div>
+              <div class="mutation">
+                <button class="btn btn-primary" id="acct-pass-go">Unlock my account key</button>
+                <button class="btn" id="acct-pass-back">Back</button>
+              </div>
+            </div>
+          </div>
+        </div>`;
+      document.getElementById('acct-pass-go').onclick = async () => {
+        const pass = document.getElementById('acct-pass').value;
+        if (!pass) return;
+        const btn = document.getElementById('acct-pass-go');
+        btn.disabled = true;
+        try {
+          const id = await accountId();
+          const blob = await api.account.getPasswordWrap(relay);
+          const wk = await unlock.deriveWithSalt(pass, unlock.b64decode(blob.salt_pw));
+          let A;
+          try { A = await unlock.unwrapKey(wk, unlock.b64decode(blob.wrapped_a)); }
+          finally { wk.fill(0); }
+          unlock.setAccountKey(id, A);
+          A.fill(0);
+          resolve(unlock.getAccountKey(id));
+        } catch (e) {
+          if (e.status === 404) {
+            document.getElementById('acct-pass-error').innerHTML =
+              '<div class="error-panel"><p>This account has no password — locked vaults need the vault passphrase instead.</p></div>';
+          } else if (e.status === 401) {
+            toast('Account session expired — sign in again', 'error');
+            signedOut();
+            resolve(null);
+            return;
+          } else {
+            document.getElementById('acct-pass-error').innerHTML =
+              '<div class="error-panel"><p>Incorrect account password.</p></div>';
+          }
+          btn.disabled = false;
+        }
+      };
+      document.getElementById('acct-pass').onkeydown = (e) => { if (e.key === 'Enter') document.getElementById('acct-pass-go').click(); };
+      document.getElementById('acct-pass').focus();
+      document.getElementById('acct-pass-back').onclick = () => { resolve(null); };
+    });
+  }
+
+  async function openWithAccountKey(vaultId, label) {
+    const id = await accountId();
+    let A = unlock.getAccountKey(id);
+    if (!A) {
+      // No A: passkey signin, or this tab never saw the password. No
+      // password wrap = passkey-only account → vault passphrase is the path.
+      try { await api.account.getPasswordWrap(relay); }
+      catch (e) {
+        if (e.status === 404) {
+          toast('This account has no password — unlock with the vault passphrase', 'error');
+          passphrase(vaultId, label);
+          return;
+        }
+        throw e;
+      }
+      A = await accountPasswordOnce();
+      if (!A) return;  // backed out
+    }
+    let wrap;
+    try { wrap = await api.account.getVaultWrap(relay, vaultId); }
+    catch (e) {
+      if (e.status === 404) { toast('This vault is locked — enter its passphrase', 'error'); passphrase(vaultId, label); return; }
+      if (e.status === 401) { toast('Account session expired — sign in again', 'error'); signedOut(); return; }
+      throw e;
+    }
+    const K = await unlock.unwrapKey(A, unlock.b64decode(wrap.wrapped_k));
+    A.fill(0);
+    // Composite K = enc(32)‖hmac(32)‖vault_id(UTF-8): verify the suffix so
+    // a mis-stored wrap fails loudly instead of silently decrypting garbage.
+    const idBytes = new TextEncoder().encode(vaultId);
+    if (K.length < 64 + idBytes.length || !idBytes.every((b, i) => K[64 + i] === b)) {
+      K.fill(0);
+      toast('Stored vault key does not match this vault — unlocking with the passphrase instead', 'error');
+      passphrase(vaultId, label);
+      return;
+    }
+    app.innerHTML = `<div class="page"><div class="panel" style="max-width:34rem;margin:2rem auto;"><div class="panel-header">Opening ${esc(label)}…</div><div id="open-progress" class="faint">Downloading encrypted blobs…</div></div></div>`;
+    try {
+      await unlock.unlockWithKeys(relay, vaultId, { encRaw: K.slice(0, 32), hmacRaw: K.slice(32, 64) }, (p) => {
+        const el = document.getElementById('open-progress');
+        if (!el) return;
+        if (p.stage === 'pulling') el.textContent = `Downloading encrypted blobs… ${p.fetched}`;
+        else if (p.stage === 'verifying') el.textContent = `Verifying ${p.done}/${p.total}…`;
+      });
+    } catch (e) {
+      if (e.status === 401) { toast('Account session expired — sign in again', 'error'); signedOut(); return; }
+      toast(e.message, 'error');
+      picker();
+      return;
+    }
+    list(true);
+  }
+
+  // Wrap the OPEN vault's keys (from getVaultKeys) under A and store them:
+  // this vault opens by default from now on. Called from the unlocked view
+  // (only place K exists) and right after a passphrase unlock when the user
+  // asked to open it by default.
+  async function makeOpenByDefault(vaultId) {
+    const keys = unlock.getVaultKeys();
+    if (!keys) { toast('Vault is locked', 'error'); return; }
+    const id = await accountId();
+    let A = unlock.getAccountKey(id);
+    if (!A) {
+      try { await api.account.getPasswordWrap(relay); }
+      catch (e) {
+        if (e.status === 404) throw new Error('This account has no password — it cannot open vaults by default.');
+        throw e;
+      }
+      A = await accountPasswordOnce();
+      if (!A) return;
+    }
+    const idBytes = new TextEncoder().encode(vaultId);
+    const K = new Uint8Array(64 + idBytes.length);
+    K.set(keys.encRaw, 0); K.set(keys.hmacRaw, 32); K.set(idBytes, 64);
+    keys.encRaw.fill(0); keys.hmacRaw.fill(0);
+    const wrapped = await unlock.wrapKey(A, K);
+    A.fill(0); K.fill(0);
+    await api.account.putVaultWrap(relay, vaultId, unlock.b64encode(wrapped));
+    toast('Vault now opens by default', 'ok');
+  }
+
+  async function toggleVaultWrap(vaultId, label, currentlyOpen) {
+    if (!currentlyOpen) {
+      // K only exists after a passphrase unlock — walk that flow first,
+      // then wrap (passphrase() handles the wrap when asked to).
+      passphrase(vaultId, label, { openByDefault: true });
+      return;
+    }
+    let password = null;
+    try {
+      const creds = await api.account.credentials(relay);
+      if (creds && creds.has_password) {
+        password = prompt(`Locking "${label}" gates its keys behind the vault passphrase.\nConfirm with your account password:`);
+        if (password === null) return;
+        if (!password) { toast('Account password required to lock', 'error'); return; }
+      }
+    } catch {}
+    if (!confirm(`Lock "${label}"?\nIt will need its vault passphrase every time. Memories are not re-encrypted.`)) return;
+    try {
+      await api.account.deleteVaultWrap(relay, vaultId, password);
+      toast('Vault locked', 'ok');
+      picker();
+    } catch (e) {
+      if (e.status === 401) { toast('Account session expired — sign in again', 'error'); signedOut(); return; }
+      if (e.code === 'invalid_password') { toast('Incorrect account password', 'error'); return; }
+      if (e.code === 'password_required') { toast('Enter your account password to lock', 'error'); return; }
+      toast(e.message, 'error');
+    }
+  }
+
   function picker() {
     app.innerHTML = '<div class="loading">Loading vaults…</div>';
     unlock.listVaults(relay).then(vaults => {
@@ -1355,15 +1550,17 @@ route('/unlock', async () => {
               ${vaults.map(v => {
                 const name = v.label || v.vault_id;
                 const count = (typeof v.live_count === 'number') ? v.live_count : v.blob_count;
+                const isOpen = !!v.is_open;
                 return `
                 <div class="unlock-vault-row">
                   <div>
-                    <div class="unlock-vault-name">${esc(name)}</div>
+                    <div class="unlock-vault-name">${esc(name)}${isOpen ? '' : ' <span class="faint" title="Locked — needs its vault passphrase">🔒</span>'}</div>
                     <div class="unlock-vault-id">${esc(v.vault_id)}</div>
                     <div class="faint">${count} ${count === 1 ? 'memory' : 'memories'} · synced ${ago(v.latest_sync)}</div>
                   </div>
                   <div class="unlock-vault-actions">
-                    <button class="btn btn-primary btn-sm" data-unlock-vault="${esc(v.vault_id)}">Unlock</button>
+                    <button class="btn btn-primary btn-sm" data-unlock-vault="${esc(v.vault_id)}">${isOpen ? 'Open' : 'Unlock'}</button>
+                    <button class="forget-link" data-toggle-vault="${esc(v.vault_id)}">${isOpen ? 'Lock' : 'Open by default'}</button>
                     <button class="forget-link" data-forget-vault="${esc(v.vault_id)}">Forget</button>
                   </div>
                 </div>`;
@@ -1377,7 +1574,13 @@ route('/unlock', async () => {
         </div>`;
       app.querySelectorAll('[data-unlock-vault]').forEach(btn => {
         const v = vaults.find(x => x.vault_id === btn.getAttribute('data-unlock-vault'));
-        btn.onclick = () => passphrase(v.vault_id, v.label || v.vault_id);
+        btn.onclick = () => v.is_open
+          ? openWithAccountKey(v.vault_id, v.label || v.vault_id)
+          : passphrase(v.vault_id, v.label || v.vault_id);
+      });
+      app.querySelectorAll('[data-toggle-vault]').forEach(btn => {
+        const v = vaults.find(x => x.vault_id === btn.getAttribute('data-toggle-vault'));
+        btn.onclick = () => toggleVaultWrap(v.vault_id, v.label || v.vault_id, !!v.is_open);
       });
       app.querySelectorAll('[data-forget-vault]').forEach(btn => {
         btn.onclick = async () => {
@@ -1419,7 +1622,7 @@ route('/unlock', async () => {
     });
   }
 
-  function passphrase(vaultId, label) {
+  function passphrase(vaultId, label, opts = {}) {
     app.innerHTML = `
       <div class="page">
         <div class="panel" style="max-width:34rem;margin:2rem auto;">
@@ -1447,7 +1650,11 @@ route('/unlock', async () => {
           else if (p.stage === 'deriving') progress.innerHTML = `<div class="faint">Deriving keys… (${p.step}/2) — a few seconds</div>`;
           else if (p.stage === 'verifying') progress.innerHTML = `<div class="faint">Verifying ${p.done}/${p.total}…</div>`;
         });
-        list();
+        if (opts.openByDefault) {
+          try { await makeOpenByDefault(vaultId); }
+          catch (e) { toast(e.message, 'error'); }
+        }
+        list(!!opts.openByDefault);
       } catch (e) {
         if (e.status === 401) {
           toast('Account session expired — sign in again', 'error');
@@ -1501,8 +1708,9 @@ route('/unlock', async () => {
     overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
   }
 
-  function list() {
+  function list(isOpen = false) {
     const meta = unlock.getMeta();
+    const policy = localStorage.getItem('engram-lock-policy:' + meta.vaultId) || 'session';
     const memories = unlock.getMemories();
     const skipped = meta.hmacFailed + meta.corrupt;
     app.innerHTML = `
@@ -1511,6 +1719,13 @@ route('/unlock', async () => {
           <span class="mono">${esc(meta.vaultId)}</span>
           <span class="faint">${meta.memoryCount} memories · ${meta.verified} verified${skipped ? ` · ${skipped} skipped` : ''}</span>
           <span class="unlock-header-actions">
+            <select class="btn btn-sm" id="unlock-policy" title="Lock policy for this vault">
+              <option value="session"${policy === 'session' ? ' selected' : ''}>Open while signed in</option>
+              <option value="close"${policy === 'close' ? ' selected' : ''}>Lock when I leave</option>
+              <option value="5"${policy === '5' ? ' selected' : ''}>Lock after 5 min</option>
+              <option value="15"${policy === '15' ? ' selected' : ''}>Lock after 15 min</option>
+              <option value="60"${policy === '60' ? ' selected' : ''}>Lock after 60 min</option>
+            </select>
             <button class="btn btn-sm" id="unlock-lock">Lock</button>
             <button class="btn btn-sm" id="unlock-list-signout">Sign out</button>
           </span>
@@ -1555,12 +1770,45 @@ route('/unlock', async () => {
       navigate('#/login');
     };
     updateStatus();
+
+    // Per-vault lock policy (client-side only; stored per vault_id).
+    const polKey = 'engram-lock-policy:' + meta.vaultId;
+    const polSel = document.getElementById('unlock-policy');
+    polSel.onchange = () => {
+      localStorage.setItem(polKey, polSel.value);
+      if (parseInt(polSel.value, 10)) onActivity();
+      else if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
+    };
+    if (parseInt(polSel.value, 10)) onActivity();
+
+    // Locked-vault path: offer to make it open by default (K is in memory).
+    if (!isOpen) {
+      const actions = document.querySelector('.unlock-header-actions');
+      const btn = document.createElement('button');
+      btn.className = 'btn btn-sm';
+      btn.id = 'unlock-open-default';
+      btn.textContent = 'Open by default';
+      btn.title = "Wrap this vault's keys under your account key — it opens without the passphrase while signed in";
+      btn.onclick = async () => {
+        btn.disabled = true;
+        try { await makeOpenByDefault(meta.vaultId); btn.remove(); }
+        catch (e) { btn.disabled = false; toast(e.message, 'error'); }
+      };
+      actions.insertBefore(btn, polSel);
+    }
   }
 
   if (unlock.isUnlocked()) { list(); return; }
   relay = await relayUrl();
   if (!api.account.token()) { signedOut(); return; }
   picker();
+  // Route cleanup: the "lock when I leave" policy locks the vault on
+  // navigation away; the inactivity timer dies with the route.
+  return () => {
+    const vaultId = unlock.getMeta() && unlock.getMeta().vaultId;
+    if (vaultId && localStorage.getItem('engram-lock-policy:' + vaultId) === 'close') unlock.lock();
+    if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
+  };
 });
 
 // ── Dashboard ─────────────────────────────────────────────────────────────
