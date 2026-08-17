@@ -114,6 +114,10 @@ engram.ellmstack.dev {
 	handle {
 		root * /srv/engram/landing
 		file_server
+		# Landing has no build-hash fingerprinting either; heuristic caching
+		# served stale pre-grey-flip HTML (old CSP without the sync relay)
+		# long after deploys. Always revalidate, same as the SPA above.
+		header Cache-Control "no-cache"
 	}
 
 	# Site-level (matcher-less) header block: applies to ALL paths. (A `header /`
