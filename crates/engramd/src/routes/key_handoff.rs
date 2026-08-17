@@ -89,6 +89,7 @@ async fn redeem_handoff(
     Ok(Json(json!({
         "enc_key_b64": base64::engine::general_purpose::STANDARD.encode(keys.enc_key),
         "hmac_key_b64": base64::engine::general_purpose::STANDARD.encode(keys.hmac_key),
+        "vault_id": keys.vault_id,
     })))
 }
 

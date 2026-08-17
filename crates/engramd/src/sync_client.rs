@@ -82,6 +82,10 @@ impl SyncClient {
         self.hmac_key
     }
 
+    pub fn vault_id(&self) -> &str {
+        &self.vault_id
+    }
+
     // ── Public API ────────────────────────────────────────────────────────
 
     /// Encrypt a plaintext memory entry into a `SyncBlob` ready for push.

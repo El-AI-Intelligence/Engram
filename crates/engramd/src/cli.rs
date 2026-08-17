@@ -124,6 +124,20 @@ pub enum Commands {
         #[arg(long)]
         env_file: Option<PathBuf>,
     },
+    /// Hand the vault sync keys to the browser exactly once: mints a one-time
+    /// link that makes this vault "open by default" under the account signed
+    /// in on the hosted site. The vault passphrase is never typed or shown.
+    Handoff {
+        /// Path to vault (overrides config)
+        #[arg(long)]
+        vault: Option<PathBuf>,
+        /// Daemon address to mint the handoff from (defaults to 127.0.0.1:8799)
+        #[arg(long, default_value = "127.0.0.1:8799")]
+        bind: String,
+        /// Site URL the link opens (defaults to https://engram.ellmstack.dev)
+        #[arg(long, default_value = "https://engram.ellmstack.dev")]
+        site: String,
+    },
     /// Seed 30 sample memories and simulate a month of decay — the "wow" demo
     Demo {
         /// Path to vault (overrides config)
@@ -1600,5 +1614,57 @@ pub fn handle_show_passphrase(env_file: Option<PathBuf>) -> Result<()> {
     println!("Vault passphrase from {}:", path.display());
     println!("{passphrase}");
     eprintln!("Treat this as a secret: save it, never share it, never commit it.");
+    Ok(())
+}
+
+/// Mint a one-time vault-key handoff: the browser pulls the sync keys from
+/// THIS machine's daemon and wraps them under the signed-in account key —
+/// no passphrase typing, no passphrase display. Single-use, 300s TTL.
+pub async fn handle_handoff(vault: Option<PathBuf>, bind: String, site: String) -> Result<()> {
+    let vault_path = vault.unwrap_or_else(|| home_dir().join(".engram").join("vault"));
+    if !vault_path.join("engrams.db").exists() {
+        anyhow::bail!(
+            "no vault at {} — pair this machine first (`engram pair`)",
+            vault_path.display()
+        );
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?;
+    let resp = client
+        .post(format!("http://{bind}/sync/key-handoff/start"))
+        .send()
+        .await
+        .with_context(|| format!("cannot reach the daemon at {bind} — is engramd running?"))?;
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::json!({}));
+    if !status.is_success() {
+        let msg = body
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown error");
+        anyhow::bail!("handoff refused ({status}): {msg}");
+    }
+    let token = body
+        .get("token")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("handoff response missing token"))?;
+    println!();
+    println!("  Vault keys ready for a one-time handoff (expires in 5 minutes).");
+    println!();
+    println!("  Open this link in the browser where you're signed in to your");
+    println!("  Engram account:");
+    println!();
+    println!(
+        "    {}/#/handoff/{}?daemon={}",
+        site.trim_end_matches('/'),
+        token,
+        bind
+    );
+    println!();
+    println!("  The site pulls the vault keys from this machine's daemon and wraps");
+    println!("  them under your account key — the vault then opens with your");
+    println!("  account password. Your vault passphrase is never typed or shown.");
+    println!();
     Ok(())
 }

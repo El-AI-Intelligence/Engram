@@ -103,6 +103,9 @@ async fn dispatch_cli(cmd: cli::Commands) -> anyhow::Result<()> {
         cli::Commands::Pair { code, vault, server_url, name } => {
             cli::handle_pair(code, vault, server_url, name).await
         }
+        cli::Commands::Handoff { vault, bind, site } => {
+            cli::handle_handoff(vault, bind, site).await
+        }
         cli::Commands::Capture { content, tags, layer, source, valence, project, vault } => {
             cli::handle_capture(content, tags, layer, source, valence, project, vault).await
         }
@@ -542,6 +545,7 @@ async fn run_daemon(
                     state.sync_keys = Some(Arc::new(SyncKeyMaterial {
                         enc_key: sync_client.encryption_key(),
                         hmac_key: sync_client.hmac_key(),
+                        vault_id: sync_client.vault_id().to_string(),
                     }));
                     info!(
                         server_url = %server_url,

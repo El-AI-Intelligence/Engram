@@ -41,6 +41,10 @@ pub enum LiveEvent {
 pub struct SyncKeyMaterial {
     pub enc_key: [u8; 32],
     pub hmac_key: [u8; 32],
+    /// The vault these keys belong to — the composite K the SPA wraps under
+    /// account key A is enc_key‖hmac_key‖vault_id, so the handoff response
+    /// must carry it (the browser cannot know the daemon's vault id).
+    pub vault_id: String,
 }
 
 /// One-time key-handoff token store: single-use, 300s TTL, swept on access.

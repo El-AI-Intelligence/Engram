@@ -378,7 +378,7 @@ async function render() {
   // from the relay, decrypted in the browser, so box creds are irrelevant.
   // /reset/{token} is also gate-exempt: the reset email links to it and the
   // recipient may not be signed in anywhere.
-  if (!hasAuth() && hash !== '/login' && hash !== '/unlock' && !hash.startsWith('/reset/')) { navigate('#/login'); return; }
+  if (!hasAuth() && hash !== '/login' && hash !== '/unlock' && !hash.startsWith('/reset/') && !hash.startsWith('/handoff/')) { navigate('#/login'); return; }
 
   // Highlight nav
   document.querySelectorAll('.nav a').forEach(a => {
@@ -1356,6 +1356,83 @@ route('/login', () => {
 // Gate-exempt: the recipient may not be signed in anywhere. The token is
 // single-use and 30-minute TTL (server-enforced); a reset revokes all other
 // sessions, so the user lands back on signin afterwards.
+
+// ── Vault key handoff from a local daemon (#/handoff/{token}?daemon=HOST:PORT) ──
+// `engram handoff` mints a single-use token against this machine's daemon;
+// this route redeems it and wraps the vault keys under the signed-in
+// account key A — the vault becomes open-by-default with zero passphrase
+// typing. The daemon runs on loopback; the token in the link is the secret.
+route('/handoff/:token', (token) => {
+  const app = document.getElementById('app');
+  const ACCT = 'https://sync.ellmstack.dev';
+  const daemon = (window.location.hash.match(/[?&]daemon=([^&]+)/) || [])[1] || '127.0.0.1:8799';
+  const daemonOrigin = 'http://' + daemon;
+  const fail = (msg) => {
+    app.innerHTML = `
+      <div class="modal-overlay">
+        <div class="modal login-modal">
+          <div class="login-brand"><span class="brand-gem">◆</span> Engram Vault</div>
+          <div class="modal-body">
+            <div class="error-panel"><p>${esc(msg)}</p></div>
+            <div class="login-alt">
+              <p class="faint"><a href="#/login">← Back to sign in</a> · <a href="#/unlock">Go to vault picker</a></p>
+            </div>
+          </div>
+        </div>
+      </div>`;
+  };
+  app.innerHTML = `
+    <div class="modal-overlay">
+      <div class="modal login-modal">
+        <div class="login-brand"><span class="brand-gem">◆</span> Engram Vault</div>
+        <div class="modal-body">
+          <p class="faint" style="margin-top:0;">Linking this machine's vault keys to your account…</p>
+          <div id="handoff-error"></div>
+        </div>
+      </div>
+    </div>`;
+  const el = document.getElementById('handoff-error');
+  (async () => {
+    try {
+      const acct = await api.account.get(ACCT);
+      const accountId = acct.account_id;
+      let A = unlock.getAccountKey(accountId);
+      if (!A) {
+        const password = window.prompt('Enter your account password to link the vault keys:');
+        if (!password) return fail('Account password required to wrap the vault keys.');
+        const wraps = await api.account.wraps(ACCT);
+        if (!wraps.password_wrap) return fail('Your account has no key wraps yet — sign in with your password first.');
+        const blob = await api.account.getPasswordWrap(ACCT);
+        const wk = await unlock.deriveWithSalt(password, unlock.b64decode(blob.salt_pw));
+        try {
+          A = await unlock.unwrapKey(wk, unlock.b64decode(blob.wrapped_a));
+          unlock.setAccountKey(accountId, A);
+        } catch {
+          return fail('That password does not open your account key.');
+        } finally { wk.fill(0); }
+      }
+      const r = await fetch(daemonOrigin + '/sync/key-handoff/' + encodeURIComponent(token), { method: 'POST' });
+      if (!r.ok) {
+        if (r.status === 401) return fail('That handoff link has expired or was already used — run `engram handoff` again.');
+        return fail(`This machine's daemon refused the handoff (${r.status}).`);
+      }
+      const h = await r.json();
+      const enc = unlock.b64decode(h.enc_key_b64);
+      const hmac = unlock.b64decode(h.hmac_key_b64);
+      const vid = new TextEncoder().encode(String(h.vault_id || ''));
+      const K = new Uint8Array(64 + vid.length);
+      K.set(enc, 0); K.set(hmac, 32); K.set(vid, 64);
+      const wrapped = await unlock.wrapKey(A, K);
+      await api.account.putVaultWrap(ACCT, h.vault_id, unlock.b64encode(wrapped));
+      enc.fill(0); hmac.fill(0); K.fill(0);
+      toast('Vault linked — it now opens with your account', 'ok');
+      navigate('#/unlock');
+    } catch (e) {
+      if (e && e.status === 401) { api.account.setToken(null); navigate('#/login'); return; }
+      fail(e.message || 'Handoff failed.');
+    }
+  })();
+});
 
 route('/reset/:token', (token) => {
   const app = document.getElementById('app');
