@@ -2992,9 +2992,9 @@ async function webauthnRegister(server) {
     const res = await api.account.registerFinish(
       server, window.location.origin, start.challenge_id, encodeCredential(credential));
     api.account.setToken(res.session_token);
-    // Registration is the one path that shows the Add-device wizard.
-    sessionStorage.setItem(VAULT_JUST_REGISTERED_KEY, '1');
-    toast(res.already_registered ? 'Passkey already registered — signed in' : 'Account created — signed in', 'ok');
+    // Registration now only ATTACHES a passkey to a signed-in account —
+    // account creation is email+password on the login screen, no wizard.
+    toast(res.already_registered ? 'Passkey already registered — signed in' : 'Passkey added', 'ok');
     render();
   } catch (e) {
     if (e.name === 'SecurityError') {
@@ -3400,11 +3400,9 @@ route('/settings', async () => {
       bodyEl.innerHTML = `
         <div class="health-row faint">Not signed in — no account session on this browser.</div>
         <div class="mutation" style="display:flex;gap:0.5rem;padding:0 1rem 1rem;">
-          <button class="btn btn-primary" id="acct-register">Register passkey</button>
-          <button class="btn" id="acct-login">Sign in with passkey</button>
+          <button class="btn btn-primary" id="acct-signin">Sign in</button>
         </div>`;
-      document.getElementById('acct-register').onclick = () => webauthnRegister(server);
-      document.getElementById('acct-login').onclick = () => webauthnLogin(server);
+      document.getElementById('acct-signin').onclick = () => navigate('#/login');
     };
     if (!api.account.token()) { renderSignedOut(); return; }
 
@@ -3443,6 +3441,144 @@ route('/settings', async () => {
         || '<div class="health-row faint">No keys yet — create one to let this device sync.</div>'}
       ${revokedKeys.length ? `<div class="health-row faint">${revokedKeys.length} revoked key${revokedKeys.length > 1 ? 's' : ''} (history)</div>` : ''}
       <div id="acct-key-once"></div>`;
+
+    // ── Email+password credentials, passkeys, recovery ────────────────────
+    const acctId = acct.account_id;
+    let creds = null;
+    try { creds = await api.account.credentials(server); } catch {}
+    const acctExtra = document.createElement('div');
+    acctExtra.innerHTML = creds
+      ? `
+        <div class="health-row" style="margin-top:0.5rem;"><strong>Account</strong></div>
+        <div class="health-row"><span class="faint">Email</span> <span class="mono">${esc(creds.email || '—')}</span></div>
+        <div class="health-row"><span class="faint">Recovery phrase</span>
+          <span class="ml-auto">${creds.has_recovery_key
+            ? `<span class="ok">● set ${creds.recovery_created_at ? '· ' + esc(String(creds.recovery_created_at).slice(0, 10)) : ''}</span>`
+            : '<span class="error">● NOT set — set it now</span>'}
+          <button class="btn btn-sm" id="acct-rotrec">${creds.has_recovery_key ? 'Rotate' : 'Set up'}</button></span></div>
+        ${creds.has_password ? `
+        <div class="health-row"><span class="faint">Password</span>
+          <span class="ml-auto"><button class="btn btn-sm" id="acct-chpw">Change password</button></span></div>
+        <div id="acct-chpw-form" style="display:none;"></div>` : `
+        <div class="health-row faint">Passkey-only account — recreate it from the login screen to add a password.</div>`}
+        <div class="health-row"><strong>Passkeys</strong>
+          <span class="ml-auto"><button class="btn btn-sm btn-primary" id="acct-add-passkey">Add passkey</button></span></div>
+        ${(creds.passkeys || []).map(p => `
+          <div class="health-row"><span class="mono">${esc(String(p.credential_id || '').slice(0, 16))}…</span>
+            <span class="faint">${esc(String(p.created_at || '').slice(0, 10))}</span>
+            <span class="ml-auto"><button class="btn btn-sm btn-danger" data-detach="${esc(p.credential_id)}">Detach</button></span></div>`).join('')
+          || '<div class="health-row faint">None — add one for faster sign-in.</div>'}
+        <div class="health-row faint">Passkeys are optional extras; your password is the account. The recovery phrase is the only way back into your vaults if the password is lost.</div>`
+      : '<div class="health-row faint">No credentials — passkey-only account.</div>';
+    bodyEl.appendChild(acctExtra);
+
+    acctExtra.querySelector('#acct-add-passkey').onclick = () => webauthnRegister(server);
+
+    acctExtra.querySelectorAll('[data-detach]').forEach(btn => {
+      btn.onclick = async () => {
+        const cid = btn.getAttribute('data-detach');
+        let password = null;
+        if (creds && creds.has_password) {
+          password = prompt('Detaching a passkey needs your account password (server verifies it fresh):');
+          if (!password) { toast('Password required to detach', 'error'); return; }
+        }
+        if (!confirm('Detach this passkey? Signing in with it stops working.')) return;
+        try {
+          await api.account.detachPasskey(server, cid, password);
+          toast('Passkey detached', 'ok');
+          renderAccount();
+        } catch (e) {
+          if (e.code === 'invalid_password') toast('Incorrect account password', 'error');
+          else if (e.code === 'password_required') toast('Enter your account password to detach', 'error');
+          else toast(e.message, 'error');
+        }
+      };
+    });
+
+    // Account key A for rewrap/rotate: in memory after password signin; if
+    // this tab doesn't have it, ask for the account password once.
+    const ensureA = async (reason) => {
+      let A = unlock.getAccountKey(acctId);
+      if (A) return A;
+      const pw = prompt(reason);
+      if (!pw) throw new Error('Account password required.');
+      try {
+        const blob = await api.account.getPasswordWrap(server);
+        const wk = await unlock.deriveWithSalt(pw, unlock.b64decode(blob.salt_pw));
+        try { A = await unlock.unwrapKey(wk, unlock.b64decode(blob.wrapped_a)); }
+        finally { wk.fill(0); }
+      } catch {
+        throw new Error('Incorrect account password.');
+      }
+      unlock.setAccountKey(acctId, A);
+      return A;
+    };
+
+    const rotBtn = acctExtra.querySelector('#acct-rotrec');
+    if (rotBtn) rotBtn.onclick = async () => {
+      const rnd = new Uint32Array(12);
+      crypto.getRandomValues(rnd);
+      const words = [];
+      for (let i = 0; i < 12; i++) words.push(BIP39_WORDS[rnd[i] % 2048]);
+      const phrase = words.join(' ');
+      const ok = prompt('New recovery phrase — WRITE IT DOWN NOW. It replaces the old one and is shown only once.\n\n' + phrase + '\n\nType the first word to confirm:', '');
+      if (ok === null) return;
+      if (ok.trim().toLowerCase() !== words[0]) { toast('Confirmation word does not match — phrase not changed', 'error'); return; }
+      try {
+        const A = await ensureA('Rotating the recovery phrase needs your account password (or sign in with it first):');
+        const saltRec = crypto.getRandomValues(new Uint8Array(16));
+        const wk = await unlock.deriveWithSalt(phrase, saltRec);
+        const wrapped = await unlock.wrapKey(wk, A);
+        wk.fill(0);
+        await api.account.putRecoveryWrap(server, unlock.b64encode(wrapped), unlock.b64encode(saltRec));
+        toast('Recovery phrase rotated', 'ok');
+        renderAccount();
+      } catch (e) { toast(e.message, 'error'); }
+    };
+
+    const chpwBtn = acctExtra.querySelector('#acct-chpw');
+    if (chpwBtn) chpwBtn.onclick = () => {
+      const form = acctExtra.querySelector('#acct-chpw-form');
+      const open = form.style.display !== 'block';
+      form.style.display = open ? 'block' : 'none';
+      if (open && !form.dataset.wired) {
+        form.dataset.wired = '1';
+        form.innerHTML = `
+          <input id="chpw-cur" type="password" placeholder="Current password" autocomplete="current-password">
+          <input id="chpw-new" type="password" placeholder="New password (12+ characters)" autocomplete="new-password">
+          <input id="chpw-conf" type="password" placeholder="Confirm new password" autocomplete="new-password">
+          <div class="mutation" style="padding:0 1rem 0.5rem;">
+            <button class="btn btn-primary btn-sm" id="chpw-go">Change password</button>
+          </div>`;
+        acctExtra.querySelector('#chpw-go').onclick = async () => {
+          const cur = acctExtra.querySelector('#chpw-cur').value;
+          const np = acctExtra.querySelector('#chpw-new').value;
+          const conf = acctExtra.querySelector('#chpw-conf').value;
+          if (np.length < 12) { toast('New password must be 12+ characters', 'error'); return; }
+          if (np !== conf) { toast('New passwords do not match', 'error'); return; }
+          const btn = acctExtra.querySelector('#chpw-go');
+          btn.disabled = true;
+          try {
+            await api.account.changePassword(server, cur, np);
+            // Rewrap A under the new password so signin keeps opening vaults.
+            const A = await ensureA('Re-linking your vault keys needs your account password:');
+            const saltPw = crypto.getRandomValues(new Uint8Array(16));
+            const wk = await unlock.deriveWithSalt(np, saltPw);
+            try {
+              const wrapped = await unlock.wrapKey(wk, A);
+              await api.account.putPasswordWrap(server, unlock.b64encode(wrapped), unlock.b64encode(saltPw));
+            } finally { wk.fill(0); }
+            A.fill(0);
+            toast('Password changed — vault keys re-linked', 'ok');
+            renderAccount();
+          } catch (e) {
+            btn.disabled = false;
+            if (e.code === 'invalid_password') toast('Current password is incorrect', 'error');
+            else toast(e.message, 'error');
+          }
+        };
+      }
+    };
 
     document.getElementById('acct-logout').onclick = async () => {
       try { await api.account.logout(server); } catch {}
