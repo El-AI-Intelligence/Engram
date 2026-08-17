@@ -52,13 +52,13 @@ export function lock() {
 // defensively: the relay has two shapes ({error: msg} on pull routes,
 // {error: {code, error}} on account routes).
 
-async function relayFetch(relay, path) {
-  const headers = {};
+async function relayFetch(relay, path, opts = {}) {
+  const headers = { ...(opts.headers || {}) };
   const token = localStorage.getItem(SESSION_KEY);
   if (token) headers['Authorization'] = 'Bearer ' + token;
   let r;
   try {
-    r = await fetch(String(relay).replace(/\/+$/, '') + path, { headers });
+    r = await fetch(String(relay).replace(/\/+$/, '') + path, { ...opts, headers });
   } catch (e) {
     throw new Error('Cannot reach the sync relay.');
   }
@@ -68,6 +68,7 @@ async function relayFetch(relay, path) {
       const b = await r.json();
       if (typeof b?.error === 'string') msg = b.error;
       else if (b?.error?.error) msg = b.error.error;
+      else if (typeof b?.code === 'string') msg = b.code; // flat {code, error} shape
     } catch {}
     const e = new Error(msg);
     e.status = r.status;
@@ -81,6 +82,12 @@ async function relayFetch(relay, path) {
 export async function listVaults(relay) {
   const data = await relayFetch(relay, '/account/vaults');
   return (data && data.vaults) || [];
+}
+
+// Forget a synced vault (DELETE /account/vaults/{vault_id}, session auth).
+// Idempotent server-side; removes every blob the relay holds for it.
+export async function forgetVault(relay, vaultId) {
+  return relayFetch(relay, `/account/vaults/${encodeURIComponent(vaultId)}`, { method: 'DELETE' });
 }
 
 // ── KDF ────────────────────────────────────────────────────────────────────

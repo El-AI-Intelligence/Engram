@@ -38,6 +38,7 @@ pub fn router() -> Router<SyncState> {
         .route("/auth/logout", post(logout))
         .route("/account", get(get_account))
         .route("/account/vaults", get(account_vaults))
+        .route("/account/vaults/{vault_id}", delete(delete_account_vault))
         .route("/account/keys", post(create_account_key))
         .route("/account/keys/{key_id}", delete(revoke_account_key))
         .route("/devices/pair-codes", post(mint_pairing_code))
@@ -740,7 +741,11 @@ pub(crate) async fn account_vault_scope(
 
 /// Vaults this account can unlock in a browser: the distinct vault_ids in
 /// `sync_blobs` that the account's keys authorize, with blob-version counts
-/// and the latest sync time. `blob_count` counts versions, not memories.
+/// and the latest sync time. `blob_count` counts versions, not memories;
+/// `live_count` counts non-tombstone rows (= live memories, since
+/// sync_blobs is one row per memory), and `label` is the newest device
+/// label registered for the vault (ties broken by device_id) — the closest
+/// thing to a friendly vault name the relay has.
 /// Session auth only — a read-only view of the account's sync footprint.
 async fn account_vaults(
     State(state): State<SyncState>,
@@ -749,23 +754,35 @@ async fn account_vaults(
     let account_id = authenticate_session(&state, &headers).await?;
     let scope = account_vault_scope(&state, &account_id).await?;
 
+    const SELECT: &str = "\
+        SELECT s.vault_id, \
+               COUNT(*) AS blob_count, \
+               COUNT(*) FILTER (WHERE s.deleted = 0) AS live_count, \
+               MAX(s.created_at) AS latest_sync, \
+               (SELECT dl.label FROM device_labels dl \
+                 WHERE dl.vault_id = s.vault_id \
+                 ORDER BY dl.updated_at DESC, dl.device_id ASC LIMIT 1) AS label \
+        FROM sync_blobs s";
+    let row_json = |r: &rusqlite::Row<'_>| -> rusqlite::Result<Value> {
+        Ok(json!({
+            "vault_id": r.get::<_, String>(0)?,
+            "blob_count": r.get::<_, i64>(1)?,
+            "live_count": r.get::<_, i64>(2)?,
+            "latest_sync": r.get::<_, Option<String>>(3)?,
+            "label": r.get::<_, Option<String>>(4)?,
+        }))
+    };
+
     let conn = state.conn.lock().await;
     let vaults: Vec<Value> = match &scope {
         None => {
             let mut stmt = conn
-                .prepare(
-                    "SELECT vault_id, COUNT(*) AS blob_count, MAX(created_at) AS latest_sync \
-                     FROM sync_blobs GROUP BY vault_id ORDER BY latest_sync DESC",
-                )
+                .prepare(&format!(
+                    "{SELECT} GROUP BY s.vault_id ORDER BY latest_sync DESC"
+                ))
                 .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
             let rows = stmt
-                .query_map([], |r| {
-                    Ok(json!({
-                        "vault_id": r.get::<_, String>(0)?,
-                        "blob_count": r.get::<_, i64>(1)?,
-                        "latest_sync": r.get::<_, Option<String>>(2)?,
-                    }))
-                })
+                .query_map([], row_json)
                 .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
             rows.collect::<Result<Vec<Value>, _>>()
                 .map_err(|e| err_json(500, "database_error", &e.to_string()))?
@@ -775,22 +792,15 @@ async fn account_vaults(
                 Vec::new()
             } else {
                 let sql = format!(
-                    "SELECT vault_id, COUNT(*) AS blob_count, MAX(created_at) AS latest_sync \
-                     FROM sync_blobs WHERE vault_id IN ({}) \
-                     GROUP BY vault_id ORDER BY latest_sync DESC",
+                    "{SELECT} WHERE s.vault_id IN ({}) \
+                     GROUP BY s.vault_id ORDER BY latest_sync DESC",
                     vec!["?"; ids.len()].join(",")
                 );
                 let mut stmt = conn
                     .prepare(&sql)
                     .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
                 let rows = stmt
-                    .query_map(rusqlite::params_from_iter(ids.iter()), |r| {
-                        Ok(json!({
-                            "vault_id": r.get::<_, String>(0)?,
-                            "blob_count": r.get::<_, i64>(1)?,
-                            "latest_sync": r.get::<_, Option<String>>(2)?,
-                        }))
-                    })
+                    .query_map(rusqlite::params_from_iter(ids.iter()), row_json)
                     .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
                 rows.collect::<Result<Vec<Value>, _>>()
                     .map_err(|e| err_json(500, "database_error", &e.to_string()))?
@@ -798,6 +808,46 @@ async fn account_vaults(
         }
     };
     Ok(Json(json!({ "vaults": vaults })))
+}
+
+/// Forget a synced vault: removes every blob, device label and revoked-
+/// device row for it. Idempotent — deleting an unknown vault is a 200 with
+/// `deleted_blobs: 0` (the picker re-renders after the call, so a double
+/// click must not 404). Deliberately does NOT touch `api_keys`: a key
+/// scoped to a forgotten vault keeps phantom scope (pull/list simply return
+/// nothing) and revoking it here would silently kill a live device's sync.
+/// A device that pushes later recreates its vault — expected; this cleans
+/// decommissioned vaults, it is not a write-lock.
+async fn delete_account_vault(
+    State(state): State<SyncState>,
+    headers: HeaderMap,
+    Path(vault_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let account_id = authenticate_session(&state, &headers).await?;
+    let scope = account_vault_scope(&state, &account_id).await?;
+    crate::routes::authorize_scope(&scope, &vault_id)?;
+    crate::routes::rate_limit_session(&state, &account_id).await?;
+
+    // No awaits while the conn guard is held (mint_and_store_session comment).
+    let conn = state.conn.lock().await;
+    let deleted_blobs = conn
+        .execute(
+            "DELETE FROM sync_blobs WHERE vault_id = ?1",
+            rusqlite::params![vault_id],
+        )
+        .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+    conn.execute(
+        "DELETE FROM device_labels WHERE vault_id = ?1",
+        rusqlite::params![vault_id],
+    )
+    .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+    conn.execute(
+        "DELETE FROM revoked_devices WHERE vault_id = ?1",
+        rusqlite::params![vault_id],
+    )
+    .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+    tracing::info!(account_id, vault_id, deleted_blobs, "account forgot vault");
+    Ok(Json(json!({ "vault_id": vault_id, "deleted_blobs": deleted_blobs })))
 }
 
 // Sync on purpose: callers hold the conn mutex guard (which is !Send) and
@@ -932,6 +982,14 @@ mod tests {
                  vector_clock INTEGER NOT NULL DEFAULT 0, ciphertext TEXT NOT NULL,
                  hmac TEXT NOT NULL, created_at TEXT NOT NULL, deleted INTEGER NOT NULL DEFAULT 0,
                  PRIMARY KEY (vault_id, memory_id)
+             );
+             CREATE TABLE revoked_devices (
+                 vault_id TEXT NOT NULL, device_id TEXT NOT NULL, revoked_at TEXT NOT NULL,
+                 PRIMARY KEY (vault_id, device_id)
+             );
+             CREATE TABLE device_labels (
+                 vault_id TEXT NOT NULL, device_id TEXT NOT NULL, label TEXT NOT NULL, updated_at TEXT NOT NULL,
+                 PRIMARY KEY (vault_id, device_id)
              );",
         )
         .unwrap();
@@ -1019,6 +1077,27 @@ mod tests {
         .unwrap();
     }
 
+    async fn seed_tombstone(state: &SyncState, vault: &str, mid: &str, created: &str) {
+        let conn = state.conn.lock().await;
+        // REPLACE mirrors the relay's push: one row per (vault, memory),
+        // tombstone overwrites the live row in place.
+        conn.execute(
+            "INSERT OR REPLACE INTO sync_blobs (vault_id, memory_id, device_id, vector_clock, ciphertext, hmac, created_at, deleted) \
+             VALUES (?1, ?2, 'dev-1', 2, 'x', 'h', ?3, 1)",
+            rusqlite::params![vault, mid, created],
+        )
+        .unwrap();
+    }
+
+    async fn seed_label(state: &SyncState, vault: &str, device: &str, label: &str, updated: &str) {
+        let conn = state.conn.lock().await;
+        conn.execute(
+            "INSERT INTO device_labels (vault_id, device_id, label, updated_at) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![vault, device, label, updated],
+        )
+        .unwrap();
+    }
+
     // ── Vault list (browser unlock) ──────────────────────────────────────
 
     #[tokio::test]
@@ -1036,7 +1115,13 @@ mod tests {
         }
         seed_blob(&state, "vault-a", "m1", "2026-01-01T00:00:00Z").await;
         seed_blob(&state, "vault-a", "m2", "2026-02-01T00:00:00Z").await;
+        seed_tombstone(&state, "vault-a", "m2", "2026-03-01T00:00:00Z").await;
         seed_blob(&state, "vault-b", "m3", "2026-01-15T00:00:00Z").await;
+        // vault-a: newest label wins; same-updated_at ties break by lowest
+        // device_id ("dev-b" < "dev-c" → "Newer"); vault-b has no labels → null.
+        seed_label(&state, "vault-a", "dev-a", "Older", "2026-01-01T00:00:00Z").await;
+        seed_label(&state, "vault-a", "dev-b", "Newer", "2026-02-01T00:00:00Z").await;
+        seed_label(&state, "vault-a", "dev-c", "AlsoNew", "2026-02-01T00:00:00Z").await;
 
         let res = account_vaults(State(state.clone()), bearer("tok-1"))
             .await
@@ -1044,10 +1129,14 @@ mod tests {
         let vaults = res.0["vaults"].as_array().expect("vaults array");
         assert_eq!(vaults.len(), 2);
         let a = vaults.iter().find(|v| v["vault_id"] == "vault-a").unwrap();
-        assert_eq!(a["blob_count"], 2);
-        assert_eq!(a["latest_sync"], "2026-02-01T00:00:00Z");
+        assert_eq!(a["blob_count"], 2); // m1 live + m2 tombstone (replaced in place)
+        assert_eq!(a["live_count"], 1); // tombstone excluded from live count
+        assert_eq!(a["latest_sync"], "2026-03-01T00:00:00Z");
+        assert_eq!(a["label"], "Newer"); // newest updated_at; tie → lowest device_id
         let b = vaults.iter().find(|v| v["vault_id"] == "vault-b").unwrap();
         assert_eq!(b["blob_count"], 1);
+        assert_eq!(b["live_count"], 1);
+        assert_eq!(b["label"], Value::Null);
     }
 
     #[tokio::test]
@@ -1065,6 +1154,8 @@ mod tests {
         }
         seed_blob(&state, "vault-a", "m1", "2026-01-01T00:00:00Z").await;
         seed_blob(&state, "vault-b", "m2", "2026-01-01T00:00:00Z").await;
+        seed_label(&state, "vault-a", "dev-a", "Kitchen", "2026-01-01T00:00:00Z").await;
+        seed_label(&state, "vault-b", "dev-b", "Hidden", "2026-01-01T00:00:00Z").await;
 
         let res = account_vaults(State(state.clone()), bearer("tok-1"))
             .await
@@ -1073,12 +1164,113 @@ mod tests {
         assert_eq!(vaults.len(), 1);
         assert_eq!(vaults[0]["vault_id"], "vault-a");
         assert_eq!(vaults[0]["blob_count"], 1);
+        assert_eq!(vaults[0]["live_count"], 1);
+        assert_eq!(vaults[0]["label"], "Kitchen");
     }
 
     #[tokio::test]
     async fn account_vaults_requires_valid_session() {
         let state = test_state();
         let err = account_vaults(State(state), HeaderMap::new())
+            .await
+            .expect_err("no session → 401");
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
+
+    // ── Forget vault (DELETE /account/vaults/{vault_id}) ─────────────────
+
+    async fn seed_unscoped_key(state: &SyncState, account_id: &str, id: &str) {
+        let conn = state.conn.lock().await;
+        conn.execute(
+            "INSERT INTO api_keys (id, account_id, key_hash, key_prefix, rate, vault_id, created_at, revoked) \
+             VALUES (?1, ?2, ?3, 'en_', 100, NULL, 'now', 0)",
+            rusqlite::params![id, account_id, auth::hash_key("en_unscoped").to_vec()],
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_account_vault_removes_everything_and_is_idempotent() {
+        let state = test_state();
+        seed_session(&state, "acct-1", "tok-1").await;
+        seed_unscoped_key(&state, "acct-1", "k1").await;
+        seed_blob(&state, "vault-a", "m1", "2026-01-01T00:00:00Z").await;
+        seed_blob(&state, "vault-a", "m2", "2026-02-01T00:00:00Z").await;
+        seed_label(&state, "vault-a", "dev-a", "Old", "2026-01-01T00:00:00Z").await;
+        {
+            let conn = state.conn.lock().await;
+            conn.execute(
+                "INSERT INTO revoked_devices (vault_id, device_id, revoked_at) VALUES ('vault-a', 'dev-x', 'now')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let res = delete_account_vault(State(state.clone()), bearer("tok-1"), Path("vault-a".into()))
+            .await
+            .expect("valid session, unscoped");
+        assert_eq!(res.0["vault_id"], "vault-a");
+        assert_eq!(res.0["deleted_blobs"], 2);
+
+        {
+            let conn = state.conn.lock().await;
+            for table in ["sync_blobs", "device_labels", "revoked_devices"] {
+                let n: i64 = conn
+                    .query_row(
+                        &format!("SELECT COUNT(*) FROM {table} WHERE vault_id = 'vault-a'"),
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(n, 0, "{table} not cleared");
+            }
+        }
+
+        // Idempotent: deleting again is a 200 with zero, not a 404.
+        let again = delete_account_vault(State(state.clone()), bearer("tok-1"), Path("vault-a".into()))
+            .await
+            .expect("second delete still 200");
+        assert_eq!(again.0["deleted_blobs"], 0);
+    }
+
+    #[tokio::test]
+    async fn delete_account_vault_respects_scoped_keys() {
+        let state = test_state();
+        seed_session(&state, "acct-1", "tok-1").await;
+        {
+            let conn = state.conn.lock().await;
+            conn.execute(
+                "INSERT INTO api_keys (id, account_id, key_hash, key_prefix, rate, vault_id, created_at, revoked) \
+                 VALUES ('k1', 'acct-1', ?1, 'en_', 100, 'vault-a', 'now', 0)",
+                rusqlite::params![auth::hash_key("en_scoped").to_vec()],
+            )
+            .unwrap();
+        }
+        seed_blob(&state, "vault-a", "m1", "2026-01-01T00:00:00Z").await;
+        seed_blob(&state, "vault-b", "m2", "2026-01-01T00:00:00Z").await;
+
+        // In scope → 200.
+        let ok = delete_account_vault(State(state.clone()), bearer("tok-1"), Path("vault-a".into()))
+            .await
+            .expect("scoped key covers vault-a");
+        assert_eq!(ok.0["deleted_blobs"], 1);
+
+        // Cross-vault → 403, vault-b blobs untouched.
+        let err = delete_account_vault(State(state.clone()), bearer("tok-1"), Path("vault-b".into()))
+            .await
+            .expect_err("scoped key must not reach vault-b");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        let conn = state.conn.lock().await;
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sync_blobs WHERE vault_id = 'vault-b'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    #[tokio::test]
+    async fn delete_account_vault_requires_valid_session() {
+        let state = test_state();
+        let err = delete_account_vault(State(state), HeaderMap::new(), Path("vault-a".into()))
             .await
             .expect_err("no session → 401");
         assert_eq!(err.0, StatusCode::UNAUTHORIZED);

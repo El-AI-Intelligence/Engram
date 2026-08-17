@@ -675,7 +675,7 @@ route('/login', () => {
       // webauthnRegister sets VAULT_JUST_REGISTERED_KEY then calls render()
       // on success — the login route lands on the 'pair' view exactly once.
       document.getElementById('reg-create').onclick = () => webauthnRegister(PAIR_CODE_SERVER);
-      document.getElementById('reg-back').onclick = (e) => { e.preventDefault(); renderLoginView('form'); };
+      document.getElementById('reg-back').onclick = (e) => { e.preventDefault(); renderLoginView('account'); };
     } else if (view === 'pair') {
       app.innerHTML = `
         <div class="modal-overlay">
@@ -704,19 +704,19 @@ route('/login', () => {
           if (e.status === 401) {
             api.account.setToken(null);
             toast('Account session expired — sign in again', 'error');
-            renderLoginView('form');
+            renderLoginView('account');
             return;
           }
           el.innerHTML = `<div class="error-panel"><p>${esc(e.message)}</p></div>`;
         }
       };
-      document.getElementById('pair-back').onclick = (e) => { e.preventDefault(); renderLoginView('form'); };
+      document.getElementById('pair-back').onclick = (e) => { e.preventDefault(); renderLoginView('account'); };
       document.getElementById('pair-logout').onclick = async (e) => {
         e.preventDefault();
         try { await api.account.logout(PAIR_CODE_SERVER); } catch {}
         api.account.setToken(null);
         toast('Signed out', 'ok');
-        renderLoginView('form');
+        renderLoginView('account');
       };
       // Validate the session and show the account id (401 → back to form).
       (async () => {
@@ -728,18 +728,109 @@ route('/login', () => {
           if (e.status === 401) {
             api.account.setToken(null);
             toast('Account session expired — sign in again', 'error');
-            renderLoginView('form');
+            renderLoginView('account');
           }
         }
       })();
-    } else {
+    } else if (view === 'account') {
+      // Account-first front door: the passkey IS the account and is the
+      // primary credential. A verified session lands on an account banner;
+      // otherwise the view is passkey-first with the box vault (operator)
+      // and the read-only browser unlock demoted to links below.
+      if (api.account.token()) {
+        app.innerHTML = `
+          <div class="modal-overlay">
+            <div class="modal login-modal">
+              <div class="login-brand"><span class="brand-gem">◆</span> Engram Vault</div>
+              <div class="modal-body">
+                <p class="faint" style="margin-top:0;">Your account syncs your vaults across devices.</p>
+                <div id="login-acct"></div>
+                <div class="login-alt">
+                  <p class="faint">Just viewing? <a href="#/unlock">Unlock a synced vault in this browser</a> — read-only, your vault passphrase decrypts it locally.</p>
+                  <p class="faint"><a href="#" id="login-operator">Server operator? Sign in to this server's own vault</a> — separate credentials.</p>
+                </div>
+              </div>
+            </div>
+          </div>`;
+        document.getElementById('login-operator').onclick = (e) => { e.preventDefault(); renderLoginView('operator'); };
+        const acctEl = document.getElementById('login-acct');
+        acctEl.innerHTML = '<div class="faint">Checking account…</div>';
+        (async () => {
+          try {
+            const acct = await api.account.get(PAIR_CODE_SERVER);
+            acctEl.innerHTML = `
+              <div class="settings-note">
+                <div class="faint">✓ Signed in as <span class="mono">${esc((acct.account_id || '').slice(0, 13))}…</span></div>
+                <div class="mutation" style="padding:0;">
+                  <button class="btn btn-primary btn-sm" id="login-unlock">Unlock vault</button>
+                  <button class="btn btn-sm" id="login-pair">Pair this machine</button>
+                  <button class="btn btn-sm" id="login-acct-logout">Sign out</button>
+                </div>
+                <div id="login-pair-once"></div>
+              </div>`;
+            document.getElementById('login-unlock').onclick = () => navigate('#/unlock');
+            document.getElementById('login-pair').onclick = async () => {
+              const once = document.getElementById('login-pair-once');
+              once.innerHTML = '<div class="faint">Requesting a pairing code…</div>';
+              try {
+                const res = await api.account.pairCodes(PAIR_CODE_SERVER);
+                once.innerHTML = pairCodeHtml(res.code);
+                wirePairCodeCopies(once);
+              } catch (e) {
+                if (e.status === 401) {
+                  api.account.setToken(null);
+                  toast('Account session expired — sign in again', 'error');
+                  renderLoginView('account');
+                  return;
+                }
+                once.innerHTML = `<div class="error-panel"><p>${esc(e.message)}</p></div>`;
+              }
+            };
+            document.getElementById('login-acct-logout').onclick = async (e) => {
+              e.preventDefault();
+              try { await api.account.logout(PAIR_CODE_SERVER); } catch {}
+              api.account.setToken(null);
+              toast('Signed out', 'ok');
+              renderLoginView('account');
+            };
+          } catch (e) {
+            if (e.status === 401) {
+              api.account.setToken(null);
+              renderLoginView('account');
+            }
+          }
+        })();
+        return;
+      }
       app.innerHTML = `
         <div class="modal-overlay">
           <div class="modal login-modal">
             <div class="login-brand"><span class="brand-gem">◆</span> Engram Vault</div>
             <div class="modal-body">
-              <p class="faint" style="margin-top:0;">Sign in to access your memories.</p>
-              <div id="login-acct"></div>
+              <p class="faint" style="margin-top:0;">Your Engram account syncs your vaults across devices — passkey only, no email or password.</p>
+              <div class="login-primary-panel">
+                <button class="btn btn-primary" id="login-passkey">Sign in with passkey</button>
+                <button class="btn" id="login-register">Create an account</button>
+              </div>
+              <div class="login-alt">
+                <p class="faint">Just viewing? <a href="#/unlock">Unlock a synced vault in this browser</a> — read-only, your vault passphrase decrypts it locally.</p>
+                <p class="faint"><a href="#" id="login-operator">Server operator? Sign in to this server's own vault</a> — separate credentials.</p>
+              </div>
+            </div>
+          </div>
+        </div>`;
+      document.getElementById('login-passkey').onclick = () => webauthnLogin(PAIR_CODE_SERVER);
+      document.getElementById('login-register').onclick = () => renderLoginView('register');
+      document.getElementById('login-operator').onclick = () => renderLoginView('operator');
+    } else {
+      // Operator sign-in: this server's own vault (HTTP basic auth on the
+      // box). Deliberately small and demoted — NOT the account flow.
+      app.innerHTML = `
+        <div class="modal-overlay">
+          <div class="modal login-modal">
+            <div class="login-brand"><span class="brand-gem">◆</span> Engram Vault</div>
+            <div class="modal-body">
+              <p class="faint" style="margin-top:0;">This server's own vault (engramd) — separate credentials from your Engram account.</p>
               <input id="login-user" type="text" placeholder="Username" autocomplete="username" autocapitalize="off" spellcheck="false">
               <input id="login-pass" type="password" placeholder="Password" autocomplete="current-password">
               <div id="login-error"></div>
@@ -747,9 +838,7 @@ route('/login', () => {
                 <button class="btn btn-primary" id="login-submit">Sign in</button>
               </div>
               <div class="login-alt">
-                <p class="faint">New here? <a href="#" id="login-register">Create an Engram account</a> — it's how your devices sync.</p>
-                <p class="faint">Already have an account? <a href="#" id="login-passkey">Sign in with a passkey</a>.</p>
-                <p class="faint">Just viewing? <a href="#/unlock">Unlock a synced vault in this browser</a> — read-only, decrypted locally.</p>
+                <p class="faint"><a href="#" id="login-account-back">← Sign in with your account</a></p>
               </div>
             </div>
           </div>
@@ -789,63 +878,7 @@ route('/login', () => {
       document.getElementById('login-user').onkeydown = onKey;
       document.getElementById('login-pass').onkeydown = onKey;
       document.getElementById('login-user').focus();
-      document.getElementById('login-register').onclick = (e) => { e.preventDefault(); renderLoginView('register'); };
-      // Passkey sign-in lands back here (the 'form' view) via renderLoginView;
-      // only fresh registration shows the pairing wizard.
-      document.getElementById('login-passkey').onclick = (e) => { e.preventDefault(); webauthnLogin(PAIR_CODE_SERVER); };
-
-      // A verified account changes this view visibly: a banner with the
-      // account id plus pair / sign-out actions, so a successful passkey
-      // login clearly "does something" without forcing the wizard.
-      if (api.account.token()) {
-        const acctEl = document.getElementById('login-acct');
-        acctEl.innerHTML = '<div class="faint">Checking account…</div>';
-        (async () => {
-          try {
-            const acct = await api.account.get(PAIR_CODE_SERVER);
-            acctEl.innerHTML = `
-              <div class="settings-note">
-                <div class="faint">✓ Signed in as <span class="mono">${esc((acct.account_id || '').slice(0, 13))}…</span></div>
-                <div class="mutation" style="padding:0;">
-                  <button class="btn btn-sm" id="login-pair">Pair this machine</button>
-                  <button class="btn btn-sm" id="login-unlock">Unlock vault</button>
-                  <button class="btn btn-sm" id="login-acct-logout">Sign out</button>
-                </div>
-                <div id="login-pair-once"></div>
-              </div>`;
-            document.getElementById('login-unlock').onclick = () => navigate('#/unlock');
-            document.getElementById('login-pair').onclick = async () => {
-              const once = document.getElementById('login-pair-once');
-              once.innerHTML = '<div class="faint">Requesting a pairing code…</div>';
-              try {
-                const res = await api.account.pairCodes(PAIR_CODE_SERVER);
-                once.innerHTML = pairCodeHtml(res.code);
-                wirePairCodeCopies(once);
-              } catch (e) {
-                if (e.status === 401) {
-                  api.account.setToken(null);
-                  toast('Account session expired — sign in again', 'error');
-                  renderLoginView('form');
-                  return;
-                }
-                once.innerHTML = `<div class="error-panel"><p>${esc(e.message)}</p></div>`;
-              }
-            };
-            document.getElementById('login-acct-logout').onclick = async (e) => {
-              e.preventDefault();
-              try { await api.account.logout(PAIR_CODE_SERVER); } catch {}
-              api.account.setToken(null);
-              toast('Signed out', 'ok');
-              renderLoginView('form');
-            };
-          } catch (e) {
-            if (e.status === 401) {
-              api.account.setToken(null);
-              acctEl.innerHTML = '';
-            }
-          }
-        })();
-      }
+      document.getElementById('login-account-back').onclick = (e) => { e.preventDefault(); renderLoginView('account'); };
     }
   };
 
@@ -853,7 +886,7 @@ route('/login', () => {
   // webauthnRegister). A lingering session token alone — e.g. a passkey
   // LOGIN, or any revisit within the 7-day session — lands on the form.
   if (sessionStorage.getItem(VAULT_JUST_REGISTERED_KEY) === '1') renderLoginView('pair');
-  else renderLoginView('form');
+  else renderLoginView('account');
 
   // Transition probe (comment above) — auto-enter on cached creds, unless
   // this tab signed out (VAULT_NO_PROBE_KEY).
@@ -922,14 +955,22 @@ route('/unlock', async () => {
           <div class="panel" style="max-width:40rem;margin:2rem auto;">
             <div class="panel-header">Unlock a synced vault</div>
             <div class="unlock-vaults">
-              ${vaults.map(v => `
+              ${vaults.map(v => {
+                const name = v.label || v.vault_id;
+                const count = (typeof v.live_count === 'number') ? v.live_count : v.blob_count;
+                return `
                 <div class="unlock-vault-row">
                   <div>
-                    <div class="mono">${esc(v.vault_id)}</div>
-                    <div class="faint">${v.blob_count} encrypted ${v.blob_count === 1 ? 'blob' : 'blobs'} · synced ${ago(v.latest_sync)}</div>
+                    <div class="unlock-vault-name">${esc(name)}</div>
+                    <div class="unlock-vault-id">${esc(v.vault_id)}</div>
+                    <div class="faint">${count} ${count === 1 ? 'memory' : 'memories'} · synced ${ago(v.latest_sync)}</div>
                   </div>
-                  <button class="btn btn-primary btn-sm" data-unlock-vault="${esc(v.vault_id)}">Unlock</button>
-                </div>`).join('')}
+                  <div class="unlock-vault-actions">
+                    <button class="btn btn-primary btn-sm" data-unlock-vault="${esc(v.vault_id)}">Unlock</button>
+                    <button class="forget-link" data-forget-vault="${esc(v.vault_id)}">Forget</button>
+                  </div>
+                </div>`;
+              }).join('')}
             </div>
             <div class="unlock-footer">
               <span class="faint">Read-only — nothing leaves this browser.</span>
@@ -938,7 +979,30 @@ route('/unlock', async () => {
           </div>
         </div>`;
       app.querySelectorAll('[data-unlock-vault]').forEach(btn => {
-        btn.onclick = () => passphrase(btn.getAttribute('data-unlock-vault'));
+        const v = vaults.find(x => x.vault_id === btn.getAttribute('data-unlock-vault'));
+        btn.onclick = () => passphrase(v.vault_id, v.label || v.vault_id);
+      });
+      app.querySelectorAll('[data-forget-vault]').forEach(btn => {
+        btn.onclick = async () => {
+          const v = vaults.find(x => x.vault_id === btn.getAttribute('data-forget-vault'));
+          if (!v) return;
+          const count = (typeof v.live_count === 'number') ? v.live_count : v.blob_count;
+          if (!confirm(`Forget "${v.label || v.vault_id}" (${v.vault_id})?\nThis permanently removes its ${count} synced ${count === 1 ? 'blob' : 'blobs'} from the relay.`)) return;
+          btn.disabled = true;
+          try {
+            await unlock.forgetVault(relay, v.vault_id);
+            toast('Vault forgotten', 'ok');
+            picker();
+          } catch (e) {
+            if (e.status === 401) {
+              toast('Account session expired — sign in again', 'error');
+              signedOut();
+              return;
+            }
+            toast(e.message, 'error');
+            btn.disabled = false;
+          }
+        };
       });
       document.getElementById('unlock-signout').onclick = async (e) => {
         e.preventDefault();
@@ -958,13 +1022,13 @@ route('/unlock', async () => {
     });
   }
 
-  function passphrase(vaultId) {
+  function passphrase(vaultId, label) {
     app.innerHTML = `
       <div class="page">
         <div class="panel" style="max-width:34rem;margin:2rem auto;">
-          <div class="panel-header">Unlock <span class="mono">${esc(vaultId)}</span></div>
+          <div class="panel-header">Unlock ${esc(label || vaultId)}${label && label !== vaultId ? ` <span class="mono">${esc(vaultId)}</span>` : ''}</div>
           <div class="unlock-form">
-            <p class="faint" style="margin:0 0 0.6rem;">Enter the vault passphrase — used only in this tab, never saved.</p>
+            <p class="faint" style="margin:0 0 0.6rem;">Enter this vault's passphrase — the one engramd created when the vault was set up. It is NOT your account passkey. Used only in this tab, never saved.</p>
             <input id="unlock-pass" type="password" placeholder="Vault passphrase" autocomplete="off" autocapitalize="off" spellcheck="false">
             <div id="unlock-progress"></div>
             <div class="mutation">
@@ -2308,7 +2372,7 @@ async function webauthnLogin(server) {
     const res = await api.account.loginFinish(
       server, window.location.origin, start.challenge_id, encodeCredential(credential));
     api.account.setToken(res.session_token);
-    toast('Passkey verified — sign in to your vault below', 'ok');
+    toast('Passkey verified — signed in', 'ok');
     render();
   } catch (e) {
     if (e.code === 'no_passkeys') {
@@ -2669,7 +2733,7 @@ route('/settings', async () => {
         : '<span class="error">● unreachable</span>';
     }
     const rows = (team.devices || []).map(d => `
-      <div class="health-row"><span class="mono">${esc(d.device_id || '?')}</span>${d.is_self ? ' <span class="badge badge-semantic">this device</span>' : ''}<span class="ml-auto faint">${d.blob_count || 0} blobs · ${esc(String(d.last_seen || '—').slice(0, 19))}</span></div>`).join('');
+      <div class="health-row">${d.label ? `<span>${esc(d.label)}</span> <span class="mono faint">${esc(d.device_id || '?')}</span>` : `<span class="mono">${esc(d.device_id || '?')}</span>`}${d.is_self ? ' <span class="badge badge-semantic">this device</span>' : ''}<span class="ml-auto faint">${d.blob_count || 0} blobs · ${esc(String(d.last_seen || '—').slice(0, 19))}</span></div>`).join('');
     devicesEl.innerHTML = rows || '<div class="health-row faint">No devices have pushed to this vault yet.</div>';
     const lp = team.last_push ? String(team.last_push).slice(0, 19) : '—';
     const pl = team.last_pull ? String(team.last_pull).slice(0, 19) : '—';

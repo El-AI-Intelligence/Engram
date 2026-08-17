@@ -758,7 +758,7 @@ fn authorize_vault(
 }
 
 /// Scope check for session-authenticated pulls: `None` = unscoped (any vault).
-fn authorize_scope(
+pub(crate) fn authorize_scope(
     scope: &Option<HashSet<String>>,
     vault_id: &str,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
@@ -771,7 +771,7 @@ fn authorize_scope(
 
 /// Rate-limit a session-authenticated pull at the account's fastest key rate
 /// (fallback 100 req/s). Bucket name can't collide with key-hash buckets.
-async fn rate_limit_session(
+pub(crate) async fn rate_limit_session(
     state: &SyncState,
     account_id: &str,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
