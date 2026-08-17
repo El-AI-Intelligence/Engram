@@ -800,6 +800,37 @@ without one, the ceremony creates a brand-new account.
 `quota.*_used` is measured over all vaults the account's unrevoked keys
 reach: distinct active devices and stored ciphertext bytes (see SYNC.md).
 
+#### `GET /account/vaults` — Vaults this account can pull (Bearer session)
+
+Powers the browser unlock view's vault picker. Same visibility rule as
+`GET /account`: an unscoped unrevoked key means every vault; otherwise only
+vaults named by unrevoked keys. Scoped vaults with zero blobs are omitted
+(nothing to unlock).
+
+```json
+// Response 200 — 401 {"code":"invalid_session"} when signed out
+{
+  "vaults": [
+    { "vault_id": "engram-local", "blob_count": 398,
+      "latest_sync": "2026-08-17T09:00:00Z" }
+  ]
+}
+```
+
+`blob_count` counts stored encrypted blob **versions**, not memories;
+`latest_sync` is the newest blob `created_at`.
+
+#### Pull accepts account sessions (read-only)
+
+`GET /v1/vaults/{vault_id}/pull` authenticates API keys first; **only on a
+401** does it fall back to the account session, with vault visibility
+derived as above (403 `"session is not authorized for this vault"` when
+the account's keys don't cover it). Session pulls are rate-limited in a
+separate bucket capped at the account's highest key rate — a 429 is never
+retried against the other auth path. Sessions remain read-only on the
+data plane: push, device and stats routes still require API keys. See
+SYNC.md, "Browser Unlock (read-only)".
+
 #### `POST /account/keys` — Mint an API key (Bearer session)
 
 ```json

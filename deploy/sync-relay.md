@@ -67,6 +67,10 @@ old and new binaries.
 - **Key hygiene:** `/account/keys` shows the full key once; the DB stores
   only `sha256(key)` — a DB leak cannot recover account keys. Revocation is
   soft (row kept as audit trail).
+- **Sessions can pull (2026-08-17, read-only):** pull accepts account
+  sessions on API-key 401 only (vault visibility = the account's unrevoked
+  keys; 429 never falls through), plus `GET /account/vaults` for the
+  browser unlock picker. Sessions still can't push or manage keys.
 - **Browser e2e** (human step, on this box): open
   https://engram.ellmstack.dev (branded login screen), Settings → Account →
   Register passkey → Sign out → Sign in → mint a key → "Connect this device"

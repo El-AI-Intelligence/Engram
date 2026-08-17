@@ -383,6 +383,39 @@ while there are no static keys **and** no unrevoked account keys. **The
 first minted account key flips the relay to require Bearer auth on
 loopback too** (default-secure). Static env keys are unaffected.
 
+## Browser Unlock (read-only)
+
+The web vault UI can open a **read-only mirror** of a synced vault: the
+browser pulls the account's encrypted blobs from the relay and decrypts
+them client-side with the vault passphrase. The box and the relay never
+see plaintext — the passphrase and derived keys live in the tab's memory
+only and are wiped on lock, sign-out, or reload.
+
+- **Auth:** pull accepts the account **session token** (Bearer). Vault
+  visibility is derived from the account's unrevoked API keys — exactly the
+  vaults a device of that account could pull. Sessions cannot push, mint
+  keys, or touch device/stat routes; a session's pull rate is capped at the
+  account's highest key rate, and rate-limit rejections never fall through
+  to another auth path.
+- **KDF:** Argon2id (64 MiB, 3 iterations, 4 lanes) with SHA-256
+  domain-tag salts — byte-identical to the daemon (tags `axiom-sync-enc-v2`
+  / `axiom-sync-hmac-v2`; hash-wasm in the browser, `argon2` crate in
+  engramd).
+- **Integrity:** every blob is HMAC-verified before decrypt. A mismatch is
+  counted and skipped — one corrupt blob never bricks the view; a
+  passphrase error (100% mismatch) fails cleanly with "does not match".
+- **Merge:** same last-write-wins as the daemon — max `vector_clock` per
+  memory, ties broken by `created_at` then `device_id`; deletion tombstones
+  drop the memory.
+- **Threat model:** a stolen session token can download ciphertext only —
+  decryption needs the passphrase, which never leaves the browser. Unlock
+  state is per-tab and per-navigation (reload clears it).
+- **v1 scope:** read-only (no capture/edit), vaults listed by
+  `GET /account/vaults` (`blob_count` counts encrypted blob *versions*,
+  not memories), and the hosted shell's CSP pins its relay
+  (`sync.ellmstack.dev`) — custom-relay users unlock from their own
+  self-hosted UI.
+
 ## Self-Hosting
 
 The sync server is designed to be self-hosted:
@@ -542,9 +575,9 @@ appear in the roster even before its first push.
 ### Account endpoints (sync server)
 
 `POST /auth/register/start|finish`, `POST /auth/login/start|finish`,
-`POST /auth/logout`, `GET /account`, `POST /account/keys`,
-`DELETE /account/keys/{key_id}` — contracts in API_SURFACE.md, section
-3.9.
+`POST /auth/logout`, `GET /account`, `GET /account/vaults`,
+`POST /account/keys`, `DELETE /account/keys/{key_id}` — contracts in
+API_SURFACE.md, section 3.9.
 
 ## Migration from Other Memory Systems
 
