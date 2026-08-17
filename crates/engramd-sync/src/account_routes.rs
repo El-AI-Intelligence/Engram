@@ -1325,7 +1325,7 @@ async fn put_vault_wrap(
 ) -> Result<Json<Value>, ApiError> {
     let account_id = authenticate_session(&state, &headers).await?;
     let scope = account_vault_scope(&state, &account_id).await?;
-    crate::routes::authorize_scope(&scope, &vault_id)?;
+    authorize_wrap_write(&scope, &account_id, &vault_id)?;
     crate::routes::rate_limit_session(&state, &account_id).await?;
     let wrapped_k = blob_field(&body, "wrapped_k", 512)?;
     let now = chrono::Utc::now().to_rfc3339();
@@ -1352,6 +1352,31 @@ async fn put_vault_wrap(
     Ok(Json(json!({ "vault_id": vault_id, "open": true, "generation": generation })))
 }
 
+/// Envelope writes are self-regarding: the account stores its OWN wrapped
+/// key blob, encrypted under its account key A — a wrap proves nothing
+/// without the real vault keys, which only the key handoff can deliver.
+/// Scoped accounts must still not claim vaults outside their scope; a
+/// keyless account (empty scope — nothing paired yet) may claim any vault,
+/// because it has no other vaults to cross into. Reads stay strictly scoped.
+fn authorize_wrap_write(
+    scope: &Option<HashSet<String>>,
+    account_id: &str,
+    vault_id: &str,
+) -> Result<(), ApiError> {
+    match scope {
+        None => Ok(()),
+        Some(vaults) if vaults.is_empty() => Ok(()),
+        Some(vaults) if vaults.contains(vault_id) => Ok(()),
+        Some(_) => {
+            tracing::warn!(account_id, vault_id, "vault wrap write refused by session scope");
+            Err((
+                StatusCode::FORBIDDEN,
+                Json(json!({ "error": "session is not authorized for this vault" })),
+            ))
+        }
+    }
+}
+
 /// Lock a vault again: delete the envelope (idempotent — locking an already
 /// locked vault is a 200 with `open: false`). Memories are never
 /// re-encrypted; only this envelope row is removed.
@@ -1363,7 +1388,7 @@ async fn delete_vault_wrap(
 ) -> Result<Json<Value>, ApiError> {
     let account_id = authenticate_session(&state, &headers).await?;
     let scope = account_vault_scope(&state, &account_id).await?;
-    crate::routes::authorize_scope(&scope, &vault_id)?;
+    authorize_wrap_write(&scope, &account_id, &vault_id)?;
     crate::routes::rate_limit_session(&state, &account_id).await?;
 
     let conn = state.conn.lock().await;
@@ -2469,6 +2494,35 @@ mod tests {
             .expect_err("locked vault");
         assert_eq!(err.0, StatusCode::NOT_FOUND);
         assert_eq!(err.1["code"], "no_vault_wrap");
+    }
+
+    #[tokio::test]
+    async fn keyless_account_can_claim_vault_wrap() {
+        // A freshly signed-up account has no API keys yet. Wrapping a vault
+        // is an adoption claim — the blob is encrypted under the account's
+        // own key A and proves nothing without the real vault keys, which
+        // only the key handoff delivers — so a keyless account may claim.
+        // Reads stay strictly scoped until keys are granted.
+        let state = test_state();
+        seed_session(&state, "acct-fresh", "tok-f").await;
+        let wrapped_k = base64::engine::general_purpose::STANDARD.encode(b"claimed-wrap");
+        let res = put_vault_wrap(
+            State(state.clone()),
+            bearer("tok-f"),
+            Path("vault-a".to_string()),
+            Json(json!({"wrapped_k": wrapped_k})),
+        )
+        .await
+        .expect("keyless account may claim a vault by wrapping it");
+        assert_eq!(res.0["open"], true);
+        let err = get_vault_wrap(
+            State(state),
+            bearer("tok-f"),
+            Path("vault-a".to_string()),
+        )
+        .await
+        .expect_err("reads stay scoped for keyless accounts");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

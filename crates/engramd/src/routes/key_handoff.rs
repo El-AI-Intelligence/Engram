@@ -4,7 +4,7 @@
 //! ENGRAM_PASSPHRASE at startup). To make the vault "open by default" in the
 //! browser, the SPA must wrap those keys under the account key A — which
 //! means the keys must reach the browser exactly once. `POST
-//! /sync/key-handoff/start` mints a single-use 300s token that redeems for
+//! /sync/key-handoff/start` mints a single-use 900s token that redeems for
 //! the key bytes exactly once at `POST /sync/key-handoff/{token}`.
 //!
 //! Trust boundary: Caddy gates /sync* behind the box basic-auth — the same
@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 type ApiError = (StatusCode, Json<Value>);
 
-pub const HANDOFF_TTL_SECS: u64 = 300;
+pub const HANDOFF_TTL_SECS: u64 = 900;
 
 impl KeyHandoff {
     /// Mint a fresh single-use token, sweeping expired ones first. Injected
@@ -108,11 +108,13 @@ mod tests {
     #[tokio::test]
     async fn tokens_expire_and_sweep() {
         let kh = KeyHandoff::default();
+        let ttl = HANDOFF_TTL_SECS;
         kh.mint_swept("tok-old", 1000).await;
-        kh.mint_swept("tok-new", 1400).await;
-        // tok-old is 600s old at 1600 — expired; the sweep drops it.
-        assert!(!kh.redeem_swept("tok-old", 1600).await, "expired");
-        assert!(kh.redeem_swept("tok-new", 1600).await);
+        kh.mint_swept("tok-new", 1000 + ttl - 100).await;
+        // tok-old is ttl+600s old at 1000+ttl+600 — expired; the sweep
+        // drops it, while tok-new (700s old) is still within the TTL.
+        assert!(!kh.redeem_swept("tok-old", 1000 + ttl + 600).await, "expired");
+        assert!(kh.redeem_swept("tok-new", 1000 + ttl + 600).await);
         let map = kh.tokens.lock().await;
         assert!(map.is_empty(), "expired entries swept on access");
     }

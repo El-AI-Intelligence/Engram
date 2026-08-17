@@ -1650,7 +1650,7 @@ pub async fn handle_handoff(vault: Option<PathBuf>, bind: String, site: String) 
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("handoff response missing token"))?;
     println!();
-    println!("  Vault keys ready for a one-time handoff (expires in 5 minutes).");
+    println!("  Vault keys ready for a one-time handoff (expires in 15 minutes).");
     println!();
     println!("  Open this link in the browser where you're signed in to your");
     println!("  Engram account:");

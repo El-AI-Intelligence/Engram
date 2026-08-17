@@ -47,7 +47,7 @@ pub struct SyncKeyMaterial {
     pub vault_id: String,
 }
 
-/// One-time key-handoff token store: single-use, 300s TTL, swept on access.
+/// One-time key-handoff token store: single-use, 900s TTL, swept on access.
 /// The mint/redeem logic lives in routes::key_handoff (field is pub(crate)
 /// so that impl can reach it). The route itself is gated by the box
 /// basic-auth in Caddy — the same wall the /config routes sit behind.

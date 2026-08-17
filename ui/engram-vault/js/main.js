@@ -231,6 +231,25 @@ const VAULT_JUST_REGISTERED_KEY = 'engram-just-registered';
 // polls the account's vaults and auto-advances to the unlock picker the
 // moment the paired device registers on the relay.
 const PAIR_POLL_KEY = 'engram-pair-poll';
+// A key-handoff link opened without a live session must survive the sign-in
+// round-trip: the handoff route stashes the token here, /login resumes it
+// the moment a session exists. Single-shot and session-scoped by design.
+const HANDOFF_PENDING_KEY = 'engram-pending-handoff';
+
+function pendingHandoff() {
+  try {
+    const v = JSON.parse(sessionStorage.getItem(HANDOFF_PENDING_KEY) || 'null');
+    return v && v.token ? v : null;
+  } catch { return null; }
+}
+
+function resumePendingHandoff() {
+  const p = pendingHandoff();
+  if (!p || !localStorage.getItem('engram-sync-session')) return false;
+  sessionStorage.removeItem(HANDOFF_PENDING_KEY);
+  navigate('#/handoff/' + encodeURIComponent(p.token) + '?daemon=' + encodeURIComponent(p.daemon || '127.0.0.1:8799'));
+  return true;
+}
 
 function getCreds() {
   return sessionStorage.getItem(VAULT_CREDS_KEY);
@@ -1043,10 +1062,11 @@ route('/login', () => {
           const keyState = await acquireAccountKey(PAIR_CODE_SERVER, res.account_id, password);
           if (keyState === 'setup') {
             // Signup was aborted before the wraps landed — create the key now.
-            renderPhraseGate(PAIR_CODE_SERVER, res.account_id, email, password, () => navigate('#/unlock'));
+            renderPhraseGate(PAIR_CODE_SERVER, res.account_id, email, password, () => { if (resumePendingHandoff()) return; navigate('#/unlock'); });
           } else if (keyState === 'recovery') {
             renderRecoveryGate(PAIR_CODE_SERVER, res.account_id, password);
           } else {
+            if (resumePendingHandoff()) return;
             navigate('#/unlock');
           }
         } catch (e) {
@@ -1098,7 +1118,7 @@ route('/login', () => {
         try {
           const res = await api.account.signup(PAIR_CODE_SERVER, email, password);
           api.account.setToken(res.session_token);
-          renderPhraseGate(PAIR_CODE_SERVER, res.account_id, email, password, () => navigate('#/unlock'));
+          renderPhraseGate(PAIR_CODE_SERVER, res.account_id, email, password, () => { if (resumePendingHandoff()) return; navigate('#/unlock'); });
         } catch (e) {
           if (e.code === 'email_taken') fail('An account with that email already exists — sign in instead.');
           else if (e.code === 'weak_password') fail('Password must be 12–128 characters.');
@@ -1350,6 +1370,10 @@ route('/login', () => {
     }
   }, 3000);
   currentCleanup = () => clearInterval(poll);
+
+  // A key-handoff link that bounced here signed-out resumes the moment a
+  // session token exists (signin/signup paths also call this directly).
+  if (resumePendingHandoff()) return;
 });
 
 // ── Password reset link (from the reset email: #/reset/{token}) ────────────
@@ -1428,7 +1452,14 @@ route('/handoff/:token', (token) => {
       toast('Vault linked — it now opens with your account', 'ok');
       navigate('#/unlock');
     } catch (e) {
-      if (e && e.status === 401) { api.account.setToken(null); navigate('#/login'); return; }
+      if (e && e.status === 401) {
+        // Signed-out (or stale session): keep the link alive across the
+        // sign-in round-trip instead of destroying it.
+        sessionStorage.setItem(HANDOFF_PENDING_KEY, JSON.stringify({ token, daemon }));
+        api.account.setToken(null);
+        navigate('#/login');
+        return;
+      }
       fail(e.message || 'Handoff failed.');
     }
   })();
