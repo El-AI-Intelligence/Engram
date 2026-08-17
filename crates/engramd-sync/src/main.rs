@@ -2,7 +2,11 @@
 //!
 //! Design principles:
 //!   - Server NEVER sees plaintext — all encryption happens client-side
-//!   - Accounts are pseudonymous: passkey-only, no email/name/PII
+//!   - Accounts: email+password primary, passkeys optional. Email is the
+//!     only PII; passwords stay as a server-side Argon2id login hash whose
+//!     params/salt differ from the client key-wrap derivation (a leaked
+//!     hash yields no wrap key material). Key envelopes in the wrap tables
+//!     are client-produced AES-GCM ciphertext the relay cannot open.
 //!   - Single responsibility: accept blobs, serve blobs, verify HMAC
 //!   - Billing is handled by a separate service (Stripe webhooks)
 //!
@@ -13,10 +17,16 @@
 //!   GET    /v1/vaults/{vault_id}/stats                   — vault statistics
 //!   GET    /v1/vaults/{vault_id}/devices                 — device roster
 //!   DELETE /v1/vaults/{vault_id}/devices/{device_id}     — revoke a device
+//!   POST   /auth/signup|signin                           — email+password auth
+//!   POST   /auth/reset/request|confirm                   — password reset
 //!   POST   /auth/register/start|finish                   — create account (passkey)
 //!   POST   /auth/login/start|finish                      — sign in (passkey)
 //!   POST   /auth/logout                                  — end session
 //!   GET    /account, POST/DELETE /account/keys           — account + API keys
+//!   GET    /account/credentials, POST /account/password  — email + password
+//!   GET    /account/passkeys, DELETE /account/passkeys/{id}
+//!   GET    /account/wraps, PUT /account/wraps/{password,recovery}
+//!   PUT|DELETE /account/vaults/{vault_id}/wrap           — vault open/locked
 //!
 //! Auth (two tiers):
 //!   1. Static keys from SYNC_API_KEYS env — the original operator keys.
@@ -39,11 +49,13 @@
 
 mod account_routes;
 mod auth;
+mod password_routes;
 mod quota;
 mod routes;
 
 use crate::auth::{build_webauthn, WebauthnStore, Webauthn};
-use clap::Parser;
+use clap::{Parser, Subcommand};
+use rusqlite::OptionalExtension;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -95,25 +107,75 @@ struct Cli {
     /// Default per-account stored-bytes quota (0 = unlimited).
     #[arg(long, default_value_t = 0)]
     quota_bytes: i64,
+
+    /// SMTP host for password-reset emails. When unset, /auth/reset/request
+    /// never emails (operator hands out tokens via `admin reset-token`).
+    #[arg(long, env = "ENGRAM_SMTP_HOST")]
+    smtp_host: Option<String>,
+
+    /// SMTP port (587 STARTTLS is the supported path).
+    #[arg(long, env = "ENGRAM_SMTP_PORT", default_value_t = 587)]
+    smtp_port: u16,
+
+    /// SMTP username (plain auth; omit for unauthenticated relay).
+    #[arg(long, env = "ENGRAM_SMTP_USERNAME")]
+    smtp_username: Option<String>,
+
+    /// SMTP password.
+    #[arg(long, env = "ENGRAM_SMTP_PASSWORD")]
+    smtp_password: Option<String>,
+
+    /// From address for reset emails (required when --smtp-host is set).
+    #[arg(long, env = "ENGRAM_SMTP_FROM")]
+    smtp_from: Option<String>,
+
+    /// Public URL reset links point at (defaults to the first --origin).
+    #[arg(long)]
+    smtp_base_url: Option<String>,
+
+    #[command(subcommand)]
+    command: Option<AdminCommand>,
 }
 
-/// Per-key rate limiter: simple token bucket with 1-second refill.
+#[derive(Subcommand, Debug)]
+enum AdminCommand {
+    /// Mint and print a password-reset token for an account (operator
+    /// delivery). The plaintext is shown once on stdout, stored only as a
+    /// sha256 hash, single-use, valid 30 minutes.
+    ResetToken {
+        /// The account's signup email (case-insensitive)
+        email: String,
+    },
+}
+
+/// Per-key rate limiter: token bucket. `rate` = tokens per second of
+/// refill; `burst` = bucket capacity (starts full). Rates ≥ 1/s behave
+/// exactly as before (burst = rate); slower buckets (e.g. 3/hr) need an
+/// explicit burst or the capacity would be below the 1-token request cost
+/// and every request would be rejected.
 pub struct RateLimiter {
     tokens: f64,
+    rate: f64,
     max_tokens: f64,
     last_refill: std::time::Instant,
 }
 
 impl RateLimiter {
-    fn new(rate: f64) -> Self {
-        Self { tokens: rate, max_tokens: rate, last_refill: std::time::Instant::now() }
+    pub fn new(rate: f64, burst: f64) -> Self {
+        let max_tokens = burst.max(1.0);
+        Self {
+            tokens: max_tokens,
+            rate,
+            max_tokens,
+            last_refill: std::time::Instant::now(),
+        }
     }
 
     /// Returns true if a request is allowed (consumes 1 token).
-    fn allow(&mut self) -> bool {
+    pub fn allow(&mut self) -> bool {
         let now = std::time::Instant::now();
         let elapsed = now.duration_since(self.last_refill).as_secs_f64();
-        self.tokens = (self.tokens + elapsed * (self.max_tokens / 1.0)).min(self.max_tokens);
+        self.tokens = (self.tokens + elapsed * self.rate).min(self.max_tokens);
         self.last_refill = now;
         if self.tokens >= 1.0 {
             self.tokens -= 1.0;
@@ -163,6 +225,20 @@ pub struct SyncState {
     pub webauthn: Arc<Webauthn>,
     /// In-flight ceremony state (registrations + authentications).
     pub auth_store: Arc<WebauthnStore>,
+    /// SMTP settings for password-reset emails (None = operator fallback).
+    pub smtp: Option<Arc<SmtpConfig>>,
+}
+
+/// SMTP delivery config for password-reset emails. Present only when
+/// --smtp-host is set; everything else falls back to the operator CLI.
+#[derive(Clone, Debug)]
+pub struct SmtpConfig {
+    pub host: String,
+    pub port: u16,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub from: String,
+    pub base_url: String,
 }
 
 #[tokio::main]
@@ -175,6 +251,11 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
+
+    // ── Operator subcommand (no server, no API keys needed) ─────────────
+    if let Some(AdminCommand::ResetToken { email }) = &cli.command {
+        return admin_reset_token(&cli.data_dir, email);
+    }
 
     // ── Load API keys ──────────────────────────────────────────────────
     let api_keys = load_api_keys();
@@ -250,8 +331,9 @@ async fn main() -> anyhow::Result<()> {
             revoked_at TEXT NOT NULL,
             PRIMARY KEY (vault_id, device_id)
         );
-        -- Accounts (roadmap 1.2): standalone passkeys, no email/name/PII.
-        -- quota_* NULL = server default (--quota-devices / --quota-bytes).
+        -- Accounts: email+password primary, passkeys optional (see
+        -- account_credentials). quota_* NULL = server default
+        -- (--quota-devices / --quota-bytes).
         CREATE TABLE IF NOT EXISTS accounts (
             id            TEXT PRIMARY KEY,
             created_at    TEXT NOT NULL,
@@ -311,7 +393,80 @@ async fn main() -> anyhow::Result<()> {
             expires_at TEXT NOT NULL,
             used       INTEGER NOT NULL DEFAULT 0
         );
-        CREATE INDEX IF NOT EXISTS idx_pairing_codes_account ON pairing_codes(account_id);",
+        CREATE INDEX IF NOT EXISTS idx_pairing_codes_account ON pairing_codes(account_id);
+        -- Email+password credentials (roadmap: standard accounts). The
+        -- password_hash is Argon2id with its OWN salt and params — never
+        -- derivable into the client-side wrap keys. Legacy passkey-only
+        -- accounts simply have no row here.
+        CREATE TABLE IF NOT EXISTS account_credentials (
+            account_id      TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+            email           TEXT NOT NULL UNIQUE,
+            password_hash   BLOB NOT NULL,
+            password_salt   BLOB NOT NULL,
+            email_verified  INTEGER NOT NULL DEFAULT 0,
+            updated_at      TEXT NOT NULL
+        );
+        -- Password-reset tokens: token_hash is sha256 of the plaintext token
+        -- (emailed or operator-printed, shown once). Single-use, 30 min TTL.
+        CREATE TABLE IF NOT EXISTS password_reset_tokens (
+            token_hash BLOB PRIMARY KEY,
+            account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            used       INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_reset_tokens_account ON password_reset_tokens(account_id);
+        -- Account key envelopes (zero-knowledge): the relay stores ONLY
+        -- wrapped keys it cannot open. wrapped_a = AES-GCM(account key A,
+        -- client-derived wrap key); the recovery PHRASE itself is never
+        -- stored anywhere. kdf records the client's wrap-KDF params
+        -- (v1: argon2id 64MiB/3/4 — same as vault unlock) so they can be
+        -- strengthened later without losing old wraps; generation bumps on
+        -- every rewrap so other clients know to refetch.
+        CREATE TABLE IF NOT EXISTS account_key_wraps (
+            account_id TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+            wrapped_a  BLOB NOT NULL,
+            salt_pw    BLOB NOT NULL,
+            kdf        TEXT NOT NULL DEFAULT 'argon2id-65536-3-4',
+            generation INTEGER NOT NULL DEFAULT 1,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS recovery_key_wraps (
+            account_id    TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+            wrapped_a_rec BLOB NOT NULL,
+            salt_rec      BLOB NOT NULL,
+            kdf           TEXT NOT NULL DEFAULT 'argon2id-65536-3-4',
+            generation    INTEGER NOT NULL DEFAULT 1,
+            created_at    TEXT NOT NULL
+        );
+        -- Vault key envelopes: kind='account' row present = vault is OPEN by
+        -- default for THAT account (unwrappable by its account key A).
+        -- Per (account, vault): two accounts sharing a vault each hold
+        -- their own envelope. Absent = LOCKED (passphrase-only).
+        -- Lock/unlock toggles rows; memories never move. Lock is a
+        -- client-side concept — a malicious relay could re-serve deleted
+        -- rows, so it is not a relay-enforced boundary (threat model).
+        CREATE TABLE IF NOT EXISTS vault_key_wraps (
+            account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+            vault_id   TEXT NOT NULL,
+            kind       TEXT NOT NULL DEFAULT 'account',
+            wrapped_k  BLOB NOT NULL,
+            generation INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (account_id, vault_id, kind)
+        );
+        -- Security-relevant account events (signin, credential + wrap
+        -- changes). The only way a user notices activity on a hijacked
+        -- session. No PII beyond the account id and event names.
+        CREATE TABLE IF NOT EXISTS auth_events (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+            event      TEXT NOT NULL,
+            detail     TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_auth_events_account ON auth_events(account_id);",
     )?;
 
     // ── Run tombstone cleanup on startup ───────────────────────────────
@@ -334,6 +489,29 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // ── Optional SMTP for reset emails ─────────────────────────────────
+    let smtp = match &cli.smtp_host {
+        Some(host) => {
+            let from = cli.smtp_from.clone().unwrap_or_else(|| {
+                tracing::error!("--smtp-from is required when --smtp-host is set");
+                std::process::exit(1);
+            });
+            let base_url = cli
+                .smtp_base_url
+                .clone()
+                .unwrap_or_else(|| primary_origin.clone());
+            Some(Arc::new(SmtpConfig {
+                host: host.clone(),
+                port: cli.smtp_port,
+                username: cli.smtp_username.clone(),
+                password: cli.smtp_password.clone(),
+                from,
+                base_url,
+            }))
+        }
+        None => None,
+    };
+
     let state = SyncState {
         conn: Arc::new(Mutex::new(conn)),
         start_time: chrono::Utc::now(),
@@ -347,6 +525,7 @@ async fn main() -> anyhow::Result<()> {
         default_quota_bytes: cli.quota_bytes,
         webauthn,
         auth_store,
+        smtp,
     };
 
     // ── Background tombstone cleanup (daily) ───────────────────────────
@@ -397,6 +576,7 @@ async fn main() -> anyhow::Result<()> {
     let app = axum::Router::new()
         .merge(routes::router())
         .merge(account_routes::router())
+        .merge(password_routes::router())
         .with_state(state)
         .layer(
             CorsLayer::new()
@@ -438,6 +618,72 @@ async fn main() -> anyhow::Result<()> {
 /// as far as possible but not truncated).
 fn wal_checkpoint(conn: &rusqlite::Connection) -> rusqlite::Result<i64> {
     conn.query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |r| r.get(0))
+}
+
+/// Operator delivery of password-reset tokens: mint a fresh single-use
+/// token for an account (found by signup email), store only its sha256
+/// hash, print the plaintext ONCE on stdout. Without SMTP configured this
+/// is how the user receives a token — nothing sensitive goes to logs.
+fn admin_reset_token(data_dir: &PathBuf, email: &str) -> anyhow::Result<()> {
+    let email = email.trim().to_lowercase();
+    std::fs::create_dir_all(data_dir)?;
+    let conn = rusqlite::Connection::open(data_dir.join("sync.db"))?;
+    let account_id: Option<String> = conn
+        .query_row(
+            "SELECT account_id FROM account_credentials WHERE email = ?1",
+            rusqlite::params![email],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let account_id = match account_id {
+        Some(a) => a,
+        None => anyhow::bail!("no account with email {email} in {}", data_dir.display()),
+    };
+    let token = auth::mint_session_token()?;
+    let now = chrono::Utc::now();
+    let expires = now + chrono::Duration::minutes(30);
+    conn.execute(
+        "INSERT INTO password_reset_tokens (token_hash, account_id, created_at, expires_at) \
+         VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![
+            auth::hash_token(&token).to_vec(),
+            account_id,
+            now.to_rfc3339(),
+            expires.to_rfc3339(),
+        ],
+    )?;
+    eprintln!("Reset token for {email} (single use, valid 30 minutes):");
+    println!("{token}");
+    Ok(())
+}
+
+/// Email a reset link. Blocking SMTP round-trip — call via spawn_blocking,
+/// never inline in a handler. Returns Err on any delivery failure so the
+/// caller can fall back to `sent: false` (operator path).
+pub fn send_reset_email(cfg: &SmtpConfig, recipient: &str, link: &str) -> anyhow::Result<()> {
+    use lettre::transport::smtp::authentication::Credentials;
+    use lettre::transport::smtp::client::{Tls, TlsParameters};
+    use lettre::{Message, SmtpTransport, Transport};
+
+    let tls = Tls::Opportunistic(TlsParameters::builder(cfg.host.clone()).build()?);
+    let mut builder = SmtpTransport::relay(&cfg.host)?
+        .port(cfg.port)
+        .tls(tls);
+    if let (Some(user), Some(pass)) = (&cfg.username, &cfg.password) {
+        builder = builder.credentials(Credentials::new(user.clone(), pass.clone()));
+    }
+    let email = Message::builder()
+        .from(cfg.from.parse()?)
+        .to(recipient.parse()?)
+        .subject("Your Engram password reset")
+        .body(format!(
+            "A password reset was requested for your Engram account.\n\n\
+             If this was you, open this link within 30 minutes to set a new password:\n\n\
+             \x20 {link}\n\n\
+             If you didn't request this, ignore this email — your password is unchanged.\n"
+        ))?;
+    builder.build().send(&email)?;
+    Ok(())
 }
 
 /// Resolves once SIGINT (Ctrl+C) or SIGTERM is received, so the server

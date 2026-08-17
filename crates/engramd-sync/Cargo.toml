@@ -35,3 +35,10 @@ webauthn-rs-proto = "0.5.5"
 sha2 = "0.10"
 base64 = "0.22"
 rand = "0.9"
+
+# Server-side password hashing (Argon2id). Distinct params + salt from the
+# CLIENT-side wrap derivation so the stored hash yields no wrap key material.
+argon2 = "0.5"
+
+# Optional SMTP for password-reset emails (operator CLI fallback otherwise)
+lettre = "0.11"

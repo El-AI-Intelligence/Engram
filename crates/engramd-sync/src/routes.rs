@@ -735,7 +735,7 @@ async fn rate_limit(
     let mut limiters = state.rate_limiters.lock().await;
     let limiter = limiters
         .entry(limiter_key)
-        .or_insert_with(|| crate::RateLimiter::new(entry.rate));
+        .or_insert_with(|| crate::RateLimiter::new(entry.rate, entry.rate.max(1.0)));
     if !limiter.allow() {
         return Err(err_json(429, "rate limit exceeded"));
     }
@@ -878,6 +878,7 @@ mod tests {
             default_quota_bytes: 0,
             webauthn: Arc::new(crate::auth::build_webauthn("localhost", "http://localhost:8787").unwrap()),
             auth_store: Arc::new(crate::auth::WebauthnStore::new()),
+            smtp: None,
         }
     }
 

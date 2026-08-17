@@ -14,14 +14,16 @@
 //! vault UI origin and the relay origin.
 
 use crate::auth::{self, SESSION_TTL};
+use crate::password_routes;
 use crate::SyncState;
 use std::collections::HashSet;
 use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
     Json, Router,
 };
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use rusqlite::OptionalExtension;
 use serde_json::{json, Value};
 use webauthn_rs::prelude::*;
@@ -41,6 +43,17 @@ pub fn router() -> Router<SyncState> {
         .route("/account/vaults/{vault_id}", delete(delete_account_vault))
         .route("/account/keys", post(create_account_key))
         .route("/account/keys/{key_id}", delete(revoke_account_key))
+        .route("/account/credentials", get(account_credentials))
+        .route("/account/password", post(change_account_password))
+        .route("/account/passkeys", get(account_passkeys))
+        .route("/account/passkeys/{credential_id}", delete(delete_account_passkey))
+        .route("/account/wraps", get(account_wraps))
+        .route("/account/wraps/password", put(put_password_wrap))
+        .route("/account/wraps/recovery", put(put_recovery_wrap))
+        .route(
+            "/account/vaults/{vault_id}/wrap",
+            put(put_vault_wrap).delete(delete_vault_wrap),
+        )
         .route("/devices/pair-codes", post(mint_pairing_code))
         .route("/devices/pair", post(redeem_pairing_code))
 }
@@ -62,6 +75,13 @@ async fn register_start(
         Err(e) if e.0 == StatusCode::UNAUTHORIZED => None,
         Err(e) => return Err(e),
     };
+    // Attaching a passkey is a credential mutation: a session alone is not
+    // proof (7-day TTL). Accounts with a password must verify it here.
+    if let Some(ref account_id) = attach_account {
+        let password = body.get("password").and_then(|v| v.as_str());
+        let conn = state.conn.lock().await;
+        password_routes::require_fresh_password(&conn, account_id, password)?;
+    }
     let user_unique_id = attach_account
         .as_ref()
         .and_then(|a| Uuid::parse_str(a).ok())
@@ -148,7 +168,14 @@ async fn register_finish(
     let conn = state.conn.lock().await;
 
     // New accounts get created here; attaching to an existing account is a
-    // no-op thanks to OR IGNORE.
+    // no-op thanks to OR IGNORE. The audit event needs to know which.
+    let account_existed: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM accounts WHERE id = ?1",
+            rusqlite::params![account_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
     conn.execute(
         "INSERT OR IGNORE INTO accounts (id, created_at, last_login_at) VALUES (?1, ?2, ?2)",
         rusqlite::params![account_id, now_str],
@@ -176,6 +203,7 @@ async fn register_finish(
             match existing {
                 Some(a) => {
                     let session_token = mint_and_store_session(&conn, &a)?;
+                    audit_event(&conn, &a, "passkey_signin", Some("already_registered"));
                     return Ok(Json(json!({
                         "account_id": a,
                         "session_token": session_token,
@@ -193,6 +221,17 @@ async fn register_finish(
         }
         Err(e) => return Err(err_json(500, "database_error", &e.to_string())),
     }
+
+    audit_event(
+        &conn,
+        &account_id,
+        if account_existed > 0 {
+            "passkey_attach"
+        } else {
+            "account_created"
+        },
+        None,
+    );
 
     conn.execute(
         "UPDATE accounts SET last_login_at = ?1 WHERE id = ?2",
@@ -332,6 +371,7 @@ async fn login_finish(
     .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
 
     let session_token = mint_and_store_session(&conn, &account_id)?;
+    audit_event(&conn, &account_id, "passkey_signin", None);
     Ok(Json(json!({
         "account_id": account_id,
         "session_token": session_token,
@@ -593,7 +633,7 @@ async fn redeem_pairing_code(
         let mut limiters = state.rate_limiters.lock().await;
         let limiter = limiters
             .entry("pair-redeem".into())
-            .or_insert_with(|| crate::RateLimiter::new(5.0));
+            .or_insert_with(|| crate::RateLimiter::new(5.0, 5.0));
         if !limiter.allow() {
             return Err(err_json(
                 429,
@@ -745,7 +785,9 @@ pub(crate) async fn account_vault_scope(
 /// `live_count` counts non-tombstone rows (= live memories, since
 /// sync_blobs is one row per memory), and `label` is the newest device
 /// label registered for the vault (ties broken by device_id) — the closest
-/// thing to a friendly vault name the relay has.
+/// thing to a friendly vault name the relay has. `is_open` reflects the
+/// vault_key_wraps envelope (true = opens with the account key, no
+/// passphrase prompt).
 /// Session auth only — a read-only view of the account's sync footprint.
 async fn account_vaults(
     State(state): State<SyncState>,
@@ -761,7 +803,10 @@ async fn account_vaults(
                MAX(s.created_at) AS latest_sync, \
                (SELECT dl.label FROM device_labels dl \
                  WHERE dl.vault_id = s.vault_id \
-                 ORDER BY dl.updated_at DESC, dl.device_id ASC LIMIT 1) AS label \
+                 ORDER BY dl.updated_at DESC, dl.device_id ASC LIMIT 1) AS label, \
+               EXISTS(SELECT 1 FROM vault_key_wraps kw \
+                 WHERE kw.vault_id = s.vault_id AND kw.kind = 'account' \
+                   AND kw.account_id = ?1) AS is_open \
         FROM sync_blobs s";
     let row_json = |r: &rusqlite::Row<'_>| -> rusqlite::Result<Value> {
         Ok(json!({
@@ -770,6 +815,7 @@ async fn account_vaults(
             "live_count": r.get::<_, i64>(2)?,
             "latest_sync": r.get::<_, Option<String>>(3)?,
             "label": r.get::<_, Option<String>>(4)?,
+            "is_open": r.get::<_, bool>(5)?,
         }))
     };
 
@@ -782,7 +828,7 @@ async fn account_vaults(
                 ))
                 .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
             let rows = stmt
-                .query_map([], row_json)
+                .query_map(rusqlite::params![account_id], row_json)
                 .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
             rows.collect::<Result<Vec<Value>, _>>()
                 .map_err(|e| err_json(500, "database_error", &e.to_string()))?
@@ -799,8 +845,11 @@ async fn account_vaults(
                 let mut stmt = conn
                     .prepare(&sql)
                     .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+                // ?1 = account_id (is_open), then the IN list.
+                let params = std::iter::once(account_id.as_str())
+                    .chain(ids.iter().map(String::as_str));
                 let rows = stmt
-                    .query_map(rusqlite::params_from_iter(ids.iter()), row_json)
+                    .query_map(rusqlite::params_from_iter(params), row_json)
                     .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
                 rows.collect::<Result<Vec<Value>, _>>()
                     .map_err(|e| err_json(500, "database_error", &e.to_string()))?
@@ -848,6 +897,391 @@ async fn delete_account_vault(
     .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
     tracing::info!(account_id, vault_id, deleted_blobs, "account forgot vault");
     Ok(Json(json!({ "vault_id": vault_id, "deleted_blobs": deleted_blobs })))
+}
+
+// ── Email+password credentials + passkey management ──────────────────────────
+
+/// What credential methods this account has. No secrets: only the email,
+/// existence flags, and base64url ids of attached passkeys (ids are public
+/// in WebAuthn anyway). A legacy passkey-only account has no
+/// account_credentials row and reports `email: null`.
+async fn account_credentials(
+    State(state): State<SyncState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let account_id = authenticate_session(&state, &headers).await?;
+    crate::routes::rate_limit_session(&state, &account_id).await?;
+
+    let conn = state.conn.lock().await;
+    let creds: Option<(String, i64)> = conn
+        .query_row(
+            "SELECT email, email_verified FROM account_credentials WHERE account_id = ?1",
+            rusqlite::params![account_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+    let recovery_created_at: Option<String> = conn
+        .query_row(
+            "SELECT created_at FROM recovery_key_wraps WHERE account_id = ?1",
+            rusqlite::params![account_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+    let passkeys = list_passkeys(&conn, &account_id)?;
+    Ok(Json(json!({
+        "email": creds.as_ref().map(|(e, _)| e.clone()),
+        "email_verified": creds.as_ref().map(|(_, v)| *v != 0).unwrap_or(false),
+        "has_password": creds.is_some(),
+        "has_recovery_key": recovery_created_at.is_some(),
+        "recovery_created_at": recovery_created_at,
+        "passkeys": passkeys,
+    })))
+}
+
+/// The attached passkeys, newest first. `credential_id` is base64url (no
+/// padding) so the SPA can match rows against navigator-returned ids.
+async fn account_passkeys(
+    State(state): State<SyncState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let account_id = authenticate_session(&state, &headers).await?;
+    crate::routes::rate_limit_session(&state, &account_id).await?;
+    let conn = state.conn.lock().await;
+    Ok(Json(json!({ "passkeys": list_passkeys(&conn, &account_id)? })))
+}
+
+fn list_passkeys(conn: &rusqlite::Connection, account_id: &str) -> Result<Vec<Value>, ApiError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT credential_id, created_at FROM passkeys \
+             WHERE account_id = ?1 ORDER BY created_at DESC",
+        )
+        .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+    let rows = stmt
+        .query_map(rusqlite::params![account_id], |r| {
+            Ok(json!({
+                "credential_id": URL_SAFE_NO_PAD.encode(r.get::<_, Vec<u8>>(0)?),
+                "created_at": r.get::<_, String>(1)?,
+            }))
+        })
+        .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+    rows.collect::<Result<Vec<Value>, _>>()
+        .map_err(|e| err_json(500, "database_error", &e.to_string()))
+}
+
+/// Detach a passkey (delete the row only — the authenticator still holds a
+/// resident copy, which the user should remove there too; that copy can no
+/// longer sign in). Guards against self-lockout: an account with no
+/// password cannot remove its last passkey.
+async fn delete_account_passkey(
+    State(state): State<SyncState>,
+    headers: HeaderMap,
+    Path(credential_id_b64): Path<String>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let account_id = authenticate_session(&state, &headers).await?;
+    crate::routes::rate_limit_session(&state, &account_id).await?;
+    let credential_id = URL_SAFE_NO_PAD
+        .decode(credential_id_b64.trim_end_matches('='))
+        .map_err(|_| err_json(400, "bad_credential_id", "credential_id is not valid base64url"))?;
+
+    let conn = state.conn.lock().await;
+    let has_password: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM account_credentials WHERE account_id = ?1",
+            rusqlite::params![account_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+    let passkey_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM passkeys WHERE account_id = ?1",
+            rusqlite::params![account_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+    if has_password == 0 && passkey_count <= 1 {
+        return Err(err_json(
+            409,
+            "last_credential",
+            "this account has no password; removing its only passkey would lock you out",
+        ));
+    }
+    // Fresh-password gate: detaching a passkey is a credential mutation, and
+    // a 7-day session alone is not proof.
+    let password = body.get("password").and_then(|v| v.as_str());
+    password_routes::require_fresh_password(&conn, &account_id, password)?;
+    let removed = conn
+        .execute(
+            "DELETE FROM passkeys WHERE account_id = ?1 AND credential_id = ?2",
+            rusqlite::params![account_id, credential_id],
+        )
+        .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+    if removed == 0 {
+        return Err(err_json(404, "unknown_passkey", "no such passkey on this account"));
+    }
+    audit_event(&conn, &account_id, "passkey_detach", None);
+    tracing::info!(account_id, "account detached passkey");
+    Ok(Json(json!({ "detached": true })))
+}
+
+/// Change the account password in-session. Rewrites only the login hash;
+/// the client is responsible for rewrapping the account key A under the new
+/// password (PUT /account/wraps/password). Other sessions are revoked so a
+/// changed password cannot keep previously-issued sessions alive.
+async fn change_account_password(
+    State(state): State<SyncState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let account_id = authenticate_session(&state, &headers).await?;
+    crate::routes::rate_limit_session(&state, &account_id).await?;
+    let current_password = str_field(&body, "current_password")?;
+    let new_password = str_field(&body, "new_password")?;
+    if new_password.chars().count() < password_routes::PASSWORD_MIN_CHARS
+        || new_password.len() > password_routes::PASSWORD_MAX_CHARS
+    {
+        return Err(err_json(400, "weak_password", "password must be 12-128 characters"));
+    }
+    let current_token_hash = auth::hash_token(bearer_token(&headers)?).to_vec();
+
+    let conn = state.conn.lock().await;
+    let stored: Option<(Vec<u8>, Vec<u8>)> = conn
+        .query_row(
+            "SELECT password_hash, password_salt FROM account_credentials \
+             WHERE account_id = ?1",
+            rusqlite::params![account_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+    let (stored_hash, salt) = match stored {
+        Some(row) => row,
+        None => {
+            return Err(err_json(
+                409,
+                "no_password",
+                "this account has no password (sign in with a passkey)",
+            ))
+        }
+    };
+    if !password_routes::verify_password(current_password, &salt, &stored_hash)? {
+        return Err(err_json(401, "invalid_password", "current password is incorrect"));
+    }
+    let (new_salt, new_hash) = password_routes::hash_password(new_password)?;
+    conn.execute(
+        "UPDATE account_credentials SET password_hash = ?1, password_salt = ?2, updated_at = ?3 \
+         WHERE account_id = ?4",
+        rusqlite::params![new_hash, new_salt, chrono::Utc::now().to_rfc3339(), account_id],
+    )
+    .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+    let revoked = conn
+        .execute(
+            "DELETE FROM sessions WHERE account_id = ?1 AND token_hash != ?2",
+            rusqlite::params![account_id, current_token_hash],
+        )
+        .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+    audit_event(&conn, &account_id, "password_change", None);
+    tracing::info!(account_id, revoked_sessions = revoked, "account password changed");
+    Ok(Json(json!({ "changed": true })))
+}
+
+// ── Account + vault key envelopes (zero-knowledge: the relay only stores
+//    AES-GCM ciphertexts it can never open) ──────────────────────────────────
+
+/// Which envelopes exist for this account + which vaults are OPEN (an
+/// `kind='account'` wrap row). `open_vaults` is scoped to vaults the
+/// account's API keys authorize, like every other vault listing.
+async fn account_wraps(
+    State(state): State<SyncState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let account_id = authenticate_session(&state, &headers).await?;
+    crate::routes::rate_limit_session(&state, &account_id).await?;
+    let scope = account_vault_scope(&state, &account_id).await?;
+
+    let conn = state.conn.lock().await;
+    // Generations let the SPA detect stale wraps after a rewrap race (two
+    // sessions rotating the password): a PUT that returns a lower generation
+    // than the client last saw means another session won.
+    let password_wrap_generation: Option<i64> = conn
+        .query_row(
+            "SELECT generation FROM account_key_wraps WHERE account_id = ?1",
+            rusqlite::params![account_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+    let recovery_wrap_generation: Option<i64> = conn
+        .query_row(
+            "SELECT generation FROM recovery_key_wraps WHERE account_id = ?1",
+            rusqlite::params![account_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT DISTINCT vault_id FROM vault_key_wraps \
+             WHERE account_id = ?1 AND kind = 'account' ORDER BY vault_id",
+        )
+        .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+    let rows = stmt
+        .query_map(rusqlite::params![account_id], |r| r.get::<_, String>(0))
+        .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+    let open_vaults: Vec<String> = rows
+        .collect::<Result<Vec<String>, _>>()
+        .map_err(|e| err_json(500, "database_error", &e.to_string()))?
+        .into_iter()
+        .filter(|v| scope.as_ref().map(|s| s.contains(v)).unwrap_or(true))
+        .collect();
+    Ok(Json(json!({
+        "password_wrap": password_wrap_generation.is_some(),
+        "password_wrap_generation": password_wrap_generation,
+        "recovery_wrap": recovery_wrap_generation.is_some(),
+        "recovery_wrap_generation": recovery_wrap_generation,
+        "open_vaults": open_vaults,
+    })))
+}
+
+/// Store (or replace) the password envelope of the account key A.
+/// `wrapped_a` is AES-GCM output the client produced; the relay cannot open
+/// it. Blobs are size-capped so the wrap tables cannot become a dump.
+async fn put_password_wrap(
+    State(state): State<SyncState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let account_id = authenticate_session(&state, &headers).await?;
+    crate::routes::rate_limit_session(&state, &account_id).await?;
+    let wrapped_a = blob_field(&body, "wrapped_a", 512)?;
+    let salt_pw = blob_field(&body, "salt_pw", 64)?;
+    let now = chrono::Utc::now().to_rfc3339();
+
+    let conn = state.conn.lock().await;
+    conn.execute(
+        "INSERT INTO account_key_wraps (account_id, wrapped_a, salt_pw, kdf, generation, updated_at) \
+         VALUES (?1, ?2, ?3, 'argon2id-65536-3-4', 1, ?4) \
+         ON CONFLICT(account_id) DO UPDATE SET \
+           wrapped_a = ?2, salt_pw = ?3, kdf = 'argon2id-65536-3-4', \
+           generation = account_key_wraps.generation + 1, updated_at = ?4",
+        rusqlite::params![account_id, wrapped_a, salt_pw, now],
+    )
+    .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+    let generation: i64 = conn
+        .query_row(
+            "SELECT generation FROM account_key_wraps WHERE account_id = ?1",
+            rusqlite::params![account_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+    audit_event(&conn, &account_id, "password_wrap_put", None);
+    tracing::info!(account_id, generation, "account stored password wrap");
+    Ok(Json(json!({ "stored": true, "generation": generation })))
+}
+
+/// Store (or replace) the recovery-phrase envelope of A. The phrase itself
+/// is never sent here — only the ciphertext and the salt. `created_at` is
+/// preserved on rotate: it records when recovery was first set up.
+async fn put_recovery_wrap(
+    State(state): State<SyncState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let account_id = authenticate_session(&state, &headers).await?;
+    crate::routes::rate_limit_session(&state, &account_id).await?;
+    let wrapped_a_rec = blob_field(&body, "wrapped_a_rec", 512)?;
+    let salt_rec = blob_field(&body, "salt_rec", 64)?;
+    let now = chrono::Utc::now().to_rfc3339();
+
+    let conn = state.conn.lock().await;
+    conn.execute(
+        "INSERT INTO recovery_key_wraps (account_id, wrapped_a_rec, salt_rec, kdf, generation, created_at) \
+         VALUES (?1, ?2, ?3, 'argon2id-65536-3-4', 1, ?4) \
+         ON CONFLICT(account_id) DO UPDATE SET \
+           wrapped_a_rec = ?2, salt_rec = ?3, kdf = 'argon2id-65536-3-4', \
+           generation = recovery_key_wraps.generation + 1",
+        rusqlite::params![account_id, wrapped_a_rec, salt_rec, now],
+    )
+    .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+    let generation: i64 = conn
+        .query_row(
+            "SELECT generation FROM recovery_key_wraps WHERE account_id = ?1",
+            rusqlite::params![account_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+    audit_event(&conn, &account_id, "recovery_wrap_put", None);
+    tracing::info!(account_id, generation, "account stored recovery wrap");
+    Ok(Json(json!({ "stored": true, "generation": generation })))
+}
+
+/// Mark a vault OPEN by default: store A-wrapped vault keys. Scoped — the
+/// account must hold an API key for the vault, same as pull/list.
+async fn put_vault_wrap(
+    State(state): State<SyncState>,
+    headers: HeaderMap,
+    Path(vault_id): Path<String>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let account_id = authenticate_session(&state, &headers).await?;
+    let scope = account_vault_scope(&state, &account_id).await?;
+    crate::routes::authorize_scope(&scope, &vault_id)?;
+    crate::routes::rate_limit_session(&state, &account_id).await?;
+    let wrapped_k = blob_field(&body, "wrapped_k", 512)?;
+    let now = chrono::Utc::now().to_rfc3339();
+
+    let conn = state.conn.lock().await;
+    conn.execute(
+        "INSERT INTO vault_key_wraps (account_id, vault_id, kind, wrapped_k, generation, created_at, updated_at) \
+         VALUES (?1, ?2, 'account', ?3, 1, ?4, ?4) \
+         ON CONFLICT(account_id, vault_id, kind) DO UPDATE SET \
+           wrapped_k = ?3, generation = vault_key_wraps.generation + 1, updated_at = ?4",
+        rusqlite::params![account_id, vault_id, wrapped_k, now],
+    )
+    .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+    let generation: i64 = conn
+        .query_row(
+            "SELECT generation FROM vault_key_wraps \
+             WHERE account_id = ?1 AND vault_id = ?2 AND kind = 'account'",
+            rusqlite::params![account_id, vault_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+    audit_event(&conn, &account_id, "vault_wrap_put", Some(vault_id.as_str()));
+    tracing::info!(account_id, vault_id, generation, "account opened vault (wrap stored)");
+    Ok(Json(json!({ "vault_id": vault_id, "open": true, "generation": generation })))
+}
+
+/// Lock a vault again: delete the envelope (idempotent — locking an already
+/// locked vault is a 200 with `open: false`). Memories are never
+/// re-encrypted; only this envelope row is removed.
+async fn delete_vault_wrap(
+    State(state): State<SyncState>,
+    headers: HeaderMap,
+    Path(vault_id): Path<String>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let account_id = authenticate_session(&state, &headers).await?;
+    let scope = account_vault_scope(&state, &account_id).await?;
+    crate::routes::authorize_scope(&scope, &vault_id)?;
+    crate::routes::rate_limit_session(&state, &account_id).await?;
+
+    let conn = state.conn.lock().await;
+    // Locking gates access to vault keys, so it is a credential mutation:
+    // accounts with a password must verify it fresh, in this request.
+    let password = body.get("password").and_then(|v| v.as_str());
+    password_routes::require_fresh_password(&conn, &account_id, password)?;
+    conn.execute(
+        "DELETE FROM vault_key_wraps WHERE account_id = ?1 AND vault_id = ?2 AND kind = 'account'",
+        rusqlite::params![account_id, vault_id],
+    )
+    .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+    audit_event(&conn, &account_id, "vault_wrap_delete", Some(vault_id.as_str()));
+    tracing::info!(account_id, vault_id, "account locked vault (wrap deleted)");
+    Ok(Json(json!({ "vault_id": vault_id, "open": false })))
 }
 
 // Sync on purpose: callers hold the conn mutex guard (which is !Send) and
@@ -902,6 +1336,42 @@ fn str_field<'a>(body: &'a Value, name: &str) -> Result<&'a str, ApiError> {
     body.get(name)
         .and_then(|v| v.as_str())
         .ok_or_else(|| err_json(400, "missing_field", &format!("missing {name}")))
+}
+
+/// Decode a required base64 field, size-capped on the DECODED bytes so the
+/// wrap tables cannot become a dump.
+fn blob_field(body: &Value, name: &str, max_len: usize) -> Result<Vec<u8>, ApiError> {
+    let b64 = str_field(body, name)?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64.trim())
+        .map_err(|_| err_json(400, "bad_base64", &format!("{name} is not valid base64")))?;
+    if bytes.len() > max_len {
+        return Err(err_json(
+            400,
+            "too_large",
+            &format!("{name} exceeds {max_len} bytes"),
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Append a security-relevant account event to the audit log (auth_events
+/// table). Best-effort: a failed insert warns but never fails the request.
+/// Callers already hold the conn guard. The event list is the only way a
+/// user notices activity on a hijacked session (e.g. a passkey added).
+pub(crate) fn audit_event(
+    conn: &rusqlite::Connection,
+    account_id: &str,
+    event: &str,
+    detail: Option<&str>,
+) {
+    if let Err(e) = conn.execute(
+        "INSERT INTO auth_events (account_id, event, detail, created_at) \
+         VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![account_id, event, detail, chrono::Utc::now().to_rfc3339()],
+    ) {
+        tracing::warn!("audit event insert failed: {e}");
+    }
 }
 
 fn validate_origin(state: &SyncState, origin: &str) -> Result<(), ApiError> {
@@ -990,6 +1460,42 @@ mod tests {
              CREATE TABLE device_labels (
                  vault_id TEXT NOT NULL, device_id TEXT NOT NULL, label TEXT NOT NULL, updated_at TEXT NOT NULL,
                  PRIMARY KEY (vault_id, device_id)
+             );
+             CREATE TABLE account_credentials (
+                 account_id TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+                 email TEXT NOT NULL UNIQUE, password_hash BLOB NOT NULL, password_salt BLOB NOT NULL,
+                 email_verified INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL
+             );
+             CREATE TABLE password_reset_tokens (
+                 token_hash BLOB PRIMARY KEY, account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+                 created_at TEXT NOT NULL, expires_at TEXT NOT NULL, used INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE account_key_wraps (
+                 account_id TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+                 wrapped_a BLOB NOT NULL, salt_pw BLOB NOT NULL,
+                 kdf TEXT NOT NULL DEFAULT 'argon2id-65536-3-4',
+                 generation INTEGER NOT NULL DEFAULT 1,
+                 updated_at TEXT NOT NULL
+             );
+             CREATE TABLE recovery_key_wraps (
+                 account_id TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+                 wrapped_a_rec BLOB NOT NULL, salt_rec BLOB NOT NULL,
+                 kdf TEXT NOT NULL DEFAULT 'argon2id-65536-3-4',
+                 generation INTEGER NOT NULL DEFAULT 1,
+                 created_at TEXT NOT NULL
+             );
+             CREATE TABLE vault_key_wraps (
+                 account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+                 vault_id TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'account',
+                 wrapped_k BLOB NOT NULL,
+                 generation INTEGER NOT NULL DEFAULT 1,
+                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                 PRIMARY KEY (account_id, vault_id, kind)
+             );
+             CREATE TABLE auth_events (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+                 event TEXT NOT NULL, detail TEXT, created_at TEXT NOT NULL
              );",
         )
         .unwrap();
@@ -1010,6 +1516,7 @@ mod tests {
             default_quota_bytes: 0,
             webauthn: Arc::new(crate::auth::build_webauthn("localhost", "http://localhost:8787").unwrap()),
             auth_store: Arc::new(crate::auth::WebauthnStore::new()),
+            smtp: None,
         }
     }
 
@@ -1184,7 +1691,11 @@ mod tests {
         conn.execute(
             "INSERT INTO api_keys (id, account_id, key_hash, key_prefix, rate, vault_id, created_at, revoked) \
              VALUES (?1, ?2, ?3, 'en_', 100, NULL, 'now', 0)",
-            rusqlite::params![id, account_id, auth::hash_key("en_unscoped").to_vec()],
+            rusqlite::params![
+                id,
+                account_id,
+                auth::hash_key(&format!("en_unscoped-{id}")).to_vec()
+            ],
         )
         .unwrap();
     }
@@ -1514,5 +2025,546 @@ mod tests {
             .expect_err("cap reached");
         assert_eq!(err.0, StatusCode::CONFLICT);
         assert_eq!(err.1["code"], "too_many_codes");
+    }
+
+    // ── Email+password credentials + passkey management (Kimi revision) ──
+
+    async fn insert_password_account(state: &SyncState, account_id: &str, password: &str) {
+        let (salt, hash) = crate::password_routes::hash_password(password).unwrap();
+        let conn = state.conn.lock().await;
+        conn.execute(
+            "INSERT OR IGNORE INTO accounts (id, created_at) VALUES (?1, 'now')",
+            rusqlite::params![account_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO account_credentials \
+             (account_id, email, password_hash, password_salt, email_verified, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, 0, 'now')",
+            rusqlite::params![account_id, format!("{account_id}@example.com"), hash, salt],
+        )
+        .unwrap();
+    }
+
+    async fn insert_passkey_row(state: &SyncState, account_id: &str, cred_id: &[u8]) {
+        let conn = state.conn.lock().await;
+        conn.execute(
+            "INSERT INTO passkeys (account_id, credential_id, public_key, created_at) \
+             VALUES (?1, ?2, x'00', 'now')",
+            rusqlite::params![account_id, cred_id],
+        )
+        .unwrap();
+    }
+
+    async fn audit_count(state: &SyncState, account_id: &str, event: &str) -> i64 {
+        let conn = state.conn.lock().await;
+        conn.query_row(
+            "SELECT COUNT(*) FROM auth_events WHERE account_id = ?1 AND event = ?2",
+            rusqlite::params![account_id, event],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn account_credentials_reports_email_flags_and_passkeys() {
+        let state = test_state();
+        seed_session(&state, "acct-1", "tok-1").await;
+        insert_password_account(&state, "acct-1", "correct-horse-battery-staple").await;
+        insert_passkey_row(&state, "acct-1", b"cred-bytes-1").await;
+
+        let res = account_credentials(State(state), bearer("tok-1"))
+            .await
+            .expect("valid session");
+        let body = res.0;
+        assert_eq!(body["email"], "acct-1@example.com");
+        assert_eq!(body["email_verified"], false);
+        assert_eq!(body["has_password"], true);
+        assert_eq!(body["has_recovery_key"], false);
+        let passkeys = body["passkeys"].as_array().unwrap();
+        assert_eq!(passkeys.len(), 1);
+        assert_eq!(
+            passkeys[0]["credential_id"],
+            URL_SAFE_NO_PAD.encode(b"cred-bytes-1".as_slice())
+        );
+    }
+
+    #[tokio::test]
+    async fn account_credentials_legacy_passkey_only_account_has_no_email() {
+        let state = test_state();
+        seed_session(&state, "acct-1", "tok-1").await;
+        insert_passkey_row(&state, "acct-1", b"cred-bytes-1").await;
+        let res = account_credentials(State(state), bearer("tok-1"))
+            .await
+            .expect("session");
+        let body = res.0;
+        assert_eq!(body["email"], Value::Null);
+        assert_eq!(body["has_password"], false);
+        assert_eq!(body["passkeys"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn delete_account_passkey_requires_fresh_password() {
+        let state = test_state();
+        seed_session(&state, "acct-1", "tok-1").await;
+        insert_password_account(&state, "acct-1", "correct-horse-battery-staple").await;
+        insert_passkey_row(&state, "acct-1", b"cred-bytes-1").await;
+        let cred_b64 = URL_SAFE_NO_PAD.encode(b"cred-bytes-1".as_slice());
+
+        // No password in the body → 401 password_required.
+        let err = delete_account_passkey(
+            State(state.clone()),
+            bearer("tok-1"),
+            Path(cred_b64.clone()),
+            Json(json!({})),
+        )
+        .await
+        .expect_err("password gate");
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(err.1["code"], "password_required");
+
+        // Wrong password → 401 invalid_password.
+        let err = delete_account_passkey(
+            State(state.clone()),
+            bearer("tok-1"),
+            Path(cred_b64.clone()),
+            Json(json!({"password": "wrong-password-1"})),
+        )
+        .await
+        .expect_err("wrong password");
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(err.1["code"], "invalid_password");
+
+        // Fresh password → detach succeeds, row gone, audit written.
+        let res = delete_account_passkey(
+            State(state.clone()),
+            bearer("tok-1"),
+            Path(cred_b64),
+            Json(json!({"password": "correct-horse-battery-staple"})),
+        )
+        .await
+        .expect("fresh password");
+        assert_eq!(res.0["detached"], true);
+        {
+            let conn = state.conn.lock().await;
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM passkeys WHERE account_id = 'acct-1'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 0);
+        }
+        assert_eq!(audit_count(&state, "acct-1", "passkey_detach").await, 1);
+    }
+
+    #[tokio::test]
+    async fn delete_account_passkey_guards_last_credential_on_passkey_only_account() {
+        let state = test_state();
+        seed_session(&state, "acct-1", "tok-1").await;
+        insert_passkey_row(&state, "acct-1", b"cred-bytes-1").await;
+        let cred_b64 = URL_SAFE_NO_PAD.encode(b"cred-bytes-1".as_slice());
+        // Passkey-only accounts pass the password gate, then hit the
+        // self-lockout guard (no password to fall back on).
+        let err = delete_account_passkey(
+            State(state),
+            bearer("tok-1"),
+            Path(cred_b64),
+            Json(json!({"password": "irrelevant"})),
+        )
+        .await
+        .expect_err("self-lockout guard");
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert_eq!(err.1["code"], "last_credential");
+    }
+
+    #[tokio::test]
+    async fn change_account_password_rotates_and_revokes_other_sessions() {
+        let state = test_state();
+        seed_session(&state, "acct-1", "tok-current").await;
+        seed_session(&state, "acct-1", "tok-other").await;
+        insert_password_account(&state, "acct-1", "correct-horse-battery-staple").await;
+
+        // Wrong current password → 401.
+        let err = change_account_password(
+            State(state.clone()),
+            bearer("tok-current"),
+            Json(json!({"current_password": "wrong-password-1", "new_password": "new-valid-password-2"})),
+        )
+        .await
+        .expect_err("wrong current");
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(err.1["code"], "invalid_password");
+
+        // Correct → 200, hash rotated, other session revoked, this one alive.
+        let res = change_account_password(
+            State(state.clone()),
+            bearer("tok-current"),
+            Json(json!({"current_password": "correct-horse-battery-staple", "new_password": "new-valid-password-2"})),
+        )
+        .await
+        .expect("correct current");
+        assert_eq!(res.0["changed"], true);
+
+        let conn = state.conn.lock().await;
+        let (hash, salt): (Vec<u8>, Vec<u8>) = conn
+            .query_row(
+                "SELECT password_hash, password_salt FROM account_credentials WHERE account_id = 'acct-1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(crate::password_routes::verify_password("new-valid-password-2", &salt, &hash).unwrap());
+        let other: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE token_hash = ?1",
+                rusqlite::params![auth::hash_token("tok-other").to_vec()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(other, 0, "other session revoked");
+        let current: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE token_hash = ?1",
+                rusqlite::params![auth::hash_token("tok-current").to_vec()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(current, 1, "current session survives");
+        drop(conn);
+        assert_eq!(audit_count(&state, "acct-1", "password_change").await, 1);
+    }
+
+    #[tokio::test]
+    async fn change_account_password_rejects_passkey_only_accounts() {
+        let state = test_state();
+        seed_session(&state, "acct-1", "tok-1").await;
+        let err = change_account_password(
+            State(state),
+            bearer("tok-1"),
+            Json(json!({"current_password": "whatever-password", "new_password": "new-valid-password-2"})),
+        )
+        .await
+        .expect_err("no password on account");
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert_eq!(err.1["code"], "no_password");
+    }
+
+    // ── Wrap CRUD (Kimi revision: generations + per-account envelopes) ───
+
+    #[tokio::test]
+    async fn wrap_put_get_roundtrip_with_generations() {
+        let state = test_state();
+        seed_session(&state, "acct-1", "tok-1").await;
+        let wrapped_a = base64::engine::general_purpose::STANDARD.encode(b"wrapped-a-bytes-1");
+        let salt_pw = base64::engine::general_purpose::STANDARD.encode(b"salt-pw-1");
+        let wrapped_rec = base64::engine::general_purpose::STANDARD.encode(b"wrapped-a-rec-1");
+        let salt_rec = base64::engine::general_purpose::STANDARD.encode(b"salt-rec-1");
+
+        let res = put_password_wrap(
+            State(state.clone()),
+            bearer("tok-1"),
+            Json(json!({"wrapped_a": wrapped_a, "salt_pw": salt_pw})),
+        )
+        .await
+        .expect("first put");
+        assert_eq!(res.0["stored"], true);
+        assert_eq!(res.0["generation"], 1);
+        let res = put_password_wrap(
+            State(state.clone()),
+            bearer("tok-1"),
+            Json(json!({"wrapped_a": wrapped_a, "salt_pw": salt_pw})),
+        )
+        .await
+        .expect("second put bumps generation");
+        assert_eq!(res.0["generation"], 2);
+        let res = put_recovery_wrap(
+            State(state.clone()),
+            bearer("tok-1"),
+            Json(json!({"wrapped_a_rec": wrapped_rec, "salt_rec": salt_rec})),
+        )
+        .await
+        .expect("recovery put");
+        assert_eq!(res.0["generation"], 1);
+
+        let res = account_wraps(State(state.clone()), bearer("tok-1"))
+            .await
+            .expect("session");
+        let body = res.0;
+        assert_eq!(body["password_wrap"], true);
+        assert_eq!(body["password_wrap_generation"], 2);
+        assert_eq!(body["recovery_wrap"], true);
+        assert_eq!(body["recovery_wrap_generation"], 1);
+        assert_eq!(body["open_vaults"].as_array().unwrap().len(), 0);
+        assert_eq!(audit_count(&state, "acct-1", "password_wrap_put").await, 2);
+        assert_eq!(audit_count(&state, "acct-1", "recovery_wrap_put").await, 1);
+    }
+
+    #[tokio::test]
+    async fn put_password_wrap_caps_blob_sizes() {
+        let state = test_state();
+        seed_session(&state, "acct-1", "tok-1").await;
+        let big_salt = base64::engine::general_purpose::STANDARD.encode(vec![7u8; 65]);
+        let err = put_password_wrap(
+            State(state.clone()),
+            bearer("tok-1"),
+            Json(json!({"wrapped_a": "aGk=", "salt_pw": big_salt})),
+        )
+        .await
+        .expect_err("salt too big");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(err.1["code"], "too_large");
+        let big_wrap = base64::engine::general_purpose::STANDARD.encode(vec![7u8; 513]);
+        let err = put_password_wrap(
+            State(state.clone()),
+            bearer("tok-1"),
+            Json(json!({"wrapped_a": big_wrap, "salt_pw": "aGk="})),
+        )
+        .await
+        .expect_err("wrap too big");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(err.1["code"], "too_large");
+        let err = put_password_wrap(
+            State(state),
+            bearer("tok-1"),
+            Json(json!({"wrapped_a": "not base64!!", "salt_pw": "aGk="})),
+        )
+        .await
+        .expect_err("bad base64");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(err.1["code"], "bad_base64");
+    }
+
+    #[tokio::test]
+    async fn vault_wrap_open_lock_flow_flips_is_open() {
+        let state = test_state();
+        seed_session(&state, "acct-1", "tok-1").await;
+        seed_unscoped_key(&state, "acct-1", "k1").await;
+        seed_blob(&state, "vault-a", "m1", "2026-01-01T00:00:00Z").await;
+        let wrapped_k = base64::engine::general_purpose::STANDARD.encode(b"wrapped-k-bytes-1");
+
+        // Locked by default.
+        let res = account_vaults(State(state.clone()), bearer("tok-1"))
+            .await
+            .expect("session");
+        assert_eq!(res.0["vaults"][0]["is_open"], false);
+
+        // Open: PUT the envelope.
+        let res = put_vault_wrap(
+            State(state.clone()),
+            bearer("tok-1"),
+            Path("vault-a".into()),
+            Json(json!({"wrapped_k": wrapped_k})),
+        )
+        .await
+        .expect("unscoped key");
+        assert_eq!(res.0["open"], true);
+        assert_eq!(res.0["generation"], 1);
+
+        // is_open flips.
+        let res = account_vaults(State(state.clone()), bearer("tok-1"))
+            .await
+            .expect("session");
+        assert_eq!(res.0["vaults"][0]["is_open"], true);
+
+        // Lock: DELETE (account has no password → gate passes). Idempotent.
+        let res = delete_vault_wrap(
+            State(state.clone()),
+            bearer("tok-1"),
+            Path("vault-a".into()),
+            Json(json!({})),
+        )
+        .await
+        .expect("no password → gate passes");
+        assert_eq!(res.0["open"], false);
+        let res = delete_vault_wrap(
+            State(state.clone()),
+            bearer("tok-1"),
+            Path("vault-a".into()),
+            Json(json!({})),
+        )
+        .await
+        .expect("idempotent");
+        assert_eq!(res.0["open"], false);
+        let res = account_vaults(State(state.clone()), bearer("tok-1"))
+            .await
+            .expect("session");
+        assert_eq!(res.0["vaults"][0]["is_open"], false);
+        assert_eq!(audit_count(&state, "acct-1", "vault_wrap_put").await, 1);
+        assert_eq!(audit_count(&state, "acct-1", "vault_wrap_delete").await, 2);
+    }
+
+    #[tokio::test]
+    async fn vault_wrap_respects_scoped_keys() {
+        let state = test_state();
+        seed_session(&state, "acct-1", "tok-1").await;
+        {
+            let conn = state.conn.lock().await;
+            conn.execute(
+                "INSERT INTO api_keys (id, account_id, key_hash, key_prefix, rate, vault_id, created_at, revoked) \
+                 VALUES ('k1', 'acct-1', ?1, 'en_', 100, 'vault-a', 'now', 0)",
+                rusqlite::params![auth::hash_key("en_scoped").to_vec()],
+            )
+            .unwrap();
+        }
+        let wrapped_k = base64::engine::general_purpose::STANDARD.encode(b"wrapped-k-bytes-1");
+        let err = put_vault_wrap(
+            State(state.clone()),
+            bearer("tok-1"),
+            Path("vault-b".into()),
+            Json(json!({"wrapped_k": wrapped_k})),
+        )
+        .await
+        .expect_err("vault-b out of scope");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        let err = delete_vault_wrap(
+            State(state.clone()),
+            bearer("tok-1"),
+            Path("vault-b".into()),
+            Json(json!({})),
+        )
+        .await
+        .expect_err("vault-b out of scope");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        // Nothing was written for vault-b.
+        let conn = state.conn.lock().await;
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM vault_key_wraps WHERE vault_id = 'vault-b'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[tokio::test]
+    async fn delete_vault_wrap_requires_fresh_password_for_password_accounts() {
+        let state = test_state();
+        seed_session(&state, "acct-1", "tok-1").await;
+        seed_unscoped_key(&state, "acct-1", "k1").await;
+        insert_password_account(&state, "acct-1", "correct-horse-battery-staple").await;
+        let wrapped_k = base64::engine::general_purpose::STANDARD.encode(b"wrapped-k-bytes-1");
+        put_vault_wrap(
+            State(state.clone()),
+            bearer("tok-1"),
+            Path("vault-a".into()),
+            Json(json!({"wrapped_k": wrapped_k})),
+        )
+        .await
+        .expect("open");
+        assert_eq!(audit_count(&state, "acct-1", "vault_wrap_put").await, 1);
+
+        let err = delete_vault_wrap(
+            State(state.clone()),
+            bearer("tok-1"),
+            Path("vault-a".into()),
+            Json(json!({})),
+        )
+        .await
+        .expect_err("gate: password required");
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(err.1["code"], "password_required");
+        let err = delete_vault_wrap(
+            State(state.clone()),
+            bearer("tok-1"),
+            Path("vault-a".into()),
+            Json(json!({"password": "wrong-password-1"})),
+        )
+        .await
+        .expect_err("gate: wrong password");
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(err.1["code"], "invalid_password");
+        // Envelope still present after failed locks.
+        {
+            let conn = state.conn.lock().await;
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM vault_key_wraps WHERE vault_id = 'vault-a'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1);
+        }
+        let res = delete_vault_wrap(
+            State(state.clone()),
+            bearer("tok-1"),
+            Path("vault-a".into()),
+            Json(json!({"password": "correct-horse-battery-staple"})),
+        )
+        .await
+        .expect("fresh password");
+        assert_eq!(res.0["open"], false);
+        assert_eq!(audit_count(&state, "acct-1", "vault_wrap_delete").await, 1);
+    }
+
+    #[tokio::test]
+    async fn open_vaults_are_per_account_not_per_vault() {
+        let state = test_state();
+        seed_session(&state, "acct-1", "tok-1").await;
+        seed_session(&state, "acct-2", "tok-2").await;
+        seed_unscoped_key(&state, "acct-1", "k1").await;
+        seed_unscoped_key(&state, "acct-2", "k2").await;
+        seed_blob(&state, "vault-shared", "m1", "2026-01-01T00:00:00Z").await;
+
+        let wrapped_k = base64::engine::general_purpose::STANDARD.encode(b"wrapped-k-bytes-1");
+        put_vault_wrap(
+            State(state.clone()),
+            bearer("tok-1"),
+            Path("vault-shared".into()),
+            Json(json!({"wrapped_k": wrapped_k})),
+        )
+        .await
+        .expect("acct-1 opens shared vault");
+
+        // Envelopes are per-account: acct-2's wrap row does not exist even
+        // though the vault is shared (this was the shared-vault clobber bug).
+        let res = account_wraps(State(state.clone()), bearer("tok-1"))
+            .await
+            .expect("session");
+        assert_eq!(res.0["open_vaults"], json!(["vault-shared"]));
+        let res = account_wraps(State(state.clone()), bearer("tok-2"))
+            .await
+            .expect("session");
+        assert_eq!(res.0["open_vaults"].as_array().unwrap().len(), 0);
+
+        // is_open is per-account too.
+        let res = account_vaults(State(state.clone()), bearer("tok-1"))
+            .await
+            .expect("session");
+        assert_eq!(res.0["vaults"][0]["is_open"], true);
+        let res = account_vaults(State(state.clone()), bearer("tok-2"))
+            .await
+            .expect("session");
+        assert_eq!(res.0["vaults"][0]["is_open"], false);
+    }
+
+    #[tokio::test]
+    async fn register_start_requires_fresh_password_to_attach() {
+        let state = test_state();
+        seed_session(&state, "acct-1", "tok-1").await;
+        insert_password_account(&state, "acct-1", "correct-horse-battery-staple").await;
+        // With a session, this ceremony ATTACHES a passkey — a credential
+        // mutation, so the password gate runs before any WebAuthn work.
+        let err = register_start(
+            State(state.clone()),
+            bearer("tok-1"),
+            Json(json!({"origin": "http://localhost:8787"})),
+        )
+        .await
+        .expect_err("attach needs password");
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(err.1["code"], "password_required");
+        // With the password the ceremony proceeds (challenge issued).
+        let res = register_start(
+            State(state),
+            bearer("tok-1"),
+            Json(json!({"origin": "http://localhost:8787", "password": "correct-horse-battery-staple"})),
+        )
+        .await
+        .expect("password verified, challenge issued");
+        assert!(res.0["challenge_id"].as_str().unwrap().len() > 0);
     }
 }
