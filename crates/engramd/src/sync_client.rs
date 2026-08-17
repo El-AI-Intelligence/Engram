@@ -72,6 +72,16 @@ impl SyncClient {
         }
     }
 
+    /// Byte-exact copies of the derived keys, for the one-time browser key
+    /// handoff (account migration). Never log these.
+    pub fn encryption_key(&self) -> [u8; 32] {
+        self.encryption_key
+    }
+
+    pub fn hmac_key(&self) -> [u8; 32] {
+        self.hmac_key
+    }
+
     // ── Public API ────────────────────────────────────────────────────────
 
     /// Encrypt a plaintext memory entry into a `SyncBlob` ready for push.

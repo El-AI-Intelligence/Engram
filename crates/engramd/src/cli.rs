@@ -4,7 +4,7 @@
 //! instead of starting the daemon. Each handler opens the vault, performs its
 //! operation, prints results, and exits.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use axiom_engram::{EngramStore, EngramLayer, EngramSource, Engram};
 use clap::Subcommand;
 use std::io::Write;
@@ -117,6 +117,12 @@ pub enum Commands {
         /// Path to vault (overrides config)
         #[arg(long)]
         vault: Option<PathBuf>,
+    },
+    /// Print the vault passphrase from the env file (a secret — save it, never share it)
+    ShowPassphrase {
+        /// Path to the env file (defaults to ~/.engram/env)
+        #[arg(long)]
+        env_file: Option<PathBuf>,
     },
     /// Seed 30 sample memories and simulate a month of decay — the "wow" demo
     Demo {
@@ -1573,4 +1579,26 @@ fn demo_data() -> Vec<(&'static str, &'static str, &'static str, Vec<&'static st
         ("kernel panic on startup if machine-id is empty string — needs fallback to random key", "episodic", "system", vec!["bug", "kernel"]),
         ("Seasonal affective pattern detected: creativity scores dip 18% in winter months", "semantic", "consolidation", vec!["pattern", "analytics"]),
     ]
+}
+
+// ── Show passphrase (migration helper) ──────────────────────────────────────
+
+/// Print the vault passphrase read from an env file. The daemon needs
+/// ENGRAM_PASSPHRASE on every restart; this file is its only home, so the
+/// migration flow ("link this server's vault") reads it back from here.
+pub fn handle_show_passphrase(env_file: Option<PathBuf>) -> Result<()> {
+    let path = env_file.unwrap_or_else(|| config_dir().join("env"));
+    let content = std::fs::read_to_string(&path)
+        .with_context(|| format!("reading env file {}", path.display()))?;
+    let passphrase = content
+        .lines()
+        .find_map(|line| line.strip_prefix("ENGRAM_PASSPHRASE="))
+        .map(str::trim)
+        .map(|v| v.trim_matches('"').trim_matches('\''))
+        .filter(|v| !v.is_empty())
+        .with_context(|| format!("no ENGRAM_PASSPHRASE= line in {}", path.display()))?;
+    println!("Vault passphrase from {}:", path.display());
+    println!("{passphrase}");
+    eprintln!("Treat this as a secret: save it, never share it, never commit it.");
+    Ok(())
 }

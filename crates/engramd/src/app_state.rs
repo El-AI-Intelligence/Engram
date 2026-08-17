@@ -1,6 +1,7 @@
 // Shared application state types used by both the binary (main.rs) and
 // integration tests (via lib.rs).
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{broadcast, watch, Mutex};
@@ -30,6 +31,25 @@ pub enum LiveEvent {
         pruned: usize,
         timestamp: String,
     },
+}
+
+/// E2E sync key material for the box vault — the enc + hmac keys the sync
+/// loop uses, byte-exact copies from `SyncClient`. Held so the one-time
+/// key-handoff route can give the browser the vault keys exactly once
+/// during account migration (the SPA wraps them under account key A).
+#[derive(Clone)]
+pub struct SyncKeyMaterial {
+    pub enc_key: [u8; 32],
+    pub hmac_key: [u8; 32],
+}
+
+/// One-time key-handoff token store: single-use, 300s TTL, swept on access.
+/// The mint/redeem logic lives in routes::key_handoff (field is pub(crate)
+/// so that impl can reach it). The route itself is gated by the box
+/// basic-auth in Caddy — the same wall the /config routes sit behind.
+#[derive(Clone, Default)]
+pub struct KeyHandoff {
+    pub(crate) tokens: Arc<Mutex<HashMap<String, u64>>>,
 }
 
 /// Alias for the QEM-wrapped vault.
@@ -67,4 +87,8 @@ pub struct AppState {
     /// of config.json). `None` disables write-time inference; loaded once at
     /// startup — a PATCH to /config requires a restart.
     pub link_inference: Option<LinkInferenceConfig>,
+    /// Sync keys for the one-time browser key handoff (None = sync disabled).
+    pub sync_keys: Option<Arc<SyncKeyMaterial>>,
+    /// One-time key-handoff tokens (single-use, 300s TTL).
+    pub key_handoff: KeyHandoff,
 }

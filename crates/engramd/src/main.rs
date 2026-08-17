@@ -12,7 +12,7 @@ mod errors;
 mod routes;
 mod sync_client;
 
-use app_state::{AppState, LiveEvent};
+use app_state::{AppState, KeyHandoff, LiveEvent, SyncKeyMaterial};
 
 use axum::extract::DefaultBodyLimit;
 use clap::Parser;
@@ -129,6 +129,9 @@ async fn dispatch_cli(cmd: cli::Commands) -> anyhow::Result<()> {
         }
         cli::Commands::Onboarding { bind } => {
             cli::handle_onboarding(bind).await
+        }
+        cli::Commands::ShowPassphrase { env_file } => {
+            cli::handle_show_passphrase(env_file)
         }
     }
 }
@@ -446,7 +449,7 @@ async fn run_daemon(
     let (sync_trigger_tx, sync_trigger_rx) = tokio::sync::watch::channel(0u64);
     let sync_trigger_tx = Arc::new(sync_trigger_tx);
 
-    let state = AppState {
+    let mut state = AppState {
         vault: vault.clone(),
         qem,
         vault_path: vault_path.clone(),
@@ -458,6 +461,8 @@ async fn run_daemon(
         noise_ignored_sources: load_noise_ignored_sources(&vault_path),
         link_inference: load_link_inference(&vault_path),
         sync_trigger: sync_trigger_tx.clone(),
+        sync_keys: None,
+        key_handoff: KeyHandoff::default(),
     };
 
     // ── Background scheduler ──────────────────────────────────────────────
@@ -532,6 +537,12 @@ async fn run_daemon(
                         api_key,
                         initial_clock,
                     ));
+                    // Hold the SAME key bytes the sync loop uses, for the
+                    // one-time browser key handoff (account migration).
+                    state.sync_keys = Some(Arc::new(SyncKeyMaterial {
+                        enc_key: sync_client.encryption_key(),
+                        hmac_key: sync_client.hmac_key(),
+                    }));
                     info!(
                         server_url = %server_url,
                         interval_secs,
@@ -585,6 +596,7 @@ async fn run_daemon(
         .merge(routes::sync_status::router())
         .merge(routes::teams::router())
         .merge(routes::digest::router())
+        .merge(routes::key_handoff::router())
         .with_state(state)
         // CORS must be outermost so OPTIONS preflight is handled before auth
         .layer(axum::middleware::from_fn_with_state(
