@@ -273,14 +273,23 @@ let globalChipMounted = false;
 function mountAccountChip(anchor, server) {
   const btn = document.createElement('button');
   btn.className = 'acct-chip';
-  btn.textContent = '\u{1F464} Account';
-  btn.title = 'Account';
   const menu = document.createElement('div');
   menu.className = 'acct-menu';
   menu.style.display = 'none';
   anchor.appendChild(btn);
   anchor.appendChild(menu);
-  const renderMenu = (email) => {
+  const renderSignedOut = () => {
+    btn.textContent = '\u{1F464} Sign in';
+    btn.title = 'Sign in to your Engram account';
+    menu.innerHTML = `<button class="acct-menu-item" id="acct-chip-signin">Sign in</button>`;
+    menu.querySelector('#acct-chip-signin').onclick = () => {
+      menu.style.display = 'none';
+      navigate('#/login');
+    };
+  };
+  const renderSignedIn = (email) => {
+    btn.textContent = '\u{1F464} ' + (email || 'Account');
+    btn.title = 'Account';
     menu.innerHTML = `
       <div class="acct-menu-head">Signed in as<br><span class="mono">${esc(email || 'account')}</span></div>
       <button class="acct-menu-item" id="acct-chip-settings">⚙ Account settings</button>
@@ -294,20 +303,22 @@ function mountAccountChip(anchor, server) {
       api.account.setToken(null);
       unlock.signOut();
       toast('Signed out', 'ok');
+      renderSignedOut();
       navigate('#/login');
     };
   };
-  renderMenu(null);
+  renderSignedOut();
   btn.onclick = (e) => {
     e.stopPropagation();
     const open = menu.style.display !== 'block';
     menu.style.display = open ? 'block' : 'none';
     if (open) {
+      // Signed-in state is resolved on open — no flicker if the session
+      // was created or destroyed in another tab since the last render.
+      if (!api.account.token()) { renderSignedOut(); return; }
       api.account.credentials(server).then(c => {
-        const email = c && c.email ? c.email : null;
-        btn.textContent = email ? '\u{1F464} ' + email : '\u{1F464} Account';
-        renderMenu(email);
-      }).catch(() => {});
+        renderSignedIn(c && c.email ? c.email : null);
+      }).catch(() => { renderSignedIn(null); });
     }
   };
   document.addEventListener('click', (e) => {
@@ -318,12 +329,9 @@ function mountAccountChip(anchor, server) {
 function syncGlobalChip() {
   const anchor = document.getElementById('global-acct-anchor');
   if (!anchor) return;
-  if (api.account.token()) {
-    if (!globalChipMounted) { mountAccountChip(anchor, ACCT_SERVER); globalChipMounted = true; }
-  } else if (globalChipMounted) {
-    anchor.innerHTML = '';
-    globalChipMounted = false;
-  }
+  // Always mounted: signed-out shows "Sign in", signed-in shows the
+  // account menu. Never an empty gap in the topbar.
+  if (!globalChipMounted) { mountAccountChip(anchor, ACCT_SERVER); globalChipMounted = true; }
 }
 
 function onApi401(r) {
