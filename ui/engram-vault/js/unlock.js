@@ -73,6 +73,7 @@ export function setAccountKey(accountId, keyBytes) {
   if (!accountId) throw new Error('Account id required.');
   if (!keyBytes || keyBytes.length !== 32) throw new Error('Account key must be 32 bytes.');
   accountKeys.set(accountId, new Uint8Array(keyBytes));
+  ensureAcctKeyChannel();
 }
 
 export function getAccountKey(accountId) {
@@ -83,6 +84,59 @@ export function getAccountKey(accountId) {
 export function clearAccountKey(accountId) {
   if (accountId) accountKeys.delete(accountId);
   else accountKeys = new Map();
+}
+
+// ── Cross-tab A sharing (in-memory only) ────────────────────────────────────
+// A handoff link opened in a NEW tab has no in-memory A, but a signed-in tab
+// of this origin holds it. BroadcastChannel moves A tab→tab without ever
+// persisting it — A is still never at rest, and closing every tab destroys
+// it. The password prompt is the last resort when no tab answers.
+
+let acctKeyChannel = null;
+
+function ensureAcctKeyChannel() {
+  if (acctKeyChannel) return;
+  try {
+    acctKeyChannel = new BroadcastChannel('engram-account-key');
+  } catch {
+    return;  // environment without BroadcastChannel: prompt fallback still works
+  }
+  acctKeyChannel.onmessage = (ev) => {
+    const d = ev.data || {};
+    if (d.type !== 'request') return;
+    const A = getAccountKey(d.accountId);
+    if (A) acctKeyChannel.postMessage({ type: 'reply', accountId: d.accountId, key: A });
+  };
+}
+
+// Ask other tabs of this origin for the account key; resolves null when none
+// answers within timeoutMs (then the caller prompts for the password).
+export function requestAccountKey(accountId, timeoutMs = 1500) {
+  return new Promise((resolve) => {
+    let ch;
+    try {
+      ch = new BroadcastChannel('engram-account-key');
+    } catch {
+      resolve(null);
+      return;
+    }
+    let settled = false;
+    const done = (val) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      ch.close();
+      resolve(val);
+    };
+    const timer = setTimeout(() => done(null), timeoutMs);
+    ch.onmessage = (ev) => {
+      const d = ev.data || {};
+      if (d.type === 'reply' && d.accountId === accountId && d.key) {
+        done(new Uint8Array(d.key));
+      }
+    };
+    ch.postMessage({ type: 'request', accountId });
+  });
 }
 
 // ── Relay fetch (session token) ────────────────────────────────────────────

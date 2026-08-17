@@ -107,6 +107,63 @@ security](https://github.com/privacyguides/privacyguides.org/blob/main/blog/post
    the CLI defaults to `PRAGMA foreign_keys=OFF`, so manual `DELETE FROM
    accounts` doesn't cascade. Always `PRAGMA foreign_keys=ON;` first.
 
+7. **Links printed with the bare host land on the marketing page.** The
+   SPA lives at `/app`; the landing page ignores `#/handoff/...`
+   fragments. Every handoff link "worked" (page loads fine, no error) and
+   the daemon logged zero redeems — the failure was completely silent.
+   **Rule: any CLI/SMS/email link that targets a hash route must include
+   the real SPA path.** The `engram handoff` `--site` default is
+   `https://engram.ellmstack.dev/app` for exactly this reason.
+
+8. **Account key A is per-tab JS memory — a link opened in a NEW tab has
+   no A.** The handoff route prompted for the account password on every
+   new-tab open, then a bad link failed AFTER the typing. Fixed three
+   ways: (a) redeem the one-time token BEFORE any password can be asked,
+   so a dead link fails with nothing typed; (b) same-origin
+   `BroadcastChannel` (`engram-account-key`) shares A tab→tab — still
+   memory-only, never at rest, dies when the last tab closes; (c) the
+   password prompt is now the last resort with copy naming the *account*
+   password explicitly.
+
+9. **Chrome 142+ Local Network Access (PNA).** A public site fetching a
+   loopback daemon fails with a bare network error (nothing in logs,
+   nothing in the network panel's response) unless BOTH hold: the daemon's
+   preflight answers `Access-Control-Allow-Private-Network: true` for the
+   allowed origin (never `*`), and the fetch sets
+   `targetAddressSpace: 'loopback'`. No header → Chrome just says
+   "blocked". **Rule: public-site→loopback features need the header pair,
+   and a PNA failure looks identical to a dead daemon — log the server
+   side of the request before blaming the network.**
+
+## Vault key handoff (`engram handoff`)
+
+The box daemon derives the sync keys from `ENGRAM_PASSPHRASE` at startup;
+they exist only in its memory. `engram handoff` mints a single-use 15-min
+token against the local daemon and prints a link the user opens in the
+signed-in browser:
+
+```
+engram handoff
+  → POST daemon /sync/key-handoff/start → token (in-memory map, 900s TTL)
+  → link: https://engram.ellmstack.dev/app/#/handoff/{token}?daemon=127.0.0.1:8799
+  → SPA: account.get (signed-out → stash token, login, resume)
+    → POST /sync/key-handoff/{token} (redeem FIRST — dead link fails fast)
+    → A from memory → BroadcastChannel → password prompt (last resort)
+    → wrap composite K (enc‖hmac‖vault_id) under A → PUT /account/vaults/{id}/wrap
+  → vault is open-by-default; the vault passphrase was never typed or shown
+```
+
+- The token IS the credential; it redeems exactly once and expired tokens
+  are swept on access. Tokens live in daemon memory — a daemon restart
+  invalidates every outstanding link.
+- Trust boundary: Caddy gates `/sync*` behind the box basic-auth, the same
+  wall as the config routes. The keys never touch the relay.
+- PNA pair (see pitfall 9) lives in the daemon's `pna_opt_in` middleware
+  (`crates/engramd/src/main.rs`) and the SPA fetch
+  (`targetAddressSpace`).
+- The `?daemon=` param points at the user's loopback (or tunnel-forwarded)
+  daemon — the CLI prints `127.0.0.1:8799` by default.
+
 ## Verification checklist for future auth work
 
 - [ ] Preflight OPTIONS for EVERY method the SPA uses, with the real
@@ -122,9 +179,14 @@ security](https://github.com/privacyguides/privacyguides.org/blob/main/blog/post
 - Relay: `crates/engramd-sync/src/password_routes.rs` (signup/signin/reset),
   `account_routes.rs` (sessions, credentials, passkeys, wrap CRUD,
   `/account/vaults` `is_open`), CORS in `main.rs` (~line 580)
+- Daemon: `crates/engramd/src/routes/key_handoff.rs` (mint/redeem),
+  `crates/engramd/src/cli.rs` (`engram handoff`, `--site` default),
+  PNA middleware in `crates/engramd/src/main.rs`
 - SPA: `ui/engram-vault/js/main.js` — `route('/login')` (~line 763) owns
-  the signin/signup/forgot/phrase/recovery views; `api.account.*` (~line
-  153); global chip + `onApi401` (~line 300); `ui/engram-vault/js/unlock.js`
-  — Argon2id, AES-GCM wrap/unwrap, account key A state
+  the signin/signup/forgot/phrase/recovery views; `route('/handoff/:token')`
+  (~line 1384) the handoff flow; `api.account.*` (~line 153); global chip
+  + `onApi401` (~line 300); `ui/engram-vault/js/unlock.js` — Argon2id,
+  AES-GCM wrap/unwrap, account key A state, `requestAccountKey`
+  BroadcastChannel
 - Deploy: `deploy/sync-relay.md` (relay runbook + deploy log),
   `deploy/caddy/sync.Caddyfile` (no CORS there — headers come from the app)

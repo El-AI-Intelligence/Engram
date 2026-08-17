@@ -397,7 +397,18 @@ async function render() {
   // from the relay, decrypted in the browser, so box creds are irrelevant.
   // /reset/{token} is also gate-exempt: the reset email links to it and the
   // recipient may not be signed in anywhere.
-  if (!hasAuth() && hash !== '/login' && hash !== '/unlock' && !hash.startsWith('/reset/') && !hash.startsWith('/handoff/')) { navigate('#/login'); return; }
+  // The box-console nav only makes sense with box creds; account users
+  // clicking it bounce off this gate into the unlock picker — a popup
+  // loop. Sync nav visibility with the creds state on every render.
+  const mainNav = document.getElementById('main-nav');
+  if (mainNav) mainNav.style.display = hasAuth() ? '' : 'none';
+  if (!hasAuth() && hash !== '/login' && hash !== '/unlock' && hash !== '/settings' && !hash.startsWith('/reset/') && !hash.startsWith('/handoff/')) {
+    // Account users land back on the vault view; strangers on the login
+    // screen. (No login round-trip: login auto-forwards signed-in accounts
+    // to #/unlock anyway, and each hop could trigger a lock.)
+    navigate(api.account.token() ? '#/unlock' : '#/login');
+    return;
+  }
 
   // Highlight nav
   document.querySelectorAll('.nav a').forEach(a => {
@@ -1387,6 +1398,11 @@ route('/login', () => {
 // account key A — the vault becomes open-by-default with zero passphrase
 // typing. The daemon runs on loopback; the token in the link is the secret.
 route('/handoff/:token', (token) => {
+  // The router's `:token` capture runs to the end of the hash, so a
+  // `?daemon=...` suffix lands INSIDE the token string; the daemon then
+  // sees a mangled token and reports it as expired/unknown. Strip the
+  // query part — daemon defaults to 127.0.0.1:8799 anyway.
+  token = token.split('?')[0];
   const app = document.getElementById('app');
   const ACCT = 'https://sync.ellmstack.dev';
   const daemon = (window.location.hash.match(/[?&]daemon=([^&]+)/) || [])[1] || '127.0.0.1:8799';
@@ -1420,21 +1436,6 @@ route('/handoff/:token', (token) => {
     try {
       const acct = await api.account.get(ACCT);
       const accountId = acct.account_id;
-      let A = unlock.getAccountKey(accountId);
-      if (!A) {
-        const password = window.prompt('Enter your account password to link the vault keys:');
-        if (!password) return fail('Account password required to wrap the vault keys.');
-        const wraps = await api.account.wraps(ACCT);
-        if (!wraps.password_wrap) return fail('Your account has no key wraps yet — sign in with your password first.');
-        const blob = await api.account.getPasswordWrap(ACCT);
-        const wk = await unlock.deriveWithSalt(password, unlock.b64decode(blob.salt_pw));
-        try {
-          A = await unlock.unwrapKey(wk, unlock.b64decode(blob.wrapped_a));
-          unlock.setAccountKey(accountId, A);
-        } catch {
-          return fail('That password does not open your account key.');
-        } finally { wk.fill(0); }
-      }
       // Chrome 142+ Local Network Access: a public site fetching a loopback
       // daemon needs targetAddressSpace:'loopback' AND the daemon's preflight
       // must carry Access-Control-Allow-Private-Network:true, or the fetch
@@ -1452,6 +1453,28 @@ route('/handoff/:token', (token) => {
       if (!r.ok) {
         if (r.status === 401) return fail('That handoff link has expired or was already used — run `engram handoff` again.');
         return fail(`This machine's daemon refused the handoff (${r.status}).`);
+      }
+      // The redeem above validates the link BEFORE any password can be
+      // asked: a dead link fails fast with nothing typed. Account key A
+      // comes from memory first, else a signed-in tab of this origin shares
+      // it over BroadcastChannel (still memory-only, never at rest), and
+      // only then does the password prompt derive it.
+      let A = unlock.getAccountKey(accountId);
+      if (!A) A = await unlock.requestAccountKey(accountId);
+      if (A) unlock.setAccountKey(accountId, A);
+      if (!A) {
+        const password = window.prompt('Enter your Engram account password to link the vault keys (it never leaves this tab):');
+        if (!password) return fail('Account password required — run `engram handoff` again when ready.');
+        const wraps = await api.account.wraps(ACCT);
+        if (!wraps.password_wrap) return fail('Your account has no password wrap — sign in with your password first, then re-run `engram handoff`.');
+        const blob = await api.account.getPasswordWrap(ACCT);
+        const wk = await unlock.deriveWithSalt(password, unlock.b64decode(blob.salt_pw));
+        try {
+          A = await unlock.unwrapKey(wk, unlock.b64decode(blob.wrapped_a));
+          unlock.setAccountKey(accountId, A);
+        } catch {
+          return fail('That password does not open your account key — run `engram handoff` again.');
+        } finally { wk.fill(0); }
       }
       const h = await r.json();
       const enc = unlock.b64decode(h.enc_key_b64);

@@ -29,7 +29,10 @@
       <a class="icon-btn" href="#/settings" title="Settings" aria-label="Settings">⚙</a>
     </div>
   </div>
-  <nav class="nav" id="main-nav">
+  <!-- Hidden unless box creds exist: account users on the public site have
+       no local engramd, and every click here bounces off the auth gate into
+       the unlock picker. main.js's render() syncs visibility with hasAuth(). -->
+  <nav class="nav" id="main-nav" style="display:none">
     <a href="#/" data-route="#/">Dashboard</a>
     <a href="#/stats" data-route="#/stats">Stats</a>
     <a href="#/tracker" data-route="#/tracker">Tracker</a>

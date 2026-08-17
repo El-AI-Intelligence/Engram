@@ -134,8 +134,8 @@ pub enum Commands {
         /// Daemon address to mint the handoff from (defaults to 127.0.0.1:8799)
         #[arg(long, default_value = "127.0.0.1:8799")]
         bind: String,
-        /// Site URL the link opens (defaults to https://engram.ellmstack.dev)
-        #[arg(long, default_value = "https://engram.ellmstack.dev")]
+        /// Site URL the link opens (defaults to https://engram.ellmstack.dev/app — the SPA root; the bare host serves the landing page, which ignores the #/handoff fragment)
+        #[arg(long, default_value = "https://engram.ellmstack.dev/app")]
         site: String,
     },
     /// Seed 30 sample memories and simulate a month of decay — the "wow" demo
