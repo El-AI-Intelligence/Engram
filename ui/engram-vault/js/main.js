@@ -1535,15 +1535,75 @@ route('/unlock', async () => {
     }
   }
 
+  // Top-right account menu for the vault pages: signed-in email, a link to
+  // the full Account & Sync settings, and a reliable Sign out. Mounted per
+  // view; the credentials call refreshes the label each time it opens.
+  function mountAccountChip(anchor) {
+    const btn = document.createElement('button');
+    btn.className = 'acct-chip';
+    btn.textContent = '\u{1F464} Account';
+    btn.title = 'Account';
+    const menu = document.createElement('div');
+    menu.className = 'acct-menu';
+    menu.style.display = 'none';
+    anchor.appendChild(btn);
+    anchor.appendChild(menu);
+    const renderMenu = (email) => {
+      menu.innerHTML = `
+        <div class="acct-menu-head">Signed in as<br><span class="mono">${esc(email || 'account')}</span></div>
+        <button class="acct-menu-item" id="acct-chip-settings">⚙ Account settings</button>
+        <button class="acct-menu-item acct-menu-danger" id="acct-chip-signout">Sign out</button>`;
+      menu.querySelector('#acct-chip-settings').onclick = () => {
+        menu.style.display = 'none';
+        navigate('#/settings');
+      };
+      menu.querySelector('#acct-chip-signout').onclick = async () => {
+        try { await api.account.logout(relay); } catch {}
+        api.account.setToken(null);
+        unlock.signOut();
+        toast('Signed out', 'ok');
+        navigate('#/login');
+      };
+    };
+    renderMenu(null);
+    btn.onclick = (e) => {
+      e.stopPropagation();
+      const open = menu.style.display !== 'block';
+      menu.style.display = open ? 'block' : 'none';
+      if (open) {
+        api.account.credentials(relay).then(c => {
+          const email = c && c.email ? c.email : null;
+          btn.textContent = email ? '\u{1F464} ' + email : '\u{1F464} Account';
+          renderMenu(email);
+        }).catch(() => {});
+      }
+    };
+    document.addEventListener('click', (e) => {
+      if (!anchor.contains(e.target)) menu.style.display = 'none';
+    });
+  }
+
   function picker() {
     app.innerHTML = '<div class="loading">Loading vaults…</div>';
     unlock.listVaults(relay).then(vaults => {
       if (!vaults.length) {
-        app.innerHTML = '<div class="error-panel"><p>No synced vaults for this account yet. Pair a device to start syncing.</p></div>';
+        app.innerHTML = `
+          <div class="page">
+            <div class="unlock-topbar">
+              <span class="faint">Engram vault</span>
+              <span class="ml-auto" id="unlock-acct-anchor"></span>
+            </div>
+            <div class="error-panel"><p>No synced vaults for this account yet. Pair a device to start syncing.</p></div>
+          </div>`;
+        mountAccountChip(document.getElementById('unlock-acct-anchor'));
         return;
       }
       app.innerHTML = `
         <div class="page">
+          <div class="unlock-topbar">
+            <span class="faint">Engram vault</span>
+            <span class="ml-auto" id="unlock-acct-anchor"></span>
+          </div>
           <div class="panel" style="max-width:40rem;margin:2rem auto;">
             <div class="panel-header">Unlock a synced vault</div>
             <div class="unlock-vaults">
@@ -1572,6 +1632,7 @@ route('/unlock', async () => {
             </div>
           </div>
         </div>`;
+      mountAccountChip(document.getElementById('unlock-acct-anchor'));
       app.querySelectorAll('[data-unlock-vault]').forEach(btn => {
         const v = vaults.find(x => x.vault_id === btn.getAttribute('data-unlock-vault'));
         btn.onclick = () => v.is_open
@@ -1727,7 +1788,7 @@ route('/unlock', async () => {
               <option value="60"${policy === '60' ? ' selected' : ''}>Lock after 60 min</option>
             </select>
             <button class="btn btn-sm" id="unlock-lock">Lock</button>
-            <button class="btn btn-sm" id="unlock-list-signout">Sign out</button>
+            <span id="unlock-list-acct-anchor"></span>
           </span>
         </div>
         ${skipped > 0 ? `
@@ -1762,13 +1823,7 @@ route('/unlock', async () => {
       unlock.lock();
       picker();
     };
-    document.getElementById('unlock-list-signout').onclick = async () => {
-      try { await api.account.logout(relay); } catch {}
-      api.account.setToken(null);
-      unlock.signOut();
-      toast('Signed out', 'ok');
-      navigate('#/login');
-    };
+    mountAccountChip(document.getElementById('unlock-list-acct-anchor'));
     updateStatus();
 
     // Per-vault lock policy (client-side only; stored per vault_id).

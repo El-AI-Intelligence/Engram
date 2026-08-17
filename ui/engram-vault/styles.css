@@ -2404,3 +2404,28 @@ body.mobile #capture-btn { display: none !important; }
 }
 .forget-link:hover { color: var(--danger, #e05d5d); }
 .forget-link:disabled { opacity: 0.5; cursor: default; }
+
+/* ── Account chip (vault pages, top right) ─────────────────────────────── */
+.unlock-topbar { display:flex; align-items:center; gap:1rem; margin:1rem auto 0; max-width:40rem; padding:0 0.25rem; }
+#unlock-acct-anchor, #unlock-list-acct-anchor { position:relative; display:inline-flex; }
+.acct-chip {
+  background:var(--bg-raised); border:1px solid var(--semantic); color:var(--text);
+  border-radius:0.4rem; padding:0.3rem 0.65rem; cursor:pointer; font-size:0.85rem;
+  max-width:15rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+}
+.acct-menu {
+  position:absolute; top:calc(100% + 0.3rem); right:0; min-width:15rem; z-index:50;
+  background:var(--bg-raised); border:1px solid var(--semantic); border-radius:0.5rem;
+  box-shadow:0 0.5rem 1.5rem rgba(0,0,0,0.35); padding:0.35rem;
+}
+.acct-menu-head {
+  padding:0.5rem 0.65rem; font-size:0.8rem; color:var(--text-faint, #8a93a6);
+  border-bottom:1px solid var(--semantic); margin-bottom:0.3rem; word-break:break-all;
+}
+.acct-menu-item {
+  display:block; width:100%; text-align:left; background:none; border:0; color:var(--text);
+  padding:0.45rem 0.65rem; border-radius:0.35rem; cursor:pointer; font-size:0.9rem;
+}
+.acct-menu-item:hover { background:var(--semantic); }
+.acct-menu-danger { color:var(--decaying); }
+.acct-menu-danger:hover { background:rgba(225,112,85,0.12); }
