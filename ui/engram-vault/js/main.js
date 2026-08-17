@@ -336,6 +336,10 @@ function syncGlobalChip() {
 
 function onApi401(r) {
   clearCreds();
+  // A 401 can also mean the ACCOUNT session died server-side (e.g. revoked
+  // remotely). Drop the stored token too — otherwise the login screen keeps
+  // auto-forwarding on the dead token and bounces the user in a loop.
+  api.account.setToken(null);
   const hash = (window.location.hash || '#/').replace(/^#/, '');
   if (hash !== '/login' && hash !== '/unlock' && !hash.startsWith('/reset/')) navigate('#/login');
 }
