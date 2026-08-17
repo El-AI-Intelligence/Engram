@@ -223,14 +223,6 @@ const api = {
 // auth cache, mitigated by the strict CSP (script-src 'self').
 
 const VAULT_CREDS_KEY = 'engram-vault-creds';
-// Set when the login screen's headerless /health probe returns 200: the
-// browser still holds popup-era cached credentials (Safari-class) that we
-// cannot read, so we trust the browser to keep attaching them and skip the
-// form. Cleared together with the form credentials on sign-out / 401.
-const VAULT_PROBE_KEY = 'engram-vault-probe';
-// Set on sign-out: the login screen's auto-enter probe must NOT re-admit
-// this tab after an in-tab sign-out. Tab-lifetime like the creds above.
-const VAULT_NO_PROBE_KEY = 'engram-no-probe';
 // Set only by account registration (never login): the login screen shows
 // the Add-device wizard exactly once, right after sign-up — a passkey
 // LOGIN lands back on the vault sign-in form, not on the wizard.
@@ -246,13 +238,11 @@ function setCreds(b64) {
 
 function clearCreds() {
   sessionStorage.removeItem(VAULT_CREDS_KEY);
-  sessionStorage.removeItem(VAULT_PROBE_KEY);
-  sessionStorage.setItem(VAULT_NO_PROBE_KEY, '1');
   sessionStorage.removeItem(VAULT_JUST_REGISTERED_KEY);
 }
 
 function hasAuth() {
-  return getCreds() || sessionStorage.getItem(VAULT_PROBE_KEY) === '1';
+  return !!getCreds();
 }
 
 function authHeaders() {
@@ -266,9 +256,9 @@ function authHeaders() {
 const ACCT_SERVER = 'https://sync.ellmstack.dev';  // account API origin (same relay the login/unlock routes use)
 
 // Global account menu (shell topbar, every route): signed-in email, a link
-// to the Account & Sync settings, and a reliable Sign out. Mounted by
-// render() whenever an account session exists — visible on the console too,
-// not only on the login/unlock screens.
+// to the Account & Sync settings, and a reliable Sign out. Always mounted —
+// signed-out shows "Sign in" — visible on the console too, not only on the
+// login/unlock screens.
 let globalChipMounted = false;
 function mountAccountChip(anchor, server) {
   const btn = document.createElement('button');
@@ -308,6 +298,16 @@ function mountAccountChip(anchor, server) {
     };
   };
   renderSignedOut();
+  // Truth-check any stored token on mount: a session revoked elsewhere (or
+  // expired server-side) must read as signed out immediately, not after the
+  // first click.
+  if (api.account.token()) {
+    api.account.credentials(server).then(c => {
+      renderSignedIn(c && c.email ? c.email : null);
+    }).catch((e) => {
+      if (e && e.status === 401) { api.account.setToken(null); renderSignedOut(); }
+    });
+  }
   btn.onclick = (e) => {
     e.stopPropagation();
     const open = menu.style.display !== 'block';
@@ -318,7 +318,12 @@ function mountAccountChip(anchor, server) {
       if (!api.account.token()) { renderSignedOut(); return; }
       api.account.credentials(server).then(c => {
         renderSignedIn(c && c.email ? c.email : null);
-      }).catch(() => { renderSignedIn(null); });
+      }).catch((e) => {
+        // A dead token (revoked remotely / expired) must read as signed
+        // OUT — never show a phantom signed-in menu.
+        if (e && e.status === 401) { api.account.setToken(null); renderSignedOut(); }
+        else renderSignedIn(null);
+      });
     }
   };
   document.addEventListener('click', (e) => {
@@ -749,10 +754,9 @@ function openCaptureModal() {
 // Branded vault gate replacing the native basic-auth popup. The form sends
 // an explicit Authorization header — browsers never show the popup when a
 // request already carries credentials, and Caddy strips the challenge from
-// API 401s anyway. One silent headerless /health probe first: if the
-// browser still holds popup-era cached creds (Safari-class), enter without
-// prompting — self-eliminating once the user signs out once (the probe is
-// suppressed after an in-tab sign-out via VAULT_NO_PROBE_KEY).
+// API 401s anyway. No headerless auto-enter probe: browsers silently attach
+// cached basic-auth, so a probe would bounce every login-screen visit into
+// the console while box creds are cached (account form unreachable).
 //
 // The login screen is also the site's front door for Engram ACCOUNTS
 // (roadmap 1.2): "Create an account" registers a passkey against the
@@ -1306,23 +1310,15 @@ route('/login', () => {
   // The wizard shows only right after registration (flag set by
   // webauthnRegister). A lingering session token alone — e.g. a passkey
   // LOGIN, or any revisit within the 7-day session — lands on the form.
+  //
+  // No auto-enter probe here anymore: browsers silently attach cached
+  // basic-auth to headerless fetches, so any /health probe would 200 while
+  // box creds are cached and bounce the user straight into the console —
+  // making the ACCOUNT form unreachable ("logs me right in on refresh").
+  // Cached box creds still open the console directly on every other route
+  // via hasAuth(); this screen stays the account front door.
   if (sessionStorage.getItem(VAULT_JUST_REGISTERED_KEY) === '1') renderLoginView('pair');
   else renderLoginView('account');
-
-  // Transition probe (comment above) — auto-enter on cached creds, unless
-  // this tab signed out (VAULT_NO_PROBE_KEY).
-  (async () => {
-    if (sessionStorage.getItem(VAULT_NO_PROBE_KEY) === '1') return;
-    try {
-      const r = await fetch(API + '/health');
-      if (r.ok) {
-        sessionStorage.setItem(VAULT_PROBE_KEY, '1');
-        sessionStorage.removeItem(VAULT_JUST_REGISTERED_KEY);
-        updateStatus();
-        navigate('#/');
-      }
-    } catch {}
-  })();
 });
 
 // ── Password reset link (from the reset email: #/reset/{token}) ────────────
