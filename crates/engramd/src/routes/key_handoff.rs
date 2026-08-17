@@ -71,6 +71,7 @@ async fn start_handoff(State(state): State<AppState>) -> Result<Json<Value>, Api
     keys_or_409(&state)?;
     let token = uuid::Uuid::new_v4().simple().to_string();
     state.key_handoff.mint_swept(&token, now_secs()).await;
+    tracing::info!(ttl_secs = HANDOFF_TTL_SECS, "handoff token minted");
     Ok(Json(json!({ "token": token, "expires_in": HANDOFF_TTL_SECS })))
 }
 
@@ -81,11 +82,13 @@ async fn redeem_handoff(
 ) -> Result<Json<Value>, ApiError> {
     let keys = keys_or_409(&state)?;
     if !state.key_handoff.redeem_swept(&token, now_secs()).await {
+        tracing::warn!("handoff token redeem refused (unknown, expired, or already used)");
         return Err(err_json(
             401,
             "unknown, expired, or already-used handoff token",
         ));
     }
+    tracing::info!("handoff token redeemed");
     Ok(Json(json!({
         "enc_key_b64": base64::engine::general_purpose::STANDARD.encode(keys.enc_key),
         "hmac_key_b64": base64::engine::general_purpose::STANDARD.encode(keys.hmac_key),

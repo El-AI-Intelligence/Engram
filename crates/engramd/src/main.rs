@@ -368,37 +368,68 @@ fn load_consolidation_schedule(vault_path: &std::path::Path) -> (u64, bool) {
 fn cors_layer() -> CorsLayer {
     use tower_http::cors::AllowOrigin;
 
-    // Load extra allowed origins from ENGRAM_CORS_ORIGINS env var
-    let extra_origins: Vec<String> = std::env::var("ENGRAM_CORS_ORIGINS")
-        .ok()
-        .map(|s| s.split(',').map(|o| o.trim().to_string()).collect())
-        .unwrap_or_default();
+    let extra_origins = cors_extra_origins();
 
     CorsLayer::new()
         .allow_origin(AllowOrigin::predicate(
-            move |origin: &axum::http::HeaderValue, _req| {
-                if let Ok(s) = origin.to_str() {
-                    // Allow localhost on any port (dev UI, Python server, etc.)
-                    if s.starts_with("http://localhost:")
-                        || s.starts_with("http://127.0.0.1:")
-                        || s.starts_with("http://[::1]:")
-                    {
-                        return true;
-                    }
-                    // Allow the production domain
-                    if s == "https://engram.ellmstack.dev" {
-                        return true;
-                    }
-                    // Allow any domains configured via ENGRAM_CORS_ORIGINS
-                    if extra_origins.iter().any(|o| o == s) {
-                        return true;
-                    }
-                }
-                false
-            },
+            move |origin: &axum::http::HeaderValue, _req| origin_is_allowed(origin, &extra_origins),
         ))
         .allow_methods(Any)
         .allow_headers(Any)
+}
+
+/// Extra allowed origins from the ENGRAM_CORS_ORIGINS env var (comma-separated).
+fn cors_extra_origins() -> Vec<String> {
+    std::env::var("ENGRAM_CORS_ORIGINS")
+        .ok()
+        .map(|s| s.split(',').map(|o| o.trim().to_string()).collect())
+        .unwrap_or_default()
+}
+
+/// Single source of truth for which browser origins may call the daemon.
+fn origin_is_allowed(origin: &axum::http::HeaderValue, extra_origins: &[String]) -> bool {
+    let Ok(s) = origin.to_str() else { return false };
+    // Allow localhost on any port (dev UI, Python server, etc.)
+    if s.starts_with("http://localhost:")
+        || s.starts_with("http://127.0.0.1:")
+        || s.starts_with("http://[::1]:")
+    {
+        return true;
+    }
+    // Allow the production domain
+    if s == "https://engram.ellmstack.dev" {
+        return true;
+    }
+    // Allow any domains configured via ENGRAM_CORS_ORIGINS
+    extra_origins.iter().any(|o| o == s)
+}
+
+/// Chrome 142+ enforces Local Network Access (successor to Private Network
+/// Access): a fetch from a public site (https://engram.ellmstack.dev) to this
+/// loopback daemon requires the preflight to answer with
+/// `Access-Control-Allow-Private-Network: true`, or the browser fails the
+/// fetch with a bare network error that never reaches the daemon — invisible
+/// in every server log. The header is gated on the same origin predicate as
+/// the CORS layer, never `*` (a wildcard would let any public page probe
+/// loopback daemons through this opt-in).
+async fn pna_opt_in(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let extras = cors_extra_origins();
+    let origin_allowed = req
+        .headers()
+        .get(axum::http::header::ORIGIN)
+        .map(|o| origin_is_allowed(o, &extras))
+        .unwrap_or(false);
+    let mut res = next.run(req).await;
+    if origin_allowed {
+        res.headers_mut().insert(
+            axum::http::HeaderName::from_static("access-control-allow-private-network"),
+            axum::http::HeaderValue::from_static("true"),
+        );
+    }
+    res
 }
 
 // ── Daemon ─────────────────────────────────────────────────────────────────
@@ -608,6 +639,7 @@ async fn run_daemon(
             auth::auth_middleware,
         ))
         .layer(cors_layer())
+        .layer(axum::middleware::from_fn(pna_opt_in))
         .layer(TraceLayer::new_for_http())
         // Reject oversized bodies (10 MiB) with structured JSON errors
         .layer(DefaultBodyLimit::max(10 * 1024 * 1024))

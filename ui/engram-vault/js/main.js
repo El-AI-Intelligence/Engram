@@ -1435,7 +1435,20 @@ route('/handoff/:token', (token) => {
           return fail('That password does not open your account key.');
         } finally { wk.fill(0); }
       }
-      const r = await fetch(daemonOrigin + '/sync/key-handoff/' + encodeURIComponent(token), { method: 'POST' });
+      // Chrome 142+ Local Network Access: a public site fetching a loopback
+      // daemon needs targetAddressSpace:'loopback' AND the daemon's preflight
+      // must carry Access-Control-Allow-Private-Network:true, or the fetch
+      // dies with a bare network error that never reaches the daemon.
+      let r;
+      try {
+        r = await fetch(
+          new Request(daemonOrigin + '/sync/key-handoff/' + encodeURIComponent(token), {
+            method: 'POST',
+            targetAddressSpace: 'loopback',
+          }));
+      } catch {
+        return fail('Your browser blocked the link to this machine\'s daemon (Chrome 142+ Local Network Access). Click the lock icon → Site settings → Local network access → Allow, then re-open the link. If the daemon isn\'t running, start it and run `engram handoff` again.');
+      }
       if (!r.ok) {
         if (r.status === 401) return fail('That handoff link has expired or was already used — run `engram handoff` again.');
         return fail(`This machine's daemon refused the handoff (${r.status}).`);
@@ -1449,6 +1462,8 @@ route('/handoff/:token', (token) => {
       const wrapped = await unlock.wrapKey(A, K);
       await api.account.putVaultWrap(ACCT, h.vault_id, unlock.b64encode(wrapped));
       enc.fill(0); hmac.fill(0); K.fill(0);
+      // Strip the one-time token from history before moving on.
+      history.replaceState(null, '', '#/handoff/');
       toast('Vault linked — it now opens with your account', 'ok');
       navigate('#/unlock');
     } catch (e) {
