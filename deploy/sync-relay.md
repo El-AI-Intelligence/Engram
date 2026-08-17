@@ -158,3 +158,15 @@ if that record is ever added.
 Caddy: **no changes** — the relay stays behind the existing TLS site; the
 account flow is browser→relay CORS calls with a Bearer token in
 localStorage, nothing new terminates at Caddy.
+
+## Deploy log
+
+- **2026-08-17 — email+password accounts (1.2 full stack):** binary upgraded
+  (signup/signin/reset, credentials, password change, passkey detach, wrap
+  PUT/GET/DELETE incl. the three wrap GETs); live wire checks 23/23 via a
+  throwaway account (signup→wraps→credentials→change-password→reset-request),
+  rows cleaned up after. Schema auto-created on startup (additive only).
+  **Gotcha:** manual `sqlite3` CLI connections default to `foreign_keys=OFF`
+  — a CLI `DELETE FROM accounts` does NOT cascade. Always run
+  `PRAGMA foreign_keys=ON;` first for manual deletes (the app enables it via
+  execute_batch at startup, main.rs:311).
