@@ -170,3 +170,11 @@ localStorage, nothing new terminates at Caddy.
   — a CLI `DELETE FROM accounts` does NOT cascade. Always run
   `PRAGMA foreign_keys=ON;` first for manual deletes (the app enables it via
   execute_batch at startup, main.rs:311).
+- **2026-08-17 — CORS PUT fix (96193d5):** the wrap PUTs
+  (`/account/wraps/password|recovery`, `/account/vaults/{id}/wrap`) were
+  blocked by the relay's CorsLayer allow-list (GET/POST/DELETE only) —
+  first real-user signup died at the recovery-phrase gate with a bare
+  `Failed to fetch`. Added `Method::PUT`; verified with a real preflight
+  OPTIONS (Origin + Access-Control-Request-Method) then a full throwaway
+  signup→PUT wraps→GET wraps loop (all 200 + CORS headers), rows cleaned
+  up. Full postmortem + auth playbook: docs/engram-product/AUTHENTICATION.md
