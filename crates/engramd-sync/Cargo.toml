@@ -36,6 +36,11 @@ sha2 = "0.10"
 base64 = "0.22"
 rand = "0.9"
 
+# `engram link` — X25519 ECDH + ChaCha20-Poly1305 sealing of the account
+# key delivered through the one-click linking flow (see link_crypto.rs).
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+chacha20poly1305 = "0.10"
+
 # Server-side password hashing (Argon2id). Distinct params + salt from the
 # CLIENT-side wrap derivation so the stored hash yields no wrap key material.
 argon2 = "0.5"

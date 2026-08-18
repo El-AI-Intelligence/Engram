@@ -64,6 +64,15 @@ pub fn router() -> Router<SyncState> {
         )
         .route("/devices/pair-codes", post(mint_pairing_code))
         .route("/devices/pair", post(redeem_pairing_code))
+        .route("/devices/link-intents", post(create_link_intent))
+        .route(
+            "/devices/link-intents/{id}/status",
+            get(link_intent_status),
+        )
+        .route(
+            "/devices/link-intents/{id}/confirm",
+            post(confirm_link_intent),
+        )
 }
 
 // ── Register ────────────────────────────────────────────────────────────────
@@ -728,6 +737,307 @@ async fn redeem_pairing_code(
         "vault_id": Value::Null,
         "created_at": now_str,
     })))
+}
+
+// ── One-click machine linking (`engram link`, WARP-style) ──────────────────
+
+/// Link-intent lifetime: 10 minutes — the same walk-from-browser window as
+/// pairing codes.
+const LINK_INTENT_TTL_SECS: i64 = 600;
+
+/// Create a link intent (unauthenticated): the CLI posts its ephemeral
+/// X25519 public key, gets an intent id + code to put in the confirm URL.
+/// The relay derives its own per-intent keypair from (id, code_hash) —
+/// nothing private is ever at rest. The code is returned once; only its
+/// sha256 is stored.
+async fn create_link_intent(
+    State(state): State<SyncState>,
+    Json(body): Json<Value>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    {
+        let mut limiters = state.rate_limiters.lock().await;
+        let limiter = limiters
+            .entry("link-create".into())
+            .or_insert_with(|| crate::RateLimiter::new(5.0, 5.0));
+        if !limiter.allow() {
+            return Err(err_json(
+                429,
+                "rate_limit_exceeded",
+                "too many link attempts — wait a moment and try again",
+            ));
+        }
+    }
+
+    let pk_b64 = str_field(&body, "public_key")?;
+    let pk_bytes = URL_SAFE_NO_PAD
+        .decode(pk_b64.as_bytes())
+        .map_err(|_| err_json(400, "invalid_public_key", "public_key must be base64url"))?;
+    if pk_bytes.len() != 32 {
+        return Err(err_json(
+            400,
+            "invalid_public_key",
+            "public_key must be 32 bytes",
+        ));
+    }
+    let public_key: [u8; 32] = pk_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| err_json(400, "invalid_public_key", "public_key must be 32 bytes"))?;
+    let device_label = body.get("device_label").and_then(|v| v.as_str());
+
+    let code =
+        auth::generate_pairing_code().map_err(|e| err_json(500, "rng_error", &e.to_string()))?;
+    let code_hash = auth::hash_key(&code);
+    let id = Uuid::new_v4().to_string();
+    let sk_r = crate::link_crypto::intent_keypair(&id, &code_hash);
+    let pk_r = x25519_dalek::PublicKey::from(&sk_r);
+    let now = chrono::Utc::now();
+    let expires = now + chrono::Duration::seconds(LINK_INTENT_TTL_SECS);
+
+    let conn = state.conn.lock().await;
+    conn.execute(
+        "DELETE FROM link_intents WHERE expires_at < ?1",
+        rusqlite::params![now.to_rfc3339()],
+    )
+    .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+    conn.execute(
+        "INSERT INTO link_intents (id, code_hash, public_key, device_label, status, created_at, expires_at) \
+         VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6)",
+        rusqlite::params![
+            id,
+            code_hash.to_vec(),
+            public_key.to_vec(),
+            device_label,
+            now.to_rfc3339(),
+            expires.to_rfc3339(),
+        ],
+    )
+    .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "id": id,
+            "code": code, // shown once — the server keeps only its hash
+            "relay_public_key": URL_SAFE_NO_PAD.encode(pk_r.as_bytes()),
+            "expires_in": LINK_INTENT_TTL_SECS,
+            "v": 1,
+        })),
+    ))
+}
+
+/// Poll the intent: pending until confirmed, then the sealed key is
+/// delivered exactly once (atomic confirmed→delivered claim — a
+/// concurrent poll loses the race and gets 410).
+async fn link_intent_status(
+    State(state): State<SyncState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    {
+        let mut limiters = state.rate_limiters.lock().await;
+        let limiter = limiters
+            .entry("link-status".into())
+            .or_insert_with(|| crate::RateLimiter::new(20.0, 20.0));
+        if !limiter.allow() {
+            return Err(err_json(
+                429,
+                "rate_limit_exceeded",
+                "polling too fast — wait a moment and try again",
+            ));
+        }
+    }
+
+    let conn = state.conn.lock().await;
+    let row: Option<(String, Option<Vec<u8>>, Option<Vec<u8>>, String)> = conn
+        .query_row(
+            "SELECT status, sealed_key, nonce, expires_at FROM link_intents WHERE id = ?1",
+            rusqlite::params![id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()
+        .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+    let (status, sealed, nonce, expires_at) = row.ok_or_else(|| {
+        err_json(
+            404,
+            "link_intent_not_found",
+            "unknown link intent — run `engram link` again",
+        )
+    })?;
+
+    if link_intent_expired(&expires_at)? {
+        return Err(err_json(
+            410,
+            "link_intent_expired",
+            "link expired — run `engram link` again",
+        ));
+    }
+
+    match status.as_str() {
+        "pending" => Ok(Json(json!({"status": "pending", "v": 1}))),
+        "delivered" => Err(err_json(
+            410,
+            "link_intent_delivered",
+            "link already claimed — run `engram link` again",
+        )),
+        "confirmed" => {
+            let claimed = conn
+                .execute(
+                    "UPDATE link_intents SET status = 'delivered' WHERE id = ?1 AND status = 'confirmed'",
+                    rusqlite::params![id],
+                )
+                .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+            if claimed == 0 {
+                return Err(err_json(
+                    410,
+                    "link_intent_delivered",
+                    "link already claimed — run `engram link` again",
+                ));
+            }
+            let sealed = sealed
+                .ok_or_else(|| err_json(500, "database_error", "confirmed intent missing sealed_key"))?;
+            let nonce = nonce
+                .ok_or_else(|| err_json(500, "database_error", "confirmed intent missing nonce"))?;
+            Ok(Json(json!({
+                "status": "confirmed",
+                "sealed_key": URL_SAFE_NO_PAD.encode(sealed),
+                "nonce": URL_SAFE_NO_PAD.encode(nonce),
+                "key_prefix": auth::API_KEY_PREFIX,
+                "v": 1,
+            })))
+        }
+        _ => Err(err_json(500, "database_error", "corrupt link intent status")),
+    }
+}
+
+/// The signed-in browser approves the intent: verifies the code (the
+/// capability carried in the URL), binds the intent to this account, mints
+/// an unscoped account key, and seals it to the CLI's public key. The
+/// plaintext key is never echoed — the CLI polls for the seal.
+async fn confirm_link_intent(
+    State(state): State<SyncState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let account_id = authenticate_session(&state, &headers).await?;
+
+    {
+        let mut limiters = state.rate_limiters.lock().await;
+        let limiter = limiters
+            .entry("link-confirm".into())
+            .or_insert_with(|| crate::RateLimiter::new(5.0, 5.0));
+        if !limiter.allow() {
+            return Err(err_json(
+                429,
+                "rate_limit_exceeded",
+                "too many attempts — wait a moment and try again",
+            ));
+        }
+    }
+
+    let code = str_field(&body, "code")?.to_ascii_uppercase();
+    let conn = state.conn.lock().await;
+    let row: Option<(Vec<u8>, Vec<u8>, String, String)> = conn
+        .query_row(
+            "SELECT code_hash, public_key, status, expires_at FROM link_intents WHERE id = ?1",
+            rusqlite::params![id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()
+        .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+    let (code_hash, public_key, status, expires_at) = row.ok_or_else(|| {
+        err_json(
+            404,
+            "link_intent_not_found",
+            "unknown link intent — run `engram link` again",
+        )
+    })?;
+
+    if link_intent_expired(&expires_at)? {
+        return Err(err_json(
+            410,
+            "link_intent_expired",
+            "link expired — run `engram link` again",
+        ));
+    }
+    if status != "pending" {
+        return Err(err_json(
+            410,
+            "link_intent_delivered",
+            "link already used or expired — run `engram link` again",
+        ));
+    }
+
+    // The code is the capability carried in the URL — compare hashes, not
+    // plaintexts (nothing plaintext is at rest).
+    let code_hash_in = auth::hash_key(&code);
+    if code_hash_in.as_slice() != code_hash.as_slice() {
+        return Err(err_json(
+            403,
+            "invalid_link_code",
+            "this link doesn't match — run `engram link` again on the machine",
+        ));
+    }
+
+    let sk_r = crate::link_crypto::intent_keypair(&id, &code_hash_in);
+    let pk_bytes: [u8; 32] = public_key
+        .as_slice()
+        .try_into()
+        .map_err(|_| err_json(500, "database_error", "corrupt public_key"))?;
+    let shared =
+        crate::link_crypto::link_shared_secret(&sk_r, &x25519_dalek::PublicKey::from(pk_bytes))
+            .map_err(|e| err_json(400, "invalid_public_key", &e.to_string()))?;
+
+    // Mint the key — same shape as redeem_pairing_code: unscoped account key.
+    let api_key = auth::generate_api_key().map_err(|e| err_json(500, "rng_error", &e.to_string()))?;
+    let key_id = Uuid::new_v4().to_string();
+    let now_str = chrono::Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO api_keys (id, account_id, key_hash, key_prefix, rate, vault_id, created_at, revoked) \
+         VALUES (?1, ?2, ?3, ?4, 100, NULL, ?5, 0)",
+        rusqlite::params![
+            key_id,
+            account_id,
+            auth::hash_key(&api_key).to_vec(),
+            auth::API_KEY_PREFIX,
+            now_str
+        ],
+    )
+    .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+
+    let (sealed, nonce) = crate::link_crypto::seal_api_key(&id, &shared, &api_key)
+        .map_err(|e| err_json(500, "seal_error", &e.to_string()))?;
+
+    // Atomic: a second confirm loses the race and gets 410.
+    let claimed = conn
+        .execute(
+            "UPDATE link_intents SET account_id = ?1, sealed_key = ?2, nonce = ?3, status = 'confirmed' \
+             WHERE id = ?4 AND status = 'pending'",
+            rusqlite::params![account_id, sealed, nonce.to_vec(), id],
+        )
+        .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+    if claimed == 0 {
+        return Err(err_json(
+            410,
+            "link_intent_delivered",
+            "link already used or expired — run `engram link` again",
+        ));
+    }
+
+    Ok(Json(json!({
+        "status": "confirmed",
+        "key_id": key_id,
+        "key_prefix": auth::API_KEY_PREFIX,
+        "v": 1,
+    })))
+}
+
+/// Parse an intent's expires_at into a "is it expired" check.
+fn link_intent_expired(expires_at: &str) -> Result<bool, ApiError> {
+    let expires: chrono::DateTime<chrono::Utc> = chrono::DateTime::parse_from_rfc3339(expires_at)
+        .map_err(|e| err_json(500, "database_error", &format!("corrupt expires_at: {e}")))?
+        .with_timezone(&chrono::Utc);
+    Ok(expires <= chrono::Utc::now())
 }
 
 // ── Session helpers (shared with account-key routes) ────────────────────────
@@ -1569,6 +1879,12 @@ mod tests {
                  code_hash BLOB PRIMARY KEY, account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
                  created_at TEXT NOT NULL, expires_at TEXT NOT NULL, used INTEGER NOT NULL DEFAULT 0
              );
+             CREATE TABLE link_intents (
+                 id TEXT PRIMARY KEY, code_hash BLOB NOT NULL, public_key BLOB NOT NULL,
+                 account_id TEXT REFERENCES accounts(id) ON DELETE CASCADE,
+                 sealed_key BLOB, nonce BLOB, device_label TEXT,
+                 status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL, expires_at TEXT NOT NULL
+             );
              CREATE TABLE sync_blobs (
                  vault_id TEXT NOT NULL, memory_id TEXT NOT NULL, device_id TEXT NOT NULL,
                  vector_clock INTEGER NOT NULL DEFAULT 0, ciphertext TEXT NOT NULL,
@@ -2131,6 +2447,238 @@ mod tests {
         .expect_err("expired");
         assert_eq!(err.0, StatusCode::UNAUTHORIZED);
         assert_eq!(err.1["code"], "expired_pairing_code");
+    }
+
+    /// The "CLI" side of a link test: a fixed keypair the relay doesn't know.
+    fn link_test_cli_keypair() -> ([u8; 32], x25519_dalek::StaticSecret) {
+        let sk = x25519_dalek::StaticSecret::from([7u8; 32]);
+        let pk = *x25519_dalek::PublicKey::from(&sk).as_bytes();
+        (pk, sk)
+    }
+
+    /// Create an intent, returning (id, code) from the relay's response.
+    async fn create_test_link_intent(
+        state: &SyncState,
+        pk_b64: &str,
+    ) -> (String, String, serde_json::Value) {
+        let (status, body) = create_link_intent(
+            State(state.clone()),
+            Json(json!({"public_key": pk_b64, "device_label": "test-laptop"})),
+        )
+        .await
+        .expect("mint");
+        assert_eq!(status, StatusCode::CREATED);
+        let id = body["id"].as_str().expect("id").to_string();
+        let code = body["code"].as_str().expect("code").to_string();
+        assert_eq!(body["expires_in"], 600);
+        (id, code, body.0)
+    }
+
+    #[tokio::test]
+    async fn link_intent_round_trip_seals_and_delivers_once() {
+        let state = test_state();
+        let (pk, _sk_cli) = link_test_cli_keypair();
+        let pk_b64 = URL_SAFE_NO_PAD.encode(pk);
+
+        let (id, code, body) = create_test_link_intent(&state, &pk_b64).await;
+        // The returned relay public key matches the deterministic derivation.
+        let relay_pk = URL_SAFE_NO_PAD
+            .decode(body["relay_public_key"].as_str().unwrap())
+            .unwrap();
+        let derived = x25519_dalek::PublicKey::from(&crate::link_crypto::intent_keypair(
+            &id,
+            &auth::hash_key(&code),
+        ));
+        assert_eq!(relay_pk, derived.as_bytes().to_vec());
+
+        // Only the sha256 is at rest.
+        {
+            let conn = state.conn.lock().await;
+            let (hash, status, sealed, nonce): (Vec<u8>, String, Option<Vec<u8>>, Option<Vec<u8>>) =
+                conn.query_row(
+                    "SELECT code_hash, status, sealed_key, nonce FROM link_intents WHERE id = ?1",
+                    rusqlite::params![id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .unwrap();
+            assert_eq!(hash, auth::hash_key(&code).to_vec(), "sha256 at rest");
+            assert_ne!(hash, code.as_bytes());
+            assert_eq!(status, "pending");
+            assert!(sealed.is_none() && nonce.is_none(), "nothing sealed pre-confirm");
+        }
+
+        // Pending before the browser confirms.
+        let res = link_intent_status(State(state.clone()), Path(id.clone()))
+            .await
+            .expect("pending poll");
+        assert_eq!(res["status"], "pending");
+
+        // Confirm without a session → 401.
+        let err = confirm_link_intent(
+            State(state.clone()),
+            bearer("nope"),
+            Path(id.clone()),
+            Json(json!({"code": code})),
+        )
+        .await
+        .expect_err("no session");
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+
+        seed_session(&state, "acct-1", "test-token").await;
+
+        // Wrong code → 403, intent still pending.
+        let err = confirm_link_intent(
+            State(state.clone()),
+            bearer("test-token"),
+            Path(id.clone()),
+            Json(json!({"code": "ENG-2222-2222-2222"})),
+        )
+        .await
+        .expect_err("wrong code");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert_eq!(err.1["code"], "invalid_link_code");
+
+        // Correct code (lowercase accepted) confirms — plaintext key is NOT echoed.
+        let res = confirm_link_intent(
+            State(state.clone()),
+            bearer("test-token"),
+            Path(id.clone()),
+            Json(json!({"code": code.to_lowercase()})),
+        )
+        .await
+        .expect("confirm");
+        let body = res.0;
+        assert_eq!(body["status"], "confirmed");
+        assert!(body["key_id"].as_str().is_some());
+        assert!(body.get("api_key").is_none(), "sealed, never echoed");
+
+        // First status poll claims the seal and delivers it exactly once.
+        let res = link_intent_status(State(state.clone()), Path(id.clone()))
+            .await
+            .expect("claim");
+        let body = res.0;
+        assert_eq!(body["status"], "confirmed");
+        assert_eq!(body["key_prefix"], auth::API_KEY_PREFIX);
+        let sealed = URL_SAFE_NO_PAD.decode(body["sealed_key"].as_str().unwrap()).unwrap();
+        let nonce = URL_SAFE_NO_PAD.decode(body["nonce"].as_str().unwrap()).unwrap();
+        assert_eq!(nonce.len(), 12);
+
+        // The CLI's side of the handshake decrypts the key.
+        let sk_r = crate::link_crypto::intent_keypair(&id, &auth::hash_key(&code));
+        let shared =
+            crate::link_crypto::link_shared_secret(&sk_r, &x25519_dalek::PublicKey::from(pk))
+                .unwrap();
+        let api_key = crate::link_crypto::unseal_api_key(&id, &shared, &sealed, &nonce).unwrap();
+        assert!(api_key.starts_with(auth::API_KEY_PREFIX), "minted account key");
+        // …and it authenticates through the normal api_keys path.
+        {
+            let conn = state.conn.lock().await;
+            let stored: Vec<u8> = conn
+                .query_row(
+                    "SELECT key_hash FROM api_keys WHERE key_hash = ?1",
+                    rusqlite::params![auth::hash_key(&api_key).to_vec()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(stored, auth::hash_key(&api_key).to_vec());
+            let account: String = conn
+                .query_row(
+                    "SELECT account_id FROM link_intents WHERE id = ?1",
+                    rusqlite::params![id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(account, "acct-1", "intent bound to confirming account");
+        }
+
+        // One-shot: second poll and second confirm both 410.
+        let err = link_intent_status(State(state.clone()), Path(id.clone()))
+            .await
+            .expect_err("already delivered");
+        assert_eq!(err.0, StatusCode::GONE);
+        assert_eq!(err.1["code"], "link_intent_delivered");
+
+        let err = confirm_link_intent(
+            State(state.clone()),
+            bearer("test-token"),
+            Path(id.clone()),
+            Json(json!({"code": code})),
+        )
+        .await
+        .expect_err("already confirmed");
+        assert_eq!(err.0, StatusCode::GONE);
+        assert_eq!(err.1["code"], "link_intent_delivered");
+    }
+
+    #[tokio::test]
+    async fn link_intent_status_unknown_is_404() {
+        let state = test_state();
+        let err = link_intent_status(State(state), Path("missing".into()))
+            .await
+            .expect_err("unknown");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+        assert_eq!(err.1["code"], "link_intent_not_found");
+    }
+
+    #[tokio::test]
+    async fn link_intent_expiry_is_410() {
+        let state = test_state();
+        let (pk, _sk_cli) = link_test_cli_keypair();
+        let pk_b64 = URL_SAFE_NO_PAD.encode(pk);
+        let (id, code, _body) = create_test_link_intent(&state, &pk_b64).await;
+        {
+            let conn = state.conn.lock().await;
+            conn.execute(
+                "UPDATE link_intents SET expires_at = '2000-01-01T00:00:00Z' WHERE id = ?1",
+                rusqlite::params![id],
+            )
+            .unwrap();
+        }
+        let err = link_intent_status(State(state.clone()), Path(id.clone()))
+            .await
+            .expect_err("expired poll");
+        assert_eq!(err.0, StatusCode::GONE);
+        assert_eq!(err.1["code"], "link_intent_expired");
+
+        seed_session(&state, "acct-1", "test-token").await;
+        let err = confirm_link_intent(
+            State(state.clone()),
+            bearer("test-token"),
+            Path(id.clone()),
+            Json(json!({"code": code})),
+        )
+        .await
+        .expect_err("expired confirm");
+        assert_eq!(err.0, StatusCode::GONE);
+        assert_eq!(err.1["code"], "link_intent_expired");
+    }
+
+    #[tokio::test]
+    async fn link_intent_rejects_bad_public_key() {
+        let state = test_state();
+        // 33 bytes → 400.
+        let err = create_link_intent(
+            State(state.clone()),
+            Json(json!({"public_key": URL_SAFE_NO_PAD.encode([7u8; 33])})),
+        )
+        .await
+        .expect_err("33-byte key");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(err.1["code"], "invalid_public_key");
+        // Not base64url → 400.
+        let err = create_link_intent(
+            State(state.clone()),
+            Json(json!({"public_key": "not!!base64"})),
+        )
+        .await
+        .expect_err("bad b64");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(err.1["code"], "invalid_public_key");
+        // Missing → 400 (str_field).
+        let err = create_link_intent(State(state.clone()), Json(json!({})))
+            .await
+            .expect_err("missing field");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

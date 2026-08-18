@@ -49,6 +49,7 @@
 
 mod account_routes;
 mod auth;
+mod link_crypto;
 mod password_routes;
 mod quota;
 mod routes;
@@ -394,6 +395,27 @@ async fn main() -> anyhow::Result<()> {
             used       INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_pairing_codes_account ON pairing_codes(account_id);
+        -- One-click machine linking (`engram link`): the CLI creates an
+        -- intent carrying its ephemeral X25519 public key; the signed-in
+        -- browser confirms it with the code from the URL. Nothing secret
+        -- at rest: code_hash is sha256, the sealed key is undecryptable
+        -- without the CLI's private key, and the relay's own keypair is
+        -- re-derived from (id, code_hash) on demand (see link_crypto.rs).
+        -- Single-shot delivery via the confirmed→delivered transition,
+        -- 10-minute TTL.
+        CREATE TABLE IF NOT EXISTS link_intents (
+            id           TEXT PRIMARY KEY,
+            code_hash    BLOB NOT NULL,
+            public_key   BLOB NOT NULL,
+            account_id   TEXT REFERENCES accounts(id) ON DELETE CASCADE,
+            sealed_key   BLOB,
+            nonce        BLOB,
+            device_label TEXT,
+            status       TEXT NOT NULL DEFAULT 'pending',
+            created_at   TEXT NOT NULL,
+            expires_at   TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_link_intents_expires ON link_intents(expires_at);
         -- Email+password credentials (roadmap: standard accounts). The
         -- password_hash is Argon2id with its OWN salt and params — never
         -- derivable into the client-side wrap keys. Legacy passkey-only
