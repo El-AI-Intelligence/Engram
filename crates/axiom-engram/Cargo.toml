@@ -37,3 +37,8 @@ tokio = { version = "1.40", features = ["full"] }
 [features]
 default = []
 onnx-embed = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:tokenizers", "dep:hf-hub"]
+
+# Windows: see crates/engramd/Cargo.toml — vendored OpenSSL so bundled
+# SQLCipher builds on MSVC without a system OpenSSL install.
+[target.'cfg(windows)'.dependencies]
+rusqlite = { version = "0.32", features = ["bundled-sqlcipher", "bundled-sqlcipher-vendored-openssl"] }

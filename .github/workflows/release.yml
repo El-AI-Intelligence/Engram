@@ -50,6 +50,11 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      # bundled-sqlcipher-vendored-openssl compiles OpenSSL from source,
+      # which needs NASM on Windows MSVC (Perl is preinstalled on the image).
+      - name: Install NASM
+        run: choco install nasm -y --no-progress
+
       - name: Run tests
         run: cargo test -p axiom-engram -p engramd -p engramd-mcp
 
@@ -109,6 +114,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Install NASM (Windows — vendored OpenSSL build)
+        if: matrix.os == 'windows-latest'
+        run: choco install nasm -y --no-progress
 
       - name: Build
         run: cargo build --release -p engramd -p engramd-mcp --target ${{ matrix.target }}

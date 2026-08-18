@@ -54,3 +54,10 @@ argon2 = "0.5"
 tempfile = "3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "blocking"] }
 uuid = { version = "1", features = ["v4"] }
+
+# Windows: SQLCipher needs OpenSSL, which is painful on MSVC — build a
+# vendored (statically linked) OpenSSL instead so the shipped .exe has no
+# DLL dependencies and users never install OpenSSL. Requires NASM + Perl
+# when building from source on Windows (CI installs them).
+[target.'cfg(windows)'.dependencies]
+rusqlite = { version = "0.32", features = ["bundled-sqlcipher", "bundled-sqlcipher-vendored-openssl"] }
