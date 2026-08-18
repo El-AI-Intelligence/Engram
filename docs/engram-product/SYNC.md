@@ -95,37 +95,59 @@ above and `api_key` to your key — everything else in this document applies
 unchanged. See [Accounts & Passkeys](#accounts--passkeys) for the account
 model.
 
-#### Pairing a device (WARP-style, recommended)
+#### Linking a device (`engram link`, WARP-style, recommended)
 
-Copying API keys by hand is the manual path. The smooth path is a one-time
-pairing code, like Cloudflare WARP:
+Copying API keys by hand is the manual path. The smooth path is one-click
+machine linking, like Cloudflare WARP — no codes to type:
 
-1. In the vault UI, open **Settings → Account & Sync** and sign in with your
-   passkey (or create an account right from the login screen — "New here?
-   Create an account" — which lands directly on the pairing wizard).
-2. Click **Pair a device**. The site shows a single-use code
+1. Make sure the machine has an Engram account you can sign into (create one
+   from the vault login screen — "New here? Create an account").
+2. On the machine:
+
+```bash
+engram link
+```
+
+Your browser opens a "Link this machine" page. Sign in (if prompted) and
+click the one button. The CLI finishes on its own — no key pasting.
+
+The account API key never travels in plaintext: the CLI mints an ephemeral
+X25519 keypair, the relay seals the freshly issued key to it
+(ChaCha20-Poly1305, AAD-bound to the intent), and the CLI decrypts it
+exactly once (single-shot delivery, 10-minute TTL). A leaked confirm URL
+yields only an undecryptable blob. Full details in
+[AUTHENTICATION.md](AUTHENTICATION.md#device-linking-engram-link).
+
+Both flows write the sync block into `~/.engram/vault/config.json` (merging
+with an existing config — they work on existing vaults, not just fresh
+ones). Restart the daemon with `ENGRAM_PASSPHRASE` set and the device
+appears in the roster after its first push.
+
+#### Pairing a device (headless / SSH)
+
+Machines without a browser can still use a one-time pairing code:
+
+1. In the vault UI, open **Settings → Account & Sync**, sign in, and click
+   **Pair a device (headless)**. The site shows a single-use code
    (`ENG-XXXX-XXXX-XXXX`, expires in 10 minutes).
-3. On the machine:
+2. On the machine:
 
 ```bash
 engram pair ENG-XXXX-XXXX-XXXX
 ```
 
-That redeems the code for a new account API key and writes the sync block
-into `~/.engram/vault/config.json` (merging with an existing config — it
-works on existing vaults, not just fresh ones). Restart the daemon with
-`ENGRAM_PASSPHRASE` set and the device appears in the roster after its
-first push.
-
 The device's roster label is taken from `--name` if given, otherwise the
-vault's sync name, otherwise the machine hostname — `engram pair` replaces
+vault's sync name, otherwise the machine hostname — both commands replace
 a placeholder label (`unknown`) in the vault's `device.json` automatically.
+`engram link` refuses to re-link a vault that already has a sync key unless
+you pass `--force` (the old key stays active until revoked in
+Account & Sync → API keys).
 
-Notes: codes are single-use, 10-minute TTL, and stored server-side only as
-sha256 — the plaintext is shown once. Paired keys are **unscoped in v1**
-(account-wide); the vault UI can also mint per-vault keys manually.
-Machine-keyed vaults (created without a passphrase) cannot pair — sync keys
-derive from the passphrase, so `engram pair` refuses them.
+Notes: pairing codes are single-use, 10-minute TTL, and stored server-side
+only as sha256 — the plaintext is shown once. Issued keys are **unscoped in
+v1** (account-wide); the vault UI can also mint per-vault keys manually.
+Machine-keyed vaults (created without a passphrase) cannot link or pair —
+sync keys derive from the passphrase, so both commands refuse them.
 
 ### 2. Configure your vault
 

@@ -23,6 +23,7 @@ AI agents forget everything between sessions. Engram fixes that:
 ```bash
 curl -fsSL https://engram.ellmstack.dev/install.sh | bash
 engram onboarding    # 5-minute setup: vault, first memory, running daemon
+engram link          # link this machine to your account — browser opens, one click
 ```
 
 Windows (PowerShell, no admin needed — auto-starts via Task Scheduler):

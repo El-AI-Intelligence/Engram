@@ -164,6 +164,44 @@ engram handoff
 - The `?daemon=` param points at the user's loopback (or tunnel-forwarded)
   daemon — the CLI prints `127.0.0.1:8799` by default.
 
+## Device linking (`engram link`)
+
+One-click machine linking, WARP-style. `engram link` in a terminal →
+browser opens → sign in → click "Link this machine" → the CLI receives an
+account API key automatically. Pairing codes remain the headless/SSH path.
+
+**Flow:** the CLI mints an ephemeral X25519 keypair and POSTs the public
+key to `/devices/link-intents` (unauthenticated, 201 `{id, code,
+relay_public_key}` — the code is shown once, stored as sha256 only). The
+browser opens `{site}/#/link/{id}?code={code}`; the signed-in SPA POSTs
+`/devices/link-intents/{id}/confirm` (Bearer session, hash-compared code).
+The relay mints the usual unscoped `en_` key, seals it, and atomically
+flips the intent pending→confirmed. The CLI polls `/status` every 2s;
+the first poll claims the seal (confirmed→delivered, one-shot) and
+decrypts it with its ephemeral private key.
+
+**Seal format:** the relay's keypair is derived per intent —
+`sk_r = X25519(SHA-256("engram-link-relay-v1" ‖ id ‖ code_hash))` — so no
+private material is ever at rest and relay restarts don't kill live
+intents. `shared = ECDH(sk_r, pk_cli)`, `key = SHA-256("engram-link-v1" ‖
+shared)`, then ChaCha20-Poly1305 with a random 12-byte nonce and
+AAD `"engram-link-v1" ‖ id`. Both sides reject an all-zeros shared secret
+(low-order public keys). Binary fields are base64url; responses carry
+`v: 1`.
+
+**Threat model:** a leaked confirm URL is useless without the session AND
+the code AND the CLI's private key — the seal it produces is an
+undecryptable blob for anyone else. The code is single-use with a 10-minute
+TTL; confirm requires a live session (401 otherwise, and the SPA stashes
+id+code in sessionStorage to survive the sign-in round-trip, single-shot).
+Intent endpoints are bucket-limited (link-create/confirm 5/s, link-status
+20/s). The one residual trade-off: the delivered key sits in
+`config.json` plaintext like every sync key today.
+
+**Re-linking:** `engram link` bails when the vault already has a sync key;
+`--force` replaces it, orphaning the old key row (revocable in
+Account & Sync → API keys).
+
 ## Verification checklist for future auth work
 
 - [ ] Preflight OPTIONS for EVERY method the SPA uses, with the real

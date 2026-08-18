@@ -19,7 +19,7 @@ and adds the directory to your user PATH. Then:
 
 ```powershell
 engram init              # create your vault — answer Y to install the service
-engram pair ENG-XXXX-XXXX   # link this machine to your account
+engram link              # link this machine to your account (browser, one click)
 ```
 
 The daemon runs as a **Task Scheduler task** (`Engramd`) that starts at logon
@@ -77,15 +77,17 @@ It creates the vault, captures your first memory, and starts the daemon,
 then prints the dashboard URL and next steps (MCP, sync).
 
 **Sync to your Engram account** (multi-device, WARP-style): create an
-account on the vault's login screen ("New here? Create an account") or
-Settings → Account & Sync, click **Pair a device**, then run the code:
+account on the vault's login screen ("New here? Create an account"), then
+run one command — your browser opens, you click once, done:
 
 ```bash
-engram pair ENG-XXXX-XXXX-XXXX
+engram link
 ```
 
-That redeems the one-time code for a sync key and wires this machine to
-your account — full details in [SYNC.md](SYNC.md).
+The account key arrives sealed to an ephemeral keypair, so nothing secret
+ever passes through the confirm URL. Headless/SSH machines can instead mint
+a code in Settings → Account & Sync → **Pair a device (headless)** and run
+`engram pair ENG-XXXX-XXXX-XXXX`. Full details in [SYNC.md](SYNC.md).
 
 Or step through it manually:
 

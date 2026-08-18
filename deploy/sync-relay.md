@@ -41,7 +41,9 @@ carries the managed-relay flags (`--rp-id`, `--origin`, `--quota-*`).
 Schema migrations are automatic on startup (new tables only, no ALTERs);
 the DB is safe to open on an older binary, which just ignores the extra
 tables. A DB restore (backup snapshot) is therefore compatible with both
-old and new binaries.
+old and new binaries. `link_intents` (device linking, `engram link`) is
+one such additive table — deploying a newer binary creates it on first
+start; nothing manual.
 
 ## Accounts (milestone 1.2, shipped 2026-08-15)
 
