@@ -8,6 +8,7 @@
 mod app_state;
 mod auth;
 mod cli;
+mod envfile;
 mod errors;
 mod routes;
 mod sync_client;
@@ -51,6 +52,11 @@ struct Cli {
     /// Environment: ENGRAM_PASSPHRASE.
     #[arg(short, long, env = "ENGRAM_PASSPHRASE")]
     passphrase: Option<String>,
+    /// Read KEY=VALUE lines from this file into the environment before
+    /// parsing (fills gaps only — real env and CLI flags win).
+    /// Environment: ENGRAM_ENV_FILE.
+    #[arg(long, env = "ENGRAM_ENV_FILE")]
+    env_file: Option<PathBuf>,
     /// Path to static UI files to serve (SPA fallback).
     /// When set, engramd serves the vault UI directly — no reverse proxy needed.
     /// Environment: ENGRAM_UI_DIR.
@@ -67,13 +73,16 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or_else(|_| EnvFilter::new("info")))
         .init();
 
+    // Resolve --env-file before clap parses, so ENGRAM_* values from the
+    // file (e.g. ENGRAM_PASSPHRASE) are visible to clap's env feature and
+    // to everything after. Real env vars and CLI flags always win.
+    if let Some(path) = env_file_from_args() {
+        envfile::load_env_file(&path)?;
+    }
+
     let cli = Cli::parse();
 
-    // Detect binary name — if invoked as `engramd`, default to daemon mode.
-    let is_engramd = std::env::args()
-        .next()
-        .map(|a| a.ends_with("engramd"))
-        .unwrap_or(false);
+    let is_engramd = invoked_as_engramd();
 
     match cli.command {
         Some(cmd) => dispatch_cli(cmd).await,
@@ -86,11 +95,43 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
+/// True when this binary was invoked under the name `engramd` (any
+/// extension — Windows appends `.exe`), which selects daemon mode when no
+/// subcommand is given.
+fn invoked_as_engramd() -> bool {
+    std::env::args()
+        .next()
+        .map(|a| name_is_engramd(&a))
+        .unwrap_or(false)
+}
+
+fn name_is_engramd(a: &str) -> bool {
+    std::path::Path::new(a).file_stem() == Some(std::ffi::OsStr::new("engramd"))
+}
+
+/// Find `--env-file <path>` / `--env-file=<path>` in the raw argv
+/// (position-independent, so it works for both `engramd --env-file X` and
+/// `engram daemon --env-file X`), falling back to ENGRAM_ENV_FILE.
+fn env_file_from_args() -> Option<PathBuf> {
+    let mut args = std::env::args().skip(1).peekable();
+    while let Some(arg) = args.next() {
+        if let Some(rest) = arg.strip_prefix("--env-file=") {
+            return Some(PathBuf::from(rest));
+        }
+        if arg == "--env-file" {
+            if let Some(v) = args.peek() {
+                return Some(PathBuf::from(v));
+            }
+        }
+    }
+    std::env::var_os("ENGRAM_ENV_FILE").map(PathBuf::from)
+}
+
 // ── CLI dispatch ───────────────────────────────────────────────────────────
 
 async fn dispatch_cli(cmd: cli::Commands) -> anyhow::Result<()> {
     match cmd {
-        cli::Commands::Daemon { vault, bind, passphrase, ui_dir } => {
+        cli::Commands::Daemon { vault, bind, passphrase, ui_dir, env_file: _ } => {
             let addr: SocketAddr = bind.parse()?;
             run_daemon(vault, addr, passphrase, ui_dir).await
         }
@@ -781,5 +822,26 @@ async fn background_consolidator(state: AppState) {
                 timestamp: chrono::Utc::now().to_rfc3339(),
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::name_is_engramd;
+
+    #[test]
+    fn daemon_name_detection() {
+        assert!(name_is_engramd("engramd"));
+        assert!(name_is_engramd("engramd.exe"));
+        assert!(name_is_engramd("/usr/local/bin/engramd"));
+        // Backslash is only a separator on Windows itself.
+        #[cfg(windows)]
+        assert!(name_is_engramd(r"C:\Program Files\Engram\engramd.exe"));
+        assert!(name_is_engramd("../bin/engramd"));
+        assert!(!name_is_engramd("engram"));
+        assert!(!name_is_engramd("engram.exe"));
+        assert!(!name_is_engramd("engramd-mcp"));
+        assert!(!name_is_engramd("engramd-mcp.exe"));
+        assert!(!name_is_engramd(""));
     }
 }

@@ -689,6 +689,7 @@ pub fn send_reset_email(cfg: &SmtpConfig, recipient: &str, link: &str) -> anyhow
 
 /// Resolves once SIGINT (Ctrl+C) or SIGTERM is received, so the server
 /// can checkpoint and exit cleanly.
+#[cfg(unix)]
 async fn shutdown_signal() {
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .expect("install SIGTERM handler");
@@ -696,6 +697,14 @@ async fn shutdown_signal() {
         _ = tokio::signal::ctrl_c() => {},
         _ = sigterm.recv() => {},
     }
+    tracing::info!("Shutdown signal received — draining connections");
+}
+
+/// Ctrl+C only on non-unix platforms. (The relay is only deployed on Linux;
+/// this exists so the crate compiles for contributors on Windows/macOS.)
+#[cfg(not(unix))]
+async fn shutdown_signal() {
+    tokio::signal::ctrl_c().await.expect("install Ctrl+C handler");
     tracing::info!("Shutdown signal received — draining connections");
 }
 

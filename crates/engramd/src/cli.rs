@@ -7,7 +7,7 @@
 use anyhow::{Context, Result};
 use axiom_engram::{EngramStore, EngramLayer, EngramSource, Engram};
 use clap::Subcommand;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 
 // ── CLI definition ─────────────────────────────────────────────────────────
@@ -28,6 +28,10 @@ pub enum Commands {
         /// Path to static UI files to serve
         #[arg(long, env = "ENGRAM_UI_DIR")]
         ui_dir: Option<PathBuf>,
+        /// Read KEY=VALUE lines from this file into the environment before
+        /// parsing (fills gaps only — real env and CLI flags win).
+        #[arg(long, env = "ENGRAM_ENV_FILE")]
+        env_file: Option<PathBuf>,
     },
     /// Interactive setup wizard — configure your vault
     Init,
@@ -221,6 +225,25 @@ fn config_dir() -> PathBuf {
     home_dir().join(".engram")
 }
 
+/// Write ENGRAM_PASSPHRASE to ~/.engram/env (0600 on unix) so a
+/// service-installed daemon can sync after reboots without re-typing it.
+/// The value is never logged or printed. On Windows the user-profile ACL
+/// is the protection (the service installer additionally tightens it).
+fn write_env_file(passphrase: &str) -> std::result::Result<PathBuf, String> {
+    let dir = config_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    let path = dir.join("env");
+    std::fs::write(&path, format!("ENGRAM_PASSPHRASE={passphrase}\n"))
+        .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("cannot chmod {}: {e}", path.display()))?;
+    }
+    Ok(path)
+}
+
 fn expand_tilde(path: &str) -> PathBuf {
     if path.starts_with("~/") {
         home_dir().join(&path[2..])
@@ -264,16 +287,20 @@ pub async fn handle_init() -> Result<()> {
     let has_passphrase = !passphrase.is_empty();
 
     if has_passphrase {
-        println!("Confirm passphrase:");
-        print!("> ");
-        let mut confirm = String::new();
-        std::io::stdin().read_line(&mut confirm)?;
-        let confirm = confirm.trim().to_string();
-        if passphrase != confirm {
-            println!();
-            println!("  ❌ Passphrases do not match. Please run `engram init` again.");
-            println!();
-            return Ok(());
+        // Confirm only on an interactive terminal — piped stdin can't
+        // supply a second line, and EOF would abort otherwise.
+        if std::io::stdin().is_terminal() {
+            println!("Confirm passphrase:");
+            print!("> ");
+            let mut confirm = String::new();
+            std::io::stdin().read_line(&mut confirm)?;
+            let confirm = confirm.trim().to_string();
+            if passphrase != confirm {
+                println!();
+                println!("  ❌ Passphrases do not match. Please run `engram init` again.");
+                println!();
+                return Ok(());
+            }
         }
         if passphrase.len() < 8 {
             println!();
@@ -318,6 +345,15 @@ pub async fn handle_init() -> Result<()> {
     println!("  ✅ Vault created at {}", vault_path.display());
     println!("  ✅ Config saved to {}", config_file_path().display());
     println!();
+
+    // Persist the passphrase so a service-installed daemon can sync after
+    // reboots without anyone re-typing it (the daemon reads it at startup).
+    if has_passphrase {
+        match write_env_file(&passphrase) {
+            Ok(path) => println!("  ✅ Passphrase stored in {} — the daemon reads it on restart", path.display()),
+            Err(e) => println!("  ⚠  Could not write env file: {e}"),
+        }
+    }
 
     // Offer system service installation
     print!("\n  Install as a background service (start on boot)? [Y/n]: ");
@@ -385,15 +421,21 @@ pub async fn handle_join(
         println!();
         return Ok(());
     }
-    println!("Confirm passphrase:");
-    print!("> ");
-    let mut confirm = String::new();
-    std::io::stdin().read_line(&mut confirm)?;
-    if passphrase != confirm.trim() {
-        println!();
-        println!("  ❌ Passphrases do not match. Please run `engram join` again.");
-        println!();
-        return Ok(());
+    if std::io::stdin().is_terminal() {
+        println!("Confirm passphrase:");
+        print!("> ");
+        let mut confirm = String::new();
+        std::io::stdin().read_line(&mut confirm)?;
+        if passphrase != confirm.trim() {
+            println!();
+            println!("  ❌ Passphrases do not match. Please run `engram join` again.");
+            println!();
+            return Ok(());
+        }
+    }
+    match write_env_file(&passphrase) {
+        Ok(path) => println!("  ✅ Passphrase stored in {} — the daemon reads it on restart", path.display()),
+        Err(e) => println!("  ⚠  Could not write env file: {e}"),
     }
     if passphrase.len() < 8 {
         println!();
@@ -520,15 +562,17 @@ pub async fn handle_pair(
             println!();
             return Ok(());
         }
-        println!("Confirm passphrase:");
-        print!("> ");
-        let mut confirm = String::new();
-        std::io::stdin().read_line(&mut confirm)?;
-        if passphrase != confirm.trim() {
-            println!();
-            println!("  ❌ Passphrases do not match. Please run `engram pair` again.");
-            println!();
-            return Ok(());
+        if std::io::stdin().is_terminal() {
+            println!("Confirm passphrase:");
+            print!("> ");
+            let mut confirm = String::new();
+            std::io::stdin().read_line(&mut confirm)?;
+            if passphrase != confirm.trim() {
+                println!();
+                println!("  ❌ Passphrases do not match. Please run `engram pair` again.");
+                println!();
+                return Ok(());
+            }
         }
         if passphrase.len() < 8 {
             println!();
@@ -537,6 +581,10 @@ pub async fn handle_pair(
         }
         std::fs::create_dir_all(&vault_path)?;
         let _store = EngramStore::open_with_passphrase(&vault_path, &passphrase).await?;
+        match write_env_file(&passphrase) {
+            Ok(path) => println!("  ✅ Passphrase stored in {} — the daemon reads it on restart", path.display()),
+            Err(e) => println!("  ⚠  Could not write env file: {e}"),
+        }
         fresh_passphrase = Some(passphrase);
     }
 
@@ -746,6 +794,8 @@ fn install_service(vault_path: &PathBuf, home: &PathBuf) -> std::result::Result<
                      <string>{vault}</string>\n\
                      <string>--bind</string>\n\
                      <string>127.0.0.1:8787</string>\n\
+                     <string>--env-file</string>\n\
+                     <string>{envfile}</string>\n\
                  </array>\n\
                  <key>RunAtLoad</key><true/>\n\
                  <key>KeepAlive</key><true/>\n\
@@ -765,6 +815,7 @@ fn install_service(vault_path: &PathBuf, home: &PathBuf) -> std::result::Result<
                 "/usr/local/bin".to_string()
             },
             vault = vault_path.display(),
+            envfile = home.join(".engram").join("env").display(),
             logfile = home.join(".engram/daemon.log").display(),
         );
         std::fs::write(&svc_path, &plist)
@@ -782,9 +833,67 @@ fn install_service(vault_path: &PathBuf, home: &PathBuf) -> std::result::Result<
         Ok(format!("✅ LaunchAgent installed and started.\n   Check status: launchctl list | grep engramd"))
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(target_os = "windows")]
     {
-        Err("Automatic service installation is only supported on Linux and macOS.".to_string())
+        // Resolve engramd.exe: normally sits next to engram.exe; fall back
+        // to ~/.local/bin (the install.ps1 location).
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .unwrap_or_else(|| home.join(".local/bin"));
+        let daemon_exe = if exe_dir.join("engramd.exe").is_file() {
+            exe_dir.join("engramd.exe")
+        } else {
+            home.join(".local/bin").join("engramd.exe")
+        };
+        if !daemon_exe.is_file() {
+            return Err("engramd.exe not found next to engram.exe or in ~/.local/bin".to_string());
+        }
+
+        let envfile = home.join(".engram").join("env");
+        let logfile = home.join(".engram").join("daemon.log");
+        // PowerShell single-quote escaping: wrap in '…' and double embedded '.
+        let ps_quote = |s: &str| format!("'{}'", s.replace('\'', "''"));
+
+        // Hidden-console wrapper: blocks until the daemon exits, propagates
+        // its exit code (so the Task Scheduler restart policy sees crashes),
+        // and appends logs to ~/.engram/daemon.log. Only paths appear here —
+        // the passphrase is read by the daemon from the env file.
+        let wrapper = format!(
+            "& {} --vault {} --bind 127.0.0.1:8787 --env-file {} *>> {}; exit $LASTEXITCODE",
+            ps_quote(&daemon_exe.display().to_string()),
+            ps_quote(&vault_path.display().to_string()),
+            ps_quote(&envfile.display().to_string()),
+            ps_quote(&logfile.display().to_string()),
+        );
+        // -Command strings are not subject to execution policy, so the task
+        // works regardless of the machine's PowerShell policy.
+        let script = format!(
+            "$a = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument '-NoProfile -NonInteractive -WindowStyle Hidden -Command \"{wrapper}\"';\n\
+             $t = New-ScheduledTaskTrigger -AtLogOn;\n\
+             $s = New-ScheduledTaskSettingsSet -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) -Hidden;\n\
+             $p = New-ScheduledTaskPrincipal -UserId \"$env:USERNAME\" -LogonType Interactive -RunLevel Limited;\n\
+             Register-ScheduledTask -TaskName 'Engramd' -Action $a -Trigger $t -Settings $s -Principal $p -Force | Out-Null;\n\
+             Start-ScheduledTask -TaskName 'Engramd';\n\
+             icacls {} /inheritance:r /grant:r \"$env:USERNAME:(R)\" 2>$null",
+            ps_quote(&envfile.display().to_string()),
+        );
+        let output = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .output()
+            .map_err(|e| format!("cannot run powershell: {e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "Register-ScheduledTask failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Ok("✅ Windows service registered (Task Scheduler, starts at logon, no admin needed).\n   Status: Get-ScheduledTask -TaskName Engramd | Select State\n   Logs:   ~/.engram/daemon.log".to_string())
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        Err("Automatic service installation is not supported on this platform.".to_string())
     }
 }
 
@@ -1202,8 +1311,10 @@ fn merge_mcp_server(existing: &str, engramd_url: &str) -> Result<String, String>
     if !servers.is_object() {
         return Err("`mcpServers` is not a JSON object".into());
     }
+    // Node spawn does not auto-append .exe on Windows — name it explicitly.
+    let mcp_cmd = if cfg!(windows) { "engramd-mcp.exe" } else { "engramd-mcp" };
     servers["engram"] = serde_json::json!({
-        "command": "engramd-mcp",
+        "command": mcp_cmd,
         "args": ["--engramd-url", engramd_url],
     });
     serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())
@@ -1211,10 +1322,11 @@ fn merge_mcp_server(existing: &str, engramd_url: &str) -> Result<String, String>
 
 /// The snippet a user pastes into an editor's MCP config manually.
 fn manual_mcp_snippet(url: &str) -> String {
+    let mcp_cmd = if cfg!(windows) { "engramd-mcp.exe" } else { "engramd-mcp" };
     serde_json::to_string_pretty(&serde_json::json!({
         "mcpServers": {
             "engram": {
-                "command": "engramd-mcp",
+                "command": mcp_cmd,
                 "args": ["--engramd-url", url],
             }
         }
@@ -1399,13 +1511,15 @@ pub async fn handle_onboarding(bind: String) -> Result<()> {
         passphrase = passphrase.trim().to_string();
 
         if !passphrase.is_empty() {
-            println!("Confirm passphrase:");
-            print!("> ");
-            std::io::stdout().flush()?;
-            let mut confirm = String::new();
-            std::io::stdin().read_line(&mut confirm)?;
-            if confirm.trim() != passphrase {
-                anyhow::bail!("Passphrases do not match. Run `engram onboarding` again.");
+            if std::io::stdin().is_terminal() {
+                println!("Confirm passphrase:");
+                print!("> ");
+                std::io::stdout().flush()?;
+                let mut confirm = String::new();
+                std::io::stdin().read_line(&mut confirm)?;
+                if confirm.trim() != passphrase {
+                    anyhow::bail!("Passphrases do not match. Run `engram onboarding` again.");
+                }
             }
             if passphrase.len() < 8 {
                 println!("  ⚠️  Short passphrase (< 8 chars) — a password manager is safer.");
