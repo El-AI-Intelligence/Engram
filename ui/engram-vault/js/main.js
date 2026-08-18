@@ -272,6 +272,27 @@ function resumePendingHandoff() {
   return true;
 }
 
+// A `engram link` confirm URL opened without a live session must survive
+// the sign-in round-trip: the link route stashes id+code here, /login
+// resumes it the moment a session exists. The code is a one-time
+// capability — sessionStorage only, single-shot.
+const LINK_PENDING_KEY = 'engram-pending-link';
+
+function pendingLink() {
+  try {
+    const v = JSON.parse(sessionStorage.getItem(LINK_PENDING_KEY) || 'null');
+    return v && v.id && v.code ? v : null;
+  } catch { return null; }
+}
+
+function resumePendingLink() {
+  const p = pendingLink();
+  if (!p || !localStorage.getItem('engram-sync-session')) return false;
+  sessionStorage.removeItem(LINK_PENDING_KEY);
+  navigate('#/link/' + encodeURIComponent(p.id) + '?code=' + encodeURIComponent(p.code));
+  return true;
+}
+
 function getCreds() {
   return sessionStorage.getItem(VAULT_CREDS_KEY);
 }
@@ -424,7 +445,7 @@ async function render() {
   // no nav: the gate below bounces them to login.
   const mainNav = document.getElementById('main-nav');
   if (mainNav) mainNav.style.display = (hasAuth() || api.account.token()) ? '' : 'none';
-  if (!hasAuth() && !api.account.token() && hash !== '/login' && hash !== '/unlock' && hash !== '/settings' && !hash.startsWith('/reset/') && !hash.startsWith('/handoff/')) {
+  if (!hasAuth() && !api.account.token() && hash !== '/login' && hash !== '/unlock' && hash !== '/settings' && !hash.startsWith('/reset/') && !hash.startsWith('/handoff/') && !hash.startsWith('/link/')) {
     navigate('#/login');
     return;
   }
@@ -1002,9 +1023,11 @@ route('/login', () => {
             <div class="login-brand"><span class="brand-gem">◆</span> Engram Vault</div>
             <div class="modal-body">
               <p class="faint" style="margin-top:0;">Signed in<span id="pair-acct"></span>. Now link this machine:</p>
+              <p class="faint">On the machine, run <code>engram link</code> — it opens this page in a browser and one click finishes the job.</p>
               <div class="mutation">
                 <button class="btn btn-primary" id="pair-mint">Pair a device</button>
               </div>
+              <p class="faint" style="margin-top:8px;">Headless / SSH machine? Mint a one-time pairing code instead:</p>
               <div id="pair-once"></div>
               <div class="login-alt">
                 <p class="faint"><a href="#" id="pair-back">← Back to vault sign in</a> · <a href="#" id="pair-logout">Sign out</a></p>
@@ -1092,11 +1115,11 @@ route('/login', () => {
           const keyState = await acquireAccountKey(PAIR_CODE_SERVER, res.account_id, password);
           if (keyState === 'setup') {
             // Signup was aborted before the wraps landed — create the key now.
-            renderPhraseGate(PAIR_CODE_SERVER, res.account_id, email, password, () => { if (resumePendingHandoff()) return; navigate('#/unlock'); });
+            renderPhraseGate(PAIR_CODE_SERVER, res.account_id, email, password, () => { if (resumePendingHandoff() || resumePendingLink()) return; navigate('#/unlock'); });
           } else if (keyState === 'recovery') {
             renderRecoveryGate(PAIR_CODE_SERVER, res.account_id, password);
           } else {
-            if (resumePendingHandoff()) return;
+            if (resumePendingHandoff() || resumePendingLink()) return;
             navigate('#/unlock');
           }
         } catch (e) {
@@ -1148,7 +1171,7 @@ route('/login', () => {
         try {
           const res = await api.account.signup(PAIR_CODE_SERVER, email, password);
           api.account.setToken(res.session_token);
-          renderPhraseGate(PAIR_CODE_SERVER, res.account_id, email, password, () => { if (resumePendingHandoff()) return; navigate('#/unlock'); });
+          renderPhraseGate(PAIR_CODE_SERVER, res.account_id, email, password, () => { if (resumePendingHandoff() || resumePendingLink()) return; navigate('#/unlock'); });
         } catch (e) {
           if (e.code === 'email_taken') fail('An account with that email already exists — sign in instead.');
           else if (e.code === 'weak_password') fail('Password must be 12–128 characters.');
@@ -1403,7 +1426,7 @@ route('/login', () => {
 
   // A key-handoff link that bounced here signed-out resumes the moment a
   // session token exists (signin/signup paths also call this directly).
-  if (resumePendingHandoff()) return;
+  if (resumePendingHandoff() || resumePendingLink()) return;
 });
 
 // ── Password reset link (from the reset email: #/reset/{token}) ────────────
@@ -1520,6 +1543,89 @@ route('/handoff/:token', (token) => {
       fail(e.message || 'Handoff failed.');
     }
   })();
+});
+
+route('/link/:id', (id) => {
+  // Same `:id` capture quirk as /handoff: `?code=...` lands inside the
+  // capture. Strip it off and pull the code from the query — it is a
+  // one-time capability minted by `engram link`.
+  const code = (window.location.hash.match(/[?&]code=([^&]+)/) || [])[1] || '';
+  id = id.split('?')[0];
+  const app = document.getElementById('app');
+  const SERVER = 'https://sync.ellmstack.dev';
+  const fail = (msg) => {
+    app.innerHTML = `
+      <div class="modal-overlay">
+        <div class="modal login-modal">
+          <div class="login-brand"><span class="brand-gem">◆</span> Engram Vault</div>
+          <div class="modal-body">
+            <div class="error-panel"><p>${esc(msg)}</p></div>
+            <div class="login-alt">
+              <p class="faint"><a href="#/login">← Back to sign in</a> · <a href="#/unlock">Go to vault picker</a></p>
+            </div>
+          </div>
+        </div>
+      </div>`;
+  };
+  app.innerHTML = `
+    <div class="modal-overlay">
+      <div class="modal login-modal">
+        <div class="login-brand"><span class="brand-gem">◆</span> Engram Vault</div>
+        <div class="modal-body">
+          <p class="faint" style="margin-top:0;">A machine running <code>engram link</code> wants to link to this account.</p>
+          <div class="mutation">
+            <button class="btn btn-primary" id="link-allow">Link this machine</button>
+          </div>
+          <div id="link-error"></div>
+          <div class="login-alt">
+            <p class="faint"><a href="#/login">← Back to sign in</a> · <a href="#/unlock">Go to vault picker</a></p>
+          </div>
+        </div>
+      </div>
+    </div>`;
+  const errEl = document.getElementById('link-error');
+  document.getElementById('link-allow').onclick = async () => {
+    errEl.innerHTML = '';
+    try {
+      // Session check first: a signed-out visitor must keep the link alive
+      // across the sign-in round-trip, exactly like /handoff.
+      try { await api.account.get(SERVER); } catch (e) {
+        if (e && e.status === 401) {
+          sessionStorage.setItem(LINK_PENDING_KEY, JSON.stringify({ id, code }));
+          api.account.setToken(null);
+          navigate('#/login');
+          return;
+        }
+        throw e;
+      }
+      await acctPost(SERVER, '/devices/link-intents/' + encodeURIComponent(id) + '/confirm', { code });
+      // Strip the one-time code from history before moving on.
+      history.replaceState(null, '', '#/link/' + encodeURIComponent(id));
+      app.innerHTML = `
+        <div class="modal-overlay">
+          <div class="modal login-modal">
+            <div class="login-brand"><span class="brand-gem">◆</span> Engram Vault</div>
+            <div class="modal-body">
+              <p>✓ This machine is now linked to your account.</p>
+              <p class="faint">Back in the terminal, <code>engram link</code> finishes on its own. The device appears in Account &amp; Sync after its first sync.</p>
+              <div class="login-alt">
+                <p class="faint"><a href="#/login">← Back to sign in</a> · <a href="#/unlock">Go to vault picker</a></p>
+              </div>
+            </div>
+          </div>
+        </div>`;
+    } catch (e) {
+      if (e.status === 403 || e.code === 'invalid_link_code') {
+        errEl.innerHTML = `<div class="error-panel"><p>This link doesn't match the machine — run <code>engram link</code> again on it.</p></div>`;
+      } else if (e.status === 410) {
+        errEl.innerHTML = `<div class="error-panel"><p>This link has expired or was already used — run <code>engram link</code> again.</p></div>`;
+      } else if (e.status === 404) {
+        errEl.innerHTML = `<div class="error-panel"><p>The relay no longer knows this link — run <code>engram link</code> again.</p></div>`;
+      } else {
+        errEl.innerHTML = `<div class="error-panel"><p>${esc(e.message || 'Linking failed.')}</p></div>`;
+      }
+    }
+  };
 });
 
 route('/reset/:token', (token) => {
@@ -3693,7 +3799,7 @@ route('/settings', async () => {
       ${quotaBar('Devices', q.devices_used || 0, q.devices || 0)}
       ${quotaBar('Bytes', q.bytes_used || 0, q.bytes || 0, formatBytes)}
       <div class="health-row" style="margin-top:0.5rem;"><strong>API keys</strong>
-        <span class="ml-auto"><button class="btn btn-sm" id="acct-pair">Pair a device</button> <button class="btn btn-sm btn-primary" id="acct-new-key">New key${(team?.vault_id || sync.vault_id) ? ' (this vault)' : ''}</button></span></div>
+        <span class="ml-auto"><button class="btn btn-sm" id="acct-pair">Pair a device (headless)</button> <button class="btn btn-sm btn-primary" id="acct-new-key">New key${(team?.vault_id || sync.vault_id) ? ' (this vault)' : ''}</button></span></div>
       <div id="acct-pair-once"></div>
       ${activeKeys.map(k => `
         <div class="health-row"><span class="mono">${esc(k.key_prefix)}…</span>
