@@ -1644,7 +1644,8 @@ mod tests {
     fn merge_creates_fresh_config() {
         let merged = merge_mcp_server("", "http://127.0.0.1:8787").unwrap();
         let doc: serde_json::Value = serde_json::from_str(&merged).unwrap();
-        assert_eq!(doc["mcpServers"]["engram"]["command"], "engramd-mcp");
+        let expected = if cfg!(windows) { "engramd-mcp.exe" } else { "engramd-mcp" };
+        assert_eq!(doc["mcpServers"]["engram"]["command"], expected);
         assert_eq!(doc["mcpServers"]["engram"]["args"][1], "http://127.0.0.1:8787");
     }
 
