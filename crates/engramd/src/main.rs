@@ -10,6 +10,7 @@ mod auth;
 mod cli;
 mod envfile;
 mod errors;
+mod link;
 mod routes;
 mod sync_client;
 
@@ -143,6 +144,9 @@ async fn dispatch_cli(cmd: cli::Commands) -> anyhow::Result<()> {
         }
         cli::Commands::Pair { code, vault, server_url, name } => {
             cli::handle_pair(code, vault, server_url, name).await
+        }
+        cli::Commands::Link { vault, server_url, site, name, force } => {
+            cli::handle_link(vault, server_url, site, name, force).await
         }
         cli::Commands::Handoff { vault, bind, site } => {
             cli::handle_handoff(vault, bind, site).await

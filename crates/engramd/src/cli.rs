@@ -6,6 +6,7 @@
 
 use anyhow::{Context, Result};
 use axiom_engram::{EngramStore, EngramLayer, EngramSource, Engram};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use clap::Subcommand;
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
@@ -72,6 +73,26 @@ pub enum Commands {
         /// Device label shown in Account & Sync (optional)
         #[arg(long)]
         name: Option<String>,
+    },
+    /// Link this machine to your Engram account — opens your browser, one
+    /// click to approve (WARP-style). Use `engram pair` for headless setups.
+    Link {
+        /// Vault directory (defaults to ~/.engram/vault)
+        #[arg(long)]
+        vault: Option<PathBuf>,
+        /// Sync relay URL (defaults to the public Engram relay)
+        #[arg(long, default_value = "https://sync.ellmstack.dev")]
+        server_url: String,
+        /// Vault site URL opened for confirmation
+        #[arg(long, default_value = "https://engram.ellmstack.dev/app")]
+        site: String,
+        /// Device label shown in Account & Sync (optional)
+        #[arg(long)]
+        name: Option<String>,
+        /// Link even if this vault already has a sync key (the old key
+        /// stays active until revoked in Account & Sync)
+        #[arg(long)]
+        force: bool,
     },
     /// Capture a memory into the vault
     Capture {
@@ -508,19 +529,16 @@ pub async fn handle_join(
 /// exactly like `engram join` — but pair also works on EXISTING vaults.
 /// The passphrase is never stored in config.json, and the key is never
 /// printed.
-pub async fn handle_pair(
-    code: String,
+/// Shared setup for the machine→account flows (`engram pair` / `engram link`):
+/// resolve the vault path, bail on positively-known machine-keyed vaults, and
+/// create a fresh passphrase vault when the path doesn't exist yet (sync keys
+/// derive from the passphrase — it is required, blank aborts).
+///
+/// Returns None when the user aborted at the passphrase prompt.
+async fn ensure_vault_for_sync(
     vault_opt: Option<PathBuf>,
-    server_url: String,
-    name: Option<String>,
-) -> Result<()> {
-    println!();
-    println!("  ╔══════════════════════════════════════════╗");
-    println!("  ║     Engram — Pair This Device            ║");
-    println!("  ║     One code. One machine.               ║");
-    println!("  ╚══════════════════════════════════════════╝");
-    println!();
-
+    verb: &str,
+) -> Result<Option<(PathBuf, bool, Option<String>)>> {
     let default_path = home_dir().join(".engram").join("vault");
     let vault_path = vault_opt.unwrap_or(default_path);
     let existing = vault_path.join("engrams.db").exists();
@@ -541,7 +559,7 @@ pub async fn handle_pair(
                 "{} is a machine-keyed vault (created without a passphrase).\n\
                  Sync is end-to-end encrypted with the vault passphrase, so machine-keyed\n\
                  vaults cannot sync. Create a passphrase vault (re-run `engram init` with\n\
-                 a passphrase, or `engram pair` on a fresh vault path) and pair that instead.",
+                 a passphrase, or `engram {verb}` on a fresh vault path) and {verb} that instead.",
                 vault_path.display()
             );
         }
@@ -553,25 +571,27 @@ pub async fn handle_pair(
     if !existing {
         println!("Vault passphrase (sync keys derive from it; leave blank to abort):");
         print!("> ");
+        std::io::stdout().flush()?;
         let mut passphrase = String::new();
         std::io::stdin().read_line(&mut passphrase)?;
         let passphrase = passphrase.trim().to_string();
         if passphrase.is_empty() {
             println!();
-            println!("  ⚠️  Pairing aborted — sync requires a passphrase.");
+            println!("  ⚠️  {verb} aborted — sync requires a passphrase.");
             println!();
-            return Ok(());
+            return Ok(None);
         }
         if std::io::stdin().is_terminal() {
             println!("Confirm passphrase:");
             print!("> ");
+            std::io::stdout().flush()?;
             let mut confirm = String::new();
             std::io::stdin().read_line(&mut confirm)?;
             if passphrase != confirm.trim() {
                 println!();
-                println!("  ❌ Passphrases do not match. Please run `engram pair` again.");
+                println!("  ❌ Passphrases do not match. Please run `engram {verb}` again.");
                 println!();
-                return Ok(());
+                return Ok(None);
             }
         }
         if passphrase.len() < 8 {
@@ -587,6 +607,111 @@ pub async fn handle_pair(
         }
         fresh_passphrase = Some(passphrase);
     }
+
+    Ok(Some((vault_path, existing, fresh_passphrase)))
+}
+
+/// Persist a freshly issued account API key the way `pair` and `link` both
+/// need it: sync preset in vault-local config.json (field-wise merge),
+/// device roster label, and a sync_state reset so EXISTING memories re-sync
+/// against the new relay.
+fn save_sync_credential(
+    vault_path: &std::path::Path,
+    server_url: &str,
+    api_key: &str,
+    name: &Option<String>,
+) -> Result<()> {
+    let cfg_path = vault_path.join("config.json");
+    let mut config: serde_json::Value = std::fs::read_to_string(&cfg_path)
+        .ok()
+        .and_then(|data| serde_json::from_str(&data).ok())
+        .unwrap_or(serde_json::json!({}));
+    let mut sync = config
+        .get("sync")
+        .cloned()
+        .unwrap_or(serde_json::json!({}));
+    sync["enabled"] = serde_json::json!(true);
+    sync["server_url"] = serde_json::Value::String(server_url.to_string());
+    sync["api_key"] = serde_json::Value::String(api_key.to_string()); // never printed
+    sync["interval_secs"] = serde_json::json!(60);
+    if let Some(ref n) = name {
+        sync["name"] = serde_json::Value::String(n.clone());
+    }
+    // The roster label comes from vault-local device.json (the sync loop
+    // registers it on startup). Older vaults carry the "unknown" placeholder —
+    // name the device from --name, or fall back to the sync preset name, so
+    // Account & Sync shows who this machine is.
+    let label = name
+        .clone()
+        .or_else(|| sync.get("name").and_then(|v| v.as_str().map(String::from)));
+    config["sync"] = sync;
+    std::fs::write(&cfg_path, serde_json::to_string_pretty(&config)?)?;
+
+    if let Some(label) = label {
+        let dev_path = vault_path.join("device.json");
+        let mut dev: serde_json::Value = std::fs::read_to_string(&dev_path)
+            .ok()
+            .and_then(|data| serde_json::from_str(&data).ok())
+            .unwrap_or(serde_json::json!({}));
+        let current = dev.get("label").and_then(|v| v.as_str()).unwrap_or("");
+        // An explicit --name always wins; otherwise only replace the
+        // placeholder so a hand-set label survives re-pairing.
+        if name.is_some() || current.is_empty() || current == "unknown" {
+            if dev.get("device_id").and_then(|v| v.as_str()).is_none() {
+                dev["device_id"] = serde_json::Value::String(uuid::Uuid::new_v4().to_string());
+                dev["created_at"] = serde_json::Value::String(chrono::Utc::now().to_rfc3339());
+            }
+            dev["label"] = serde_json::Value::String(label);
+            std::fs::write(&dev_path, serde_json::to_string_pretty(&dev)?)?;
+        }
+    }
+
+    // Re-pointing a vault at a new relay must re-sync its EXISTING
+    // memories: sync_state.json remembers pushes against the old relay,
+    // so without a reset the daemon would only ever sync memories
+    // captured after the pair. Dropping it makes the next tick a full
+    // first sync (push everything local, pull everything remote).
+    let sync_state = vault_path.join("sync_state.json");
+    if sync_state.exists() {
+        std::fs::remove_file(&sync_state)?;
+    }
+
+    Ok(())
+}
+
+/// The post-pair/link next-steps block — identical for both flows.
+fn print_sync_next_steps(fresh_vault: bool, vault_path: &std::path::Path) {
+    println!();
+    println!("  Next steps:");
+    if fresh_vault {
+        println!("    1. Start the daemon (the passphrase is your vault key — keep it safe):");
+        println!("       ENGRAM_PASSPHRASE=\"<your passphrase>\" engramd --vault {}", vault_path.display());
+        println!("    2. The device appears in Account & Sync → Devices after its first sync.");
+    } else {
+        println!("    1. Restart the daemon so it picks up the sync preset");
+        println!("       (with ENGRAM_PASSPHRASE set, as it already runs).");
+        println!("    2. The device appears in Account & Sync → Devices after its first sync.");
+    }
+}
+
+pub async fn handle_pair(
+    code: String,
+    vault_opt: Option<PathBuf>,
+    server_url: String,
+    name: Option<String>,
+) -> Result<()> {
+    println!();
+    println!("  ╔══════════════════════════════════════════╗");
+    println!("  ║     Engram — Pair This Device            ║");
+    println!("  ║     One code. One machine.               ║");
+    println!("  ╚══════════════════════════════════════════╝");
+    println!();
+
+    let Some((vault_path, _existing, fresh_passphrase)) =
+        ensure_vault_for_sync(vault_opt, "pair").await?
+    else {
+        return Ok(());
+    };
 
     // Redeem the code for an account API key. Codes are single-use and last
     // 10 minutes — the relay is the source of truth for both.
@@ -632,80 +757,211 @@ pub async fn handle_pair(
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("relay response missing api_key"))?;
 
-    // Sync preset in the vault-local config.json. Existing vaults get a
-    // field-wise merge so unrelated keys (schedule, digest…) survive.
-    let cfg_path = vault_path.join("config.json");
-    let mut config: serde_json::Value = std::fs::read_to_string(&cfg_path)
-        .ok()
-        .and_then(|data| serde_json::from_str(&data).ok())
-        .unwrap_or(serde_json::json!({}));
-    let mut sync = config
-        .get("sync")
-        .cloned()
-        .unwrap_or(serde_json::json!({}));
-    sync["enabled"] = serde_json::json!(true);
-    sync["server_url"] = serde_json::Value::String(server_url.clone());
-    sync["api_key"] = serde_json::Value::String(api_key.to_string()); // never printed
-    sync["interval_secs"] = serde_json::json!(60);
-    if let Some(ref n) = name {
-        sync["name"] = serde_json::Value::String(n.clone());
-    }
-    // The roster label comes from vault-local device.json (the sync loop
-    // registers it on startup). Older vaults carry the "unknown" placeholder —
-    // name the device from --name, or fall back to the sync preset name, so
-    // Account & Sync shows who this machine is.
-    let label = name
-        .clone()
-        .or_else(|| sync.get("name").and_then(|v| v.as_str().map(String::from)));
-    config["sync"] = sync;
-    std::fs::write(&cfg_path, serde_json::to_string_pretty(&config)?)?;
-
-    if let Some(label) = label {
-        let dev_path = vault_path.join("device.json");
-        let mut dev: serde_json::Value = std::fs::read_to_string(&dev_path)
-            .ok()
-            .and_then(|data| serde_json::from_str(&data).ok())
-            .unwrap_or(serde_json::json!({}));
-        let current = dev.get("label").and_then(|v| v.as_str()).unwrap_or("");
-        // An explicit --name always wins; otherwise only replace the
-        // placeholder so a hand-set label survives re-pairing.
-        if name.is_some() || current.is_empty() || current == "unknown" {
-            if dev.get("device_id").and_then(|v| v.as_str()).is_none() {
-                dev["device_id"] = serde_json::Value::String(uuid::Uuid::new_v4().to_string());
-                dev["created_at"] = serde_json::Value::String(chrono::Utc::now().to_rfc3339());
-            }
-            dev["label"] = serde_json::Value::String(label);
-            std::fs::write(&dev_path, serde_json::to_string_pretty(&dev)?)?;
-        }
-    }
-
-    // Re-pointing a vault at a new relay must re-sync its EXISTING
-    // memories: sync_state.json remembers pushes against the old relay,
-    // so without a reset the daemon would only ever sync memories
-    // captured after the pair. Dropping it makes the next tick a full
-    // first sync (push everything local, pull everything remote).
-    let sync_state = vault_path.join("sync_state.json");
-    if sync_state.exists() {
-        std::fs::remove_file(&sync_state)?;
-    }
+    save_sync_credential(&vault_path, &server_url, api_key, &name)?;
 
     println!();
-    println!("  ✅ Paired! The relay issued a new API key — stored in {}", cfg_path.display());
+    println!("  ✅ Paired! The relay issued a new API key — stored in {}", vault_path.join("config.json").display());
     println!("     (the key is masked in all status output; it is not printed here)");
     if fresh_passphrase.is_some() {
         println!("     (vault created at {} — passphrase NOT stored on disk)", vault_path.display());
-        println!();
-        println!("  Next steps:");
-        println!("    1. Start the daemon (the passphrase is your vault key — keep it safe):");
-        println!("       ENGRAM_PASSPHRASE=\"<your passphrase>\" engramd --vault {}", vault_path.display());
-        println!("    2. The device appears in Account & Sync → Devices after its first sync.");
-    } else {
-        println!();
-        println!("  Next steps:");
-        println!("    1. Restart the daemon so it picks up the sync preset");
-        println!("       (with ENGRAM_PASSPHRASE set, as it already runs).");
-        println!("    2. The device appears in Account & Sync → Devices after its first sync.");
     }
+    print_sync_next_steps(fresh_passphrase.is_some(), &vault_path);
+    println!();
+
+    Ok(())
+}
+
+/// `engram link` — WARP-style one-click linking: mint an ephemeral X25519
+/// keypair, ask the relay for a link intent, open the confirm URL in the
+/// browser, and poll until the signed-in user clicks "Link this machine".
+/// The account key arrives sealed to our ephemeral keypair (never plaintext
+/// over the wire) and is decrypted exactly once, then stored exactly like
+/// `engram pair` stores it.
+pub async fn handle_link(
+    vault_opt: Option<PathBuf>,
+    server_url: String,
+    site: String,
+    name: Option<String>,
+    force: bool,
+) -> Result<()> {
+    println!();
+    println!("  ╔══════════════════════════════════════════╗");
+    println!("  ║   Engram — Link This Machine             ║");
+    println!("  ║   Your browser opens. One click. Done.   ║");
+    println!("  ╚══════════════════════════════════════════╝");
+    println!();
+
+    // Already linked? Re-linking orphans the old key (revocable at
+    // Account & Sync) — confirm intent unless --force.
+    if !force {
+        let default_path = home_dir().join(".engram").join("vault");
+        let vault_path = vault_opt.clone().unwrap_or(default_path);
+        let cfg = std::fs::read_to_string(vault_path.join("config.json"))
+            .ok()
+            .and_then(|data| serde_json::from_str::<serde_json::Value>(&data).ok());
+        if cfg
+            .as_ref()
+            .and_then(|c| c.get("sync"))
+            .and_then(|s| s.get("api_key"))
+            .and_then(|v| v.as_str())
+            .is_some()
+        {
+            anyhow::bail!(
+                "{} is already linked to an account.\n\
+                 Re-run with --force to replace the key (the old key stays active until\n\
+                 you revoke it in Account & Sync → API keys).",
+                vault_path.display()
+            );
+        }
+    }
+
+    let Some((vault_path, _existing, fresh_passphrase)) =
+        ensure_vault_for_sync(vault_opt, "link").await?
+    else {
+        return Ok(());
+    };
+
+    // Ephemeral keypair — the secret exists only for the life of this run
+    // and is dropped before the decrypted key is persisted.
+    let (sk_cli, pk_cli) = crate::link::generate_ephemeral_keypair();
+    let mut sk_cli = Some(sk_cli);
+    let pk_b64 = URL_SAFE_NO_PAD.encode(pk_cli.as_bytes());
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?;
+    let mut body = serde_json::json!({ "public_key": pk_b64 });
+    if let Some(ref n) = name {
+        body["device_label"] = serde_json::Value::String(n.clone());
+    }
+    let relay = server_url.trim_end_matches('/');
+    let resp = match client
+        .post(format!("{relay}/devices/link-intents"))
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            anyhow::bail!(
+                "cannot reach {server_url} ({e}).\n\
+                 Custom relays need --server-url <url>."
+            );
+        }
+    };
+    let intent: serde_json::Value = match resp.status().is_success() {
+        true => resp.json().await?,
+        false => {
+            let status = resp.status();
+            let err_body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+            let err_code = err_body
+                .get("code")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown_error");
+            match (status.as_u16(), err_code) {
+                (429, _) => anyhow::bail!("too many link attempts — wait a moment and try again."),
+                _ => anyhow::bail!("link failed: {err_code}"),
+            }
+        }
+    };
+    let intent_id = intent
+        .get("id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("relay response missing id"))?
+        .to_string();
+    let code = intent
+        .get("code")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("relay response missing code"))?
+        .to_string();
+    let relay_pk_bytes = URL_SAFE_NO_PAD
+        .decode(
+            intent
+                .get("relay_public_key")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("relay response missing relay_public_key"))?
+                .as_bytes(),
+        )
+        .map_err(|_| anyhow::anyhow!("relay_public_key is not base64url"))?;
+    let relay_pk: x25519_dalek::PublicKey = x25519_dalek::PublicKey::from(
+        <[u8; 32]>::try_from(relay_pk_bytes.as_slice())
+            .map_err(|_| anyhow::anyhow!("relay_public_key must be 32 bytes"))?,
+    );
+
+    let confirm_url = format!(
+        "{}/#/link/{}?code={}",
+        site.trim_end_matches('/'),
+        intent_id,
+        code
+    );
+    println!("  A browser tab is opening to link this machine to your Engram account.");
+    println!("  Sign in and click \"Link this machine\" — this window finishes on its own.");
+    println!();
+    println!("  {}", confirm_url);
+    println!();
+    crate::link::open_browser(&confirm_url);
+
+    // Poll for the seal: 2s cadence, ~10 minutes (matches the relay TTL).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(620);
+    let mut api_key: Option<String> = None;
+    while std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let resp = match client
+            .get(format!("{relay}/devices/link-intents/{intent_id}/status"))
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(_) => continue, // transient network hiccup — keep polling
+        };
+        match resp.status().as_u16() {
+            200 => {
+                let body: serde_json::Value = match resp.json().await {
+                    Ok(b) => b,
+                    Err(_) => continue,
+                };
+                match crate::link::parse_link_status(&body) {
+                    Ok(crate::link::LinkStatus::Confirmed { sealed_key, nonce }) => {
+                        let key = crate::link::decrypt_link_key(
+                            &intent_id,
+                            &relay_pk,
+                            sk_cli.as_ref().expect("keypair alive during poll"),
+                            &sealed_key,
+                            &nonce,
+                        )?;
+                        api_key = Some(key);
+                        break;
+                    }
+                    Ok(crate::link::LinkStatus::Pending) => continue,
+                    Err(_) => continue,
+                }
+            }
+            410 => anyhow::bail!("link expired or already claimed — run `engram link` again."),
+            404 => anyhow::bail!("the relay no longer knows this link — run `engram link` again."),
+            429 => continue, // polling faster than the bucket — next tick lands later
+            _ => continue,
+        }
+    }
+    let api_key = match api_key {
+        Some(k) => k,
+        None => anyhow::bail!(
+            "timed out waiting for the browser (10 minutes).\n\
+             The link expired — run `engram link` again."
+        ),
+    };
+    // The ephemeral secret has served its purpose — drop it before the
+    // decrypted key is written to disk.
+    drop(sk_cli.take());
+
+    save_sync_credential(&vault_path, &server_url, &api_key, &name)?;
+
+    println!();
+    println!("  ✅ Linked! The relay issued a new API key — stored in {}", vault_path.join("config.json").display());
+    println!("     (the key is masked in all status output; it is not printed here)");
+    if fresh_passphrase.is_some() {
+        println!("     (vault created at {} — passphrase NOT stored on disk)", vault_path.display());
+    }
+    print_sync_next_steps(fresh_passphrase.is_some(), &vault_path);
     println!();
 
     Ok(())
@@ -1630,7 +1886,7 @@ pub async fn handle_onboarding(bind: String) -> Result<()> {
     println!();
     println!("  Next steps:");
     println!("    1. Connect your AI tools:      engram mcp install");
-    println!("    2. Sync across devices:        engram pair <code-from-site>");
+    println!("    2. Sync across devices:        engram link");
     println!("    3. Revisit the setup anytime:  engram init");
     println!();
     Ok(())
