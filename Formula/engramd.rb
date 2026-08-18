@@ -1,11 +1,11 @@
 # Engram Memory Vault — Homebrew Formula
 #
 # Install:
-#   brew tap pixelphantomai/axiom-os
+#   brew tap El-AI-Intelligence/engram
 #   brew install engramd
 #
 # Or directly:
-#   brew install pixelphantomai/axiom-os/engramd
+#   brew install El-AI-Intelligence/engram/engramd
 
 class Engramd < Formula
   desc "Engram Memory Vault — Your AI deserves a memory"

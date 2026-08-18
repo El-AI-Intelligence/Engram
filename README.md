@@ -25,6 +25,16 @@ curl -fsSL https://engram.ellmstack.dev/install.sh | bash
 engram onboarding    # 5-minute setup: vault, first memory, running daemon
 ```
 
+Windows (PowerShell, no admin needed — auto-starts via Task Scheduler):
+
+```powershell
+iex (irm https://engram.ellmstack.dev/install.ps1)
+engram init          # answer Y to install the background service
+```
+
+macOS binaries are signed and notarized (Apple Developer ID). All platforms:
+the daemon auto-starts at login and syncs through your Engram account.
+
 Open `http://localhost:8787` — the vault UI walks you through onboarding.
 
 For AI tools, connect via MCP — one command writes the config for every

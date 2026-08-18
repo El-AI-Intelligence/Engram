@@ -8,13 +8,47 @@ curl -fsSL https://engram.ellmstack.dev/install.sh | bash
 
 This installs `engram` and `engramd` to `~/.local/bin`.
 
+## Windows (PowerShell)
+
+```powershell
+iex (irm https://engram.ellmstack.dev/install.ps1)
+```
+
+Installs to `~\.local\bin` (no admin rights), verifies the SHA-256 checksum,
+and adds the directory to your user PATH. Then:
+
+```powershell
+engram init              # create your vault — answer Y to install the service
+engram pair ENG-XXXX-XXXX   # link this machine to your account
+```
+
+The daemon runs as a **Task Scheduler task** (`Engramd`) that starts at logon
+and restarts itself if it crashes:
+
+```powershell
+Get-ScheduledTask Engramd            # check status
+Stop-ScheduledTask Engramd           # stop the daemon
+Start-ScheduledTask Engramd          # start it again
+Unregister-ScheduledTask Engramd     # remove the service
+```
+
+Logs: `~\.engram\daemon.log`. The vault passphrase lives in `~\.engram\env`
+(not in the scheduled task or any command line).
+
+> **SmartScreen note:** Windows binaries are unsigned. If SmartScreen blocks
+> the download, choose "More info" → "Run anyway".
+
 ## Alternative methods
 
 ### Homebrew (macOS/Linux)
 ```bash
-brew tap pixelphantomai/tap
+brew tap El-AI-Intelligence/engram
 brew install engramd
 ```
+
+macOS binaries from GitHub Releases are signed and notarized (Apple Developer
+ID), so Gatekeeper accepts them. If a binary from an old download ever gets a
+quarantine warning, clear it with `xattr -dr com.apple.quarantine <path>`.
 
 ### cargo (Rust)
 ```bash
