@@ -3,9 +3,9 @@
   "version": "0.1.0",
   "description": "Engram Memory Vault — SDK + CLI. Your AI deserves a memory.",
   "license": "MIT",
-  "author": "PixelPhantomAI",
-  "repository": "github:PixelPhantomAI/Axiom-OS",
-  "homepage": "https://github.com/PixelPhantomAI/Axiom-OS",
+  "author": "El-AI-Intelligence",
+  "repository": "github:El-AI-Intelligence/engram",
+  "homepage": "https://github.com/El-AI-Intelligence/engram",
   "keywords": [
     "memory",
     "ai",
@@ -52,7 +52,8 @@
   },
   "os": [
     "darwin",
-    "linux"
+    "linux",
+    "win32"
   ],
   "cpu": [
     "x64",

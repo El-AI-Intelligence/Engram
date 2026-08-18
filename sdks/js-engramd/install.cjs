@@ -8,23 +8,24 @@ const path = require("path");
 const https = require("https");
 const { execSync } = require("child_process");
 
-const VERSION = "0.1.0";
-const REPO = "PixelPhantomAI/Axiom-OS";
+const VERSION = require("./package.json").version;
+const REPO = "El-AI-Intelligence/engram";
 const BIN_DIR = path.join(__dirname, "bin");
 
 // ── Platform detection ─────────────────────────────────────────────────
 function getPlatform() {
-  const os = process.platform; // "darwin" | "linux"
+  const os = process.platform; // "darwin" | "linux" | "win32"
   const arch = process.arch; // "x64" | "arm64"
 
   if (os === "darwin" && arch === "x64") return "darwin-x86_64";
   if (os === "darwin" && arch === "arm64") return "darwin-arm64";
   if (os === "linux" && arch === "x64") return "linux-x86_64";
   if (os === "linux" && arch === "arm64") return "linux-arm64";
+  if (os === "win32" && arch === "x64") return "windows-x86_64";
 
   console.error(
     `engramd: unsupported platform ${os}-${arch}. ` +
-    `Only darwin-x64, darwin-arm64, linux-x64, linux-arm64 are supported.`
+    `Only darwin-x64, darwin-arm64, linux-x64, linux-arm64, windows-x64 are supported.`
   );
   process.exit(1);
 }
@@ -67,41 +68,53 @@ async function main() {
     return;
   }
 
-  // Check if binaries already exist
-  const engramBin = path.join(BIN_DIR, "engram");
-  const engramdBin = path.join(BIN_DIR, "engramd");
+  // Check if binaries already exist (Windows ships .exe names)
+  const binExt = process.platform === "win32" ? ".exe" : "";
+  const engramBin = path.join(BIN_DIR, `engram${binExt}`);
+  const engramdBin = path.join(BIN_DIR, `engramd${binExt}`);
   if (fs.existsSync(engramBin) && fs.existsSync(engramdBin)) {
     console.log("engramd: binaries already installed");
     return;
   }
 
   const platform = getPlatform();
-  const tarball = `engramd-${platform}.tar.gz`;
-  const url = `https://github.com/${REPO}/releases/download/v${VERSION}/${tarball}`;
+  const isWindows = platform.startsWith("windows");
+  const archive = `engramd-${platform}.${isWindows ? "zip" : "tar.gz"}`;
+  const url = `https://github.com/${REPO}/releases/download/v${VERSION}/${archive}`;
 
-  console.log(`engramd: downloading ${tarball}...`);
+  console.log(`engramd: downloading ${archive}...`);
 
   // Create bin directory
   fs.mkdirSync(BIN_DIR, { recursive: true });
 
-  const tarballPath = path.join(BIN_DIR, tarball);
+  const archivePath = path.join(BIN_DIR, archive);
 
   try {
-    await download(url, tarballPath);
+    await download(url, archivePath);
   } catch (err) {
     console.error(`engramd: failed to download binary: ${err.message}`);
     console.error(`engramd: you can install manually via cargo: cargo install engramd`);
     process.exit(1);
   }
 
-  // Extract
+  // Extract (Windows: bsdtar ships with Win10 1803+; Expand-Archive fallback)
   try {
-    execSync(`tar xzf "${tarballPath}" -C "${BIN_DIR}"`, { stdio: "pipe" });
-    fs.unlinkSync(tarballPath);
+    if (isWindows) {
+      try {
+        execSync(`tar -xf "${archivePath}" -C "${BIN_DIR}"`, { stdio: "pipe" });
+      } catch {
+        execSync(`powershell -NoProfile -Command "Expand-Archive -Force '${archivePath}' '${BIN_DIR}'"`, { stdio: "pipe" });
+      }
+    } else {
+      execSync(`tar xzf "${archivePath}" -C "${BIN_DIR}"`, { stdio: "pipe" });
+    }
+    fs.unlinkSync(archivePath);
 
-    // Make binaries executable
-    fs.chmodSync(engramBin, 0o755);
-    fs.chmodSync(engramdBin, 0o755);
+    // Make binaries executable (no-op on Windows)
+    if (!isWindows) {
+      fs.chmodSync(engramBin, 0o755);
+      fs.chmodSync(engramdBin, 0o755);
+    }
 
     console.log(`engramd ${VERSION} installed successfully`);
   } catch (err) {

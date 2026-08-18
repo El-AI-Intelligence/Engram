@@ -86,7 +86,9 @@ case "$(uname -s)" in
     *)
         echo -e "  ${RED}✗${RESET} Unsupported OS: $(uname -s)"
         echo "  Engram supports Linux and macOS."
-        echo "  On Windows, use WSL2 or: cargo install engramd"
+        echo "  On Windows, open PowerShell and run:"
+        echo "    iex (irm https://engram.ellmstack.dev/install.ps1)"
+        echo "  (or install from source: cargo install engramd)"
         exit 1
         ;;
 esac

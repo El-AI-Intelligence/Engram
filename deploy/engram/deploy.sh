@@ -71,7 +71,20 @@ echo "Synced landing page and vault UI to /srv/engram/"
 # ── One-command installer + public release binaries ──────────────────────────
 
 install -m 0644 "$REPO_ROOT/scripts/install.sh" /srv/engram/landing/install.sh
-echo "Published install.sh (https://engram.ellmstack.dev/install.sh)"
+install -m 0644 "$REPO_ROOT/scripts/install.ps1" /srv/engram/landing/install.ps1
+echo "Published install.sh + install.ps1 (https://engram.ellmstack.dev/install.sh)"
+
+# Optional: stage the CI-built Windows zip on the mirror (the server can't
+# build Windows binaries itself):
+#   ENGRAM_WINDOWS_ZIP_VERSION=v0.2.0 ./deploy/engram/deploy.sh -y
+if [[ -n "${ENGRAM_WINDOWS_ZIP_VERSION:-}" ]]; then
+  install -d -m 0755 /srv/engram/landing/releases
+  curl -fsSL "https://github.com/El-AI-Intelligence/engram/releases/download/${ENGRAM_WINDOWS_ZIP_VERSION}/engramd-windows-x86_64.zip" \
+    -o /srv/engram/landing/releases/engramd-windows-x86_64.zip
+  curl -fsSL "https://github.com/El-AI-Intelligence/engram/releases/download/${ENGRAM_WINDOWS_ZIP_VERSION}/engramd-windows-x86_64.zip.sha256" \
+    -o /srv/engram/landing/releases/engramd-windows-x86_64.zip.sha256
+  echo "Staged Windows release zip (${ENGRAM_WINDOWS_ZIP_VERSION}) on the mirror."
+fi
 
 if [[ -f "$REPO_ROOT/target/release/engram" && -f "$REPO_ROOT/target/release/engramd" && -f "$REPO_ROOT/target/release/engramd-mcp" ]]; then
   install -d -m 0755 /srv/engram/landing/releases
