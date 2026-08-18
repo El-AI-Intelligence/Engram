@@ -38,6 +38,11 @@ Logs: `~\.engram\daemon.log`. The vault passphrase lives in `~\.engram\env`
 > **SmartScreen note:** Windows binaries are unsigned. If SmartScreen blocks
 > the download, choose "More info" → "Run anyway".
 
+Building from source on Windows (`cargo install --git
+https://github.com/El-AI-Intelligence/engram engramd`) requires MSVC C++
+Build Tools, NASM, and Perl — the bundled SQLCipher links a vendored OpenSSL.
+The one-liner installer above avoids all of that (everything is compiled in).
+
 ## Alternative methods
 
 ### Homebrew (macOS/Linux)
