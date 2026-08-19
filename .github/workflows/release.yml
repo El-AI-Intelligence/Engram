@@ -113,7 +113,13 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
           sudo dpkg --add-architecture arm64
-          sudo apt-get update
+          # security.ubuntu.com has flaked twice in CI (apt update Err:9);
+          # retry the package-list fetch a few times before giving up.
+          for i in 1 2 3 4 5; do
+            sudo apt-get update && break
+            echo "apt update attempt $i failed — retrying in 15s"
+            sleep 15
+          done
           sudo apt-get install -y gcc-aarch64-linux-gnu libssl-dev:arm64
           # openssl-sys (via reqwest/hf-hub native-tls) must find an aarch64
           # OpenSSL; without these env vars pkg-config refuses cross builds.
