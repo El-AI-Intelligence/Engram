@@ -112,14 +112,35 @@ jobs:
       - name: Install cross-compilation deps (Linux ARM64)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
+          # The runner image proxies apt through GitHub's Azure cache
+          # (security.ubuntu.com resolves to 52.252.75.106) and that cache
+          # 404s EVERY binary-arm64 index file — deterministic, not a flake.
+          # Bypass it: drop the /etc/hosts mirror entries and replace the
+          # sources with the real Ubuntu archives.
+          sudo sed -i -e '/security\.ubuntu\.com/d' -e '/archive\.ubuntu\.com/d' /etc/hosts
+          sudo rm -f /etc/apt/apt-mirrors.txt /etc/apt/sources.list
+          sudo bash -c 'cat > /etc/apt/sources.list.d/ubuntu.sources <<EOF
+          Types: deb
+          URIs: http://archive.ubuntu.com/ubuntu/
+          Suites: noble noble-updates noble-backports
+          Components: main universe restricted multiverse
+          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+
+          Types: deb
+          URIs: http://security.ubuntu.com/ubuntu/
+          Suites: noble-security
+          Components: main universe restricted multiverse
+          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+          EOF'
           sudo dpkg --add-architecture arm64
-          # security.ubuntu.com has flaked twice in CI (apt update Err:9);
-          # retry the package-list fetch a few times before giving up.
+          # The network can still genuinely flake; retry a few times, then
+          # one hard attempt that fails the step if archives are unreachable.
           for i in 1 2 3 4 5; do
             sudo apt-get update && break
             echo "apt update attempt $i failed — retrying in 15s"
             sleep 15
           done
+          sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu libssl-dev:arm64
           # openssl-sys (via reqwest/hf-hub native-tls) must find an aarch64
           # OpenSSL; without these env vars pkg-config refuses cross builds.
@@ -166,7 +187,10 @@ jobs:
           security set-keychain-settings -lut 21600 "$KEYCHAIN"
           security unlock-keychain -p "ephemeral" "$KEYCHAIN"
           echo "$APPLE_CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/engram-cert.p12"
-          security import "$RUNNER_TEMP/engram-cert.p12" -k "$KEYCHAIN" -P "$APPLE_CERT_PASSWORD" -A -T /usr/bin/codesign -T /usr/bin/notarytool
+          # -T only for codesign: /usr/bin/notarytool no longer exists on the
+          # runner image (notarytool is invoked via xcrun), and security
+          # import fails hard on a missing -T path.
+          security import "$RUNNER_TEMP/engram-cert.p12" -k "$KEYCHAIN" -P "$APPLE_CERT_PASSWORD" -A -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "ephemeral" "$KEYCHAIN"
           echo "CODESIGN_KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
 
