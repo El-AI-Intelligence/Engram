@@ -95,6 +95,14 @@ if [[ -f "$REPO_ROOT/target/release/engram" && -f "$REPO_ROOT/target/release/eng
     && sha256sum engram-linux-x86_64 > engram-linux-x86_64.sha256 \
     && sha256sum engramd-linux-x86_64 > engramd-linux-x86_64.sha256 \
     && sha256sum engramd-mcp-linux-x86_64 > engramd-mcp-linux-x86_64.sha256 )
+  # GitHub-layout tarball: the exact asset shape scripts/install.sh downloads
+  # by default from GitHub Releases (three binaries at archive root + .sha256
+  # sidecar naming the tarball). Staging the same layout here keeps the
+  # ENGRAM_RELEASE_BASE site-mirror override working.
+  tar czf /srv/engram/landing/releases/engramd-linux-x86_64.tar.gz \
+    -C "$REPO_ROOT/target/release" engram engramd engramd-mcp
+  ( cd /srv/engram/landing/releases \
+    && sha256sum engramd-linux-x86_64.tar.gz > engramd-linux-x86_64.tar.gz.sha256 )
   echo "Published release binaries + SHA-256 checksums (the installer verifies them)."
 else
   echo "NOTE: release binaries not found (run: cargo build --release -p engramd -p engramd-mcp)."
