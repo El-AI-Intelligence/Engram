@@ -14,7 +14,7 @@ Built on the Axiom-OS kernel: FTS5 + vector + QEM holographic memory with biolog
 AI agents forget everything between sessions. Engram fixes that:
 
 - **Zero-knowledge encryption** — AES-256 (SQLCipher). Memories never leave your machine in plaintext; even a self-hosted sync server can't read them.
-- **Semantic search** — auto-downloads an ONNX embedding model on first run (~23MB). Find memories by meaning, not just keywords. Zero config, no Ollama.
+- **Semantic search** — auto-downloads a local BERT embedding model (all-MiniLM-L6-v2, ~23MB) on first run. Find memories by meaning, not just keywords. Zero config, no Ollama.
 - **AI-native API** — REST + WebSocket + MCP server. Claude Code, Cursor, Windsurf — one command to connect your AI tools.
 - **Memory hygiene** — automatic decay, strengthening, and consolidation. Important memories get stronger; noise fades away.
 - **Weekly digest** — "what your AI learned about you this week": new/reinforced/fading memories, themes clustered from local embeddings. Fully local and free; optional AI-written prose via your own BYO-key endpoint (`engram digest`, or the Digest tab in the vault UI).
@@ -24,8 +24,9 @@ AI agents forget everything between sessions. Engram fixes that:
 ## Quick start
 
 Binaries are published on **GitHub Releases** — the primary download location
-for all platforms (Linux, macOS signed/notarized, Windows), each with SHA-256
-checksums: https://github.com/El-AI-Intelligence/engram/releases
+for all platforms (Linux, macOS, Windows), each with SHA-256 checksums:
+https://github.com/El-AI-Intelligence/engram/releases
+The first release, v0.1.0, lands with the public launch.
 
 The one-liner below is the same download, wrapped for convenience (it pulls
 the latest release from GitHub):
@@ -43,10 +44,13 @@ iex (irm https://engram.ellmstack.dev/install.ps1)
 engram init          # answer Y to install the background service
 ```
 
-macOS binaries are signed and notarized (Apple Developer ID). All platforms:
-the daemon auto-starts at login and syncs through your Engram account.
+The release pipeline signs and notarizes macOS binaries (Apple Developer ID).
+All platforms: the daemon auto-starts at login (enable it with `engram init`)
+and, once linked, syncs through your Engram account.
 
-Open `http://localhost:8787` — the vault UI walks you through onboarding.
+Your daemon runs at `http://localhost:8787` (REST/WS API). For the visual
+vault UI, open https://engram.ellmstack.dev/app — it connects to your local
+daemon.
 
 For AI tools, connect via MCP — one command writes the config for every
 supported editor (Claude Desktop, Cursor, Windsurf), merging with whatever
@@ -68,9 +72,9 @@ Or from source: `cargo install --path crates/engramd` (also provides the `engram
 |---|---|
 | `crates/axiom-engram/` | The kernel: schema, FTS5 + vector store, QEM holographic memory, decay/consolidation, E2E sync primitives |
 | `crates/axiom-inference/` | Inference backends (ONNX Runtime, llama.cpp — optional features) |
-| `crates/engramd/` | The daemon: axum REST + WebSocket API, auth, privacy routes, sync client, static UI serving |
+| `crates/engramd/` | The daemon: axum REST + WebSocket API, auth, privacy routes, sync client, static UI serving (`--ui-dir`) |
 | `crates/engramd-sync/` | Sync relay server — a stateless, encrypted-blob "dumb pipe" (self-hostable) |
-| `crates/engramd-mcp/` | MCP server exposing capture/search/link/context tools to AI agents |
+| `crates/engramd-mcp/` | MCP server exposing capture/search/context tools to AI agents |
 | `ui/engram-vault/` | The vault web UI (vanilla JS SPA, no build step) |
 | `ui/landing/` | Landing page |
 | `sdks/python-engramd/` | Python client + MCP server with passive auto-capture observer |
