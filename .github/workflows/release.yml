@@ -116,7 +116,10 @@ jobs:
           # (security.ubuntu.com resolves to 52.252.75.106) and that cache
           # 404s EVERY binary-arm64 index file — deterministic, not a flake.
           # Bypass it: drop the /etc/hosts mirror entries and replace the
-          # sources with the real Ubuntu archives.
+          # sources with the real Ubuntu archives. NOTE: arm64 is a PORT
+          # architecture — its Packages live on ports.ubuntu.com, not on
+          # archive.ubuntu.com/security.ubuntu.com (those 404 binary-arm64
+          # for real). Constrain each source to the arch it actually serves.
           sudo sed -i -e '/security\.ubuntu\.com/d' -e '/archive\.ubuntu\.com/d' /etc/hosts
           sudo rm -f /etc/apt/apt-mirrors.txt /etc/apt/sources.list
           sudo bash -c 'cat > /etc/apt/sources.list.d/ubuntu.sources <<EOF
@@ -124,12 +127,21 @@ jobs:
           URIs: http://archive.ubuntu.com/ubuntu/
           Suites: noble noble-updates noble-backports
           Components: main universe restricted multiverse
+          Architectures: amd64
           Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
 
           Types: deb
           URIs: http://security.ubuntu.com/ubuntu/
           Suites: noble-security
           Components: main universe restricted multiverse
+          Architectures: amd64
+          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+
+          Types: deb
+          URIs: http://ports.ubuntu.com/ubuntu-ports/
+          Suites: noble noble-updates noble-backports noble-security
+          Components: main universe restricted multiverse
+          Architectures: arm64
           Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
           EOF'
           sudo dpkg --add-architecture arm64
