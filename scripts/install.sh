@@ -4,28 +4,30 @@
 #
 #     curl -fsSL https://engram.ellmstack.dev/install.sh | bash
 #
-# Downloads the latest prebuilt Linux x86_64 release binaries, verifies their
-# SHA-256 checksums, and installs them into ~/.local/bin (override with
-# INSTALL_DIR). Staged on the live site by deploy/engram/deploy.sh.
+# Downloads the latest Linux x86_64 release from GitHub Releases (by default),
+# verifies its SHA-256 checksum, and installs the binaries into ~/.local/bin
+# (override with INSTALL_DIR). Override the download base with
+# ENGRAM_RELEASE_BASE (e.g. the site mirror https://engram.ellmstack.dev/releases).
+# Staged on the live site by deploy/engram/deploy.sh.
 #
-# Other platforms: build from source once the repo is public —
-# https://github.com/El-AI-Intelligence/engram.
+# Other platforms: macOS/Windows assets and installers on GitHub Releases —
+# https://github.com/El-AI-Intelligence/engram/releases.
 #
 # No sudo, no secrets, no telemetry. Everything installed is MIT open source.
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
-RELEASE_BASE="${ENGRAM_RELEASE_BASE:-https://engram.ellmstack.dev/releases}"
+RELEASE_BASE="${ENGRAM_RELEASE_BASE:-https://github.com/El-AI-Intelligence/engram/releases/latest/download}"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
 
 if [[ "$(uname -s)" != "Linux" || "$(uname -m)" != "x86_64" ]]; then
   echo "Prebuilt binaries currently ship for Linux x86_64 only." >&2
-  echo "For other platforms, build from source once the repo is public:" >&2
-  echo "  https://github.com/El-AI-Intelligence/engram" >&2
+  echo "macOS and Windows assets are on GitHub Releases:" >&2
+  echo "  https://github.com/El-AI-Intelligence/engram/releases" >&2
   exit 1
 fi
 
-for dep in curl sha256sum; do
+for dep in curl sha256sum tar; do
   command -v "$dep" >/dev/null 2>&1 || { echo "ERROR: $dep is required." >&2; exit 1; }
 done
 
@@ -34,14 +36,22 @@ trap 'rm -rf "$tmpdir"' EXIT
 
 mkdir -p "$INSTALL_DIR"
 
+# Linux x86_64 release asset: all three binaries ship in one tarball, named
+# exactly as uploaded by .github/workflows/release.yml.
+asset="engramd-linux-x86_64.tar.gz"
+
+echo "→ Downloading $asset…"
+curl -fsSL "$RELEASE_BASE/$asset" -o "$tmpdir/$asset"
+# Downloaded under the FULL asset name so sha256sum -c matches the filename
+# recorded in the .sha256 sidecar.
+curl -fsSL "$RELEASE_BASE/$asset.sha256" -o "$tmpdir/$asset.sha256"
+( cd "$tmpdir" && sha256sum -c "$asset.sha256" ) >/dev/null
+
+echo "→ Extracting…"
+tar xzf "$tmpdir/$asset" -C "$tmpdir"
+
 for bin in engram engramd engramd-mcp; do
-  # Downloaded under the FULL artifact name so sha256sum -c matches the
-  # filenames recorded in the .sha256 files.
-  echo "→ Downloading $bin…"
-  curl -fsSL "$RELEASE_BASE/$bin-linux-x86_64" -o "$tmpdir/$bin-linux-x86_64"
-  curl -fsSL "$RELEASE_BASE/$bin-linux-x86_64.sha256" -o "$tmpdir/$bin-linux-x86_64.sha256"
-  ( cd "$tmpdir" && sha256sum -c "$bin-linux-x86_64.sha256" ) >/dev/null
-  install -m 0755 "$tmpdir/$bin-linux-x86_64" "$INSTALL_DIR/$bin"
+  install -m 0755 "$tmpdir/$bin" "$INSTALL_DIR/$bin"
   echo "✓ Installed $bin ($INSTALL_DIR/$bin)"
 done
 

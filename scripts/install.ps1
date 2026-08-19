@@ -5,16 +5,17 @@
 # or:
 #   powershell -ExecutionPolicy Bypass -File install.ps1
 #
-# Downloads engramd-windows-x86_64.zip, verifies its sha256 sidecar, and
-# installs engram.exe / engramd.exe / engramd-mcp.exe. Never touches secrets;
-# the vault passphrase is entered interactively by `engram init` later.
+# Downloads engramd-windows-x86_64.zip from GitHub Releases (by default —
+# override with the ENGRAM_RELEASE_BASE env var), verifies its sha256 sidecar,
+# and installs engram.exe / engramd.exe / engramd-mcp.exe. Never touches
+# secrets; the vault passphrase is entered interactively by `engram init` later.
 
 $ErrorActionPreference = 'Stop'
 
 # PowerShell 5.1 defaults to TLS 1.0 for Invoke-WebRequest — modern servers refuse it.
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$ReleaseBase = if ($env:ENGRAM_RELEASE_BASE) { $env:ENGRAM_RELEASE_BASE } else { "https://engram.ellmstack.dev/releases" }
+$ReleaseBase = if ($env:ENGRAM_RELEASE_BASE) { $env:ENGRAM_RELEASE_BASE } else { "https://github.com/El-AI-Intelligence/engram/releases/latest/download" }
 $InstallDir  = if ($env:ENGRAM_INSTALL_DIR)  { $env:ENGRAM_INSTALL_DIR }  else { Join-Path $env:USERPROFILE ".local\bin" }
 $ZipName     = "engramd-windows-x86_64.zip"
 
