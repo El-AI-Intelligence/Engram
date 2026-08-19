@@ -258,19 +258,30 @@ jobs:
     name: Publish to crates.io
     runs-on: ubuntu-latest
     needs: [build, release]
-    # Only when a CRATES_IO_TOKEN secret exists — publishing is optional;
-    # set the token (crates.io → Account Settings → API Tokens) and the next
-    # tag push publishes automatically. Never blocks a release.
-    if: github.ref_type == 'tag' && secrets.CRATES_IO_TOKEN != ''
+    if: github.ref_type == 'tag'
+    env:
+      # Publishing is optional: without a CRATES_IO_TOKEN secret the steps
+      # below no-op. (secrets can't be referenced in a job-level `if` —
+      # that makes the whole workflow fail to evaluate — so surface it as
+      # env and gate each step.)
+      HAS_CRATES_TOKEN: ${{ secrets.CRATES_IO_TOKEN != '' }}
 
     steps:
+      - name: Skip (no crates.io token)
+        if: env.HAS_CRATES_TOKEN != 'true'
+        run: echo "CRATES_IO_TOKEN secret not set — skipping crates.io publish."
+
       - uses: actions/checkout@v4
+        if: env.HAS_CRATES_TOKEN == 'true'
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        if: env.HAS_CRATES_TOKEN == 'true'
 
       - name: Publish axiom-engram
+        if: env.HAS_CRATES_TOKEN == 'true'
         run: cargo publish -p axiom-engram --token ${{ secrets.CRATES_IO_TOKEN }}
 
       - name: Publish engramd
+        if: env.HAS_CRATES_TOKEN == 'true'
         run: cargo publish -p engramd --token ${{ secrets.CRATES_IO_TOKEN }}
