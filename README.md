@@ -1,5 +1,8 @@
 # Engram — Your AI deserves a memory.
 
+[![GitHub release](https://img.shields.io/github/v/release/El-AI-Intelligence/engram?label=latest%20release)](https://github.com/El-AI-Intelligence/engram/releases)
+[![GitHub stars](https://img.shields.io/github/stars/El-AI-Intelligence/engram)](https://github.com/El-AI-Intelligence/engram)
+
 A **local-first, end-to-end encrypted memory vault** that gives AI agents persistent recall across sessions. Your AI remembers conversations, decisions, and context — without the memory ever leaving your machine in plaintext.
 
 Built on the Axiom-OS kernel: FTS5 + vector + QEM holographic memory with biological decay, strengthening, and consolidation.
@@ -19,6 +22,13 @@ AI agents forget everything between sessions. Engram fixes that:
 - **Privacy controls** — full audit trail, purge by criteria, retention policies. You control what's stored and for how long.
 
 ## Quick start
+
+Binaries are published on **GitHub Releases** — the primary download location
+for all platforms (Linux, macOS signed/notarized, Windows), each with SHA-256
+checksums: https://github.com/El-AI-Intelligence/engram/releases
+
+The one-liner below is the same download, wrapped for convenience (it pulls
+the latest release from GitHub):
 
 ```bash
 curl -fsSL https://engram.ellmstack.dev/install.sh | bash
@@ -76,7 +86,7 @@ Or from source: `cargo install --path crates/engramd` (also provides the `engram
 - [API_SURFACE.md](docs/engram-product/API_SURFACE.md) — REST/WS API contract
 - [REVENUE_ROADMAP.md](docs/engram-product/REVENUE_ROADMAP.md) — the plan for paid layers (cloud sync, team memory) on top of the MIT core
 
-Live site: https://engram.ellmstack.dev
+Live site: https://engram.ellmstack.dev — and if Engram is useful, a ⭐ on GitHub is the best signal: [github.com/El-AI-Intelligence/engram](https://github.com/El-AI-Intelligence/engram)
 
 ## License
 

@@ -46,8 +46,35 @@ The site box has **no git checkout** — `/root/engram/` is a plain copy:
 rsync `ui/`, `scripts/`, `deploy/`, and `target/release/` binaries from a dev
 machine, then run `./deploy/engram/deploy.sh -y`. Note the systemd unit runs
 `/root/engram/engramd` while deploy.sh installs to `/usr/local/bin/` — copy
-the unit's binary by hand (stop the service first, or you get "Text file
-busy").
+the unit's binary by hand first, so the restart boots the new build.
+
+The exact procedure (from a dev machine with the repo at HEAD, then on the box):
+
+```bash
+# dev machine — NO trailing slashes: a trailing slash flattens the CONTENTS
+# into /root/engram/ and silently leaves /root/engram/ui/ (what deploy.sh
+# reads) stale. This is the #1 way the site ends up serving yesterday's UI.
+rsync -a --chown=root:root -e ssh ui deploy scripts root@204.168.163.161:/root/engram/
+scp target/release/engramd target/release/engram target/release/engramd-mcp \
+    root@204.168.163.161:/root/engram/target/release/
+
+# box — backup the unit's binary (house convention), swap, then deploy
+ssh root@204.168.163.161
+cp -p /root/engram/engramd /root/engram/engramd.bak-$(date +%Y%m%d)
+install -m 0755 /root/engram/target/release/engramd /root/engram/engramd
+cd /root/engram && ./deploy/engram/deploy.sh -y
+```
+
+`install` swaps the binary while the daemon runs (rename, no "Text file
+busy"); the deploy.sh restart then boots the new build. The real vault on
+this box lives at `/root/engram/vault` (the unit is host-specific — the
+generic `/var/lib/engram` paths below are for a fresh host).
+
+**2026-08-18 incident:** the deploy was run on the wrong machine (a home
+workstation, not this box) and the site kept serving the old `main.js` —
+symptom: served file hash ≠ deployed file hash while the site still
+answers. Check `/srv/engram/vault/js/main.js` ON THE SITE BOX first; if the
+box file is new but the served one is old, someone deployed elsewhere.
 
 ## Cloudflare
 
