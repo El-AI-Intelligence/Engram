@@ -206,6 +206,13 @@ jobs:
           security create-keychain -p "ephemeral" "$KEYCHAIN"
           security set-keychain-settings -lut 21600 "$KEYCHAIN"
           security unlock-keychain -p "ephemeral" "$KEYCHAIN"
+          # codesign resolves KEY items through the user search list on
+          # newer macOS: a keychain passed only via --keychain yields
+          # "<hash>: no identity found" even though find-identity lists
+          # the identity in it. Add to the search list and make default.
+          security list-keychains -d user -s "$KEYCHAIN" "$(security list-keychains -d user | sed 's/\"//g')"
+          security default-keychain -d user -s "$KEYCHAIN"
+          security unlock-keychain -p "ephemeral" "$KEYCHAIN"
           echo "$APPLE_CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/engram-cert.p12"
           # -T only for codesign: /usr/bin/notarytool no longer exists on the
           # runner image (notarytool is invoked via xcrun), and security
