@@ -276,7 +276,28 @@ impl McpServer {
             .json(&body)
             .send()
             .await
-            .map_err(|e| format!("engramd unreachable: {e}"))?
+            .map_err(|e| format!("engramd unreachable: {e}"))?;
+
+        // A rejection (401/403 when the daemon is API-keyed) must surface the
+        // daemon's own message — previously the error body parsed as JSON and
+        // fell through to a false "captured successfully (ID: unknown)".
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let parsed = resp.json::<Value>().await.unwrap_or(Value::Null);
+            let msg = parsed
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("the daemon rejected the capture");
+            return Ok(json!({
+                "content": [{
+                    "type": "text",
+                    "text": format!("Capture failed ({status}): {msg}")
+                }],
+                "isError": true,
+            }));
+        }
+
+        let resp = resp
             .json::<Value>()
             .await
             .map_err(|e| format!("parse error: {e}"))?;
@@ -575,4 +596,85 @@ fn emit(stdout: &std::io::Stdout, response: &JsonRpcResponse) {
     }
     // Flush every message so the MCP client receives it immediately
     let _ = out.flush();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use tokio::io::AsyncWriteExt;
+
+    /// Spin a raw TCP stub that answers every request with one canned HTTP
+    /// response (status line + JSON body, content-length computed here so it
+    /// always matches) and return its base URL.
+    async fn spawn_http_stub(status_line: &'static str, body: &'static str) -> String {
+        let response = Arc::new(
+            format!(
+                "HTTP/1.1 {status_line}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .into_bytes(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("ephemeral bind");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let response = response.clone();
+                tokio::spawn(async move {
+                    let _ = sock.write_all(&response).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// A daemon rejection must be reported as a capture failure carrying the
+    /// daemon's own message — never as a silent success.
+    #[tokio::test]
+    async fn capture_reports_daemon_rejection() {
+        let url = spawn_http_stub(
+            "401 Unauthorized",
+            r#"{"error":"invalid API key","code":"unauthorized"}"#,
+        )
+        .await;
+        let server = McpServer::new(url);
+        let result = server
+            .capture(&json!({"content": "hello"}))
+            .await
+            .expect("tool returns Ok");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("401"), "must name the status: {text}");
+        assert!(
+            text.contains("invalid API key"),
+            "must surface the daemon error body: {text}"
+        );
+        assert_eq!(
+            result["isError"], json!(true),
+            "must flag the tool result as an error"
+        );
+    }
+
+    /// The happy path still reports the stored id now that the status gate
+    /// sits in front of the body parse.
+    #[tokio::test]
+    async fn capture_reports_id_on_success() {
+        let url = spawn_http_stub("200 OK", r#"{"id":"mem_123"}"#).await;
+        let server = McpServer::new(url);
+        let result = server
+            .capture(&json!({"content": "hello"}))
+            .await
+            .expect("tool returns Ok");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("mem_123"), "must report the id: {text}");
+        assert!(
+            result.get("isError").is_none(),
+            "success must not be flagged as an error"
+        );
+    }
 }

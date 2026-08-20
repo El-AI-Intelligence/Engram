@@ -1592,6 +1592,16 @@ impl EngramStore {
             params.push(p.to_string());
         }
         if let Some(d) = before_date {
+            // `created_at < ?` is a lexical comparison against stored RFC3339
+            // timestamps — a non-timestamp string ("z", "today", …) sorts
+            // AFTER every real date and would match the whole vault. Guard
+            // here as the store-level backstop (the HTTP route validates
+            // earlier and maps this to a 400).
+            if chrono::DateTime::parse_from_rfc3339(d).is_err() {
+                return Err(EngramError::Validation(format!(
+                    "before_date must be an RFC3339 timestamp (e.g. 2026-08-01T00:00:00Z), got: {d}"
+                )));
+            }
             conditions.push(format!("created_at < ?{}", params.len() + 1));
             params.push(d.to_string());
         }
@@ -2468,6 +2478,48 @@ mod tests {
         assert!(w.new[0].strength >= w.new[1].strength, "new sorted by strength desc");
         assert_eq!(w.reinforced[0].content, "reinforced memory from the old project");
         assert_eq!(w.fading[0].content, "fading note from the old project");
+    }
+
+    /// A non-RFC3339 `before_date` must be rejected up front — a lexical
+    /// `created_at < 'z'` comparison would otherwise match every stored
+    /// timestamp and purge the whole vault.
+    #[tokio::test]
+    async fn purge_before_date_rejects_non_timestamp() {
+        let (store, _dir) = test_store().await;
+        let err = store
+            .purge_by_criteria(None, None, None, Some("z"))
+            .await
+            .expect_err("non-RFC3339 before_date must be rejected");
+        assert!(
+            matches!(err, EngramError::Validation(_)),
+            "expected Validation error, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("RFC3339"),
+            "error should name the accepted format"
+        );
+
+        // A valid timestamp still purges — and must not match memories
+        // created after it.
+        let now = chrono::Utc::now();
+        let mut old = make_engram("decision captured long ago for purge");
+        old.created_at = now - chrono::Duration::days(14);
+        let old_id = old.id.clone();
+        let fresh = make_engram("recent observation that must survive");
+        store.write(&old).await.unwrap();
+        store.write(&fresh).await.unwrap();
+
+        let cutoff = (now - chrono::Duration::days(7)).to_rfc3339();
+        let deleted = store
+            .purge_by_criteria(None, None, None, Some(&cutoff))
+            .await
+            .expect("valid RFC3339 before_date must purge");
+        assert_eq!(deleted, 1, "only the old memory matches the cutoff");
+        assert!(
+            matches!(store.get(&old_id).await, Err(EngramError::NotFound(_))),
+            "the old memory must be gone"
+        );
+        assert!(store.get(&fresh.id).await.is_ok(), "the fresh memory must survive");
     }
 
     fn make_engram(content: &str) -> Engram {

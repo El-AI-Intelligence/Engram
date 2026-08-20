@@ -250,6 +250,10 @@ fn privacy_audit_returns_expected_shape() {
     assert_eq!(status, StatusCode::OK);
     assert!(body.get("total_memories").is_some());
     assert!(body.get("breakdown").is_some());
+    // The dashboard must report real values, not TODO placeholders — a fresh
+    // vault without sync config is local-only.
+    assert_eq!(body["sync_enabled"], json!(false));
+    assert_eq!(body["local_only"], json!(true));
 }
 
 #[test]
@@ -258,6 +262,25 @@ fn privacy_purge_requires_criteria() {
     let (status, body) = post(&srv.url("/privacy/purge"), json!({}));
     assert!(status.is_client_error());
     assert!(body["error"]["message"].as_str().unwrap_or("").contains("criterion"));
+}
+
+/// A non-timestamp `before_date` must 400 before anything is deleted — a
+/// lexical `created_at < "z"` comparison would match every stored timestamp.
+#[test]
+fn privacy_purge_rejects_non_timestamp_before_date() {
+    let srv = api();
+    post(&srv.url("/memories"), json!({"content": "Test A", "source": "test-a"}));
+
+    let (status, body) = post(&srv.url("/privacy/purge"), json!({"before_date": "z"}));
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body["error"]["message"].as_str().unwrap_or("").contains("RFC3339"),
+        "rejection must name the accepted format"
+    );
+
+    // Vault intact.
+    let (_, audit) = get(&srv.url("/privacy/audit"));
+    assert_eq!(audit["total_memories"], json!(1), "nothing may be deleted");
 }
 
 // ── Sync status ──────────────────────────────────────────────────────────

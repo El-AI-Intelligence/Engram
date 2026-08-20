@@ -214,8 +214,8 @@ async fn audit(
         "db_size_bytes": db_size_bytes,
         "estimated_db_size_human": format_size(db_size_bytes),
         "retention_days": retention_days,
-        "sync_enabled": false, // TODO: read from config
-        "local_only": true,    // TODO: read from config
+        "sync_enabled": state.sync_enabled,
+        "local_only": !state.sync_enabled,
     })))
 }
 
@@ -254,6 +254,21 @@ async fn purge(
         ));
     }
 
+    // `before_date` feeds a lexical SQL comparison against stored RFC3339
+    // timestamps — a non-timestamp string ("z", "today", …) sorts AFTER every
+    // real date and would match the entire vault. Validate before anything
+    // touches the store.
+    if let Some(d) = &req.before_date {
+        if chrono::DateTime::parse_from_rfc3339(d).is_err() {
+            return Err(err_json(
+                400,
+                format!(
+                    "before_date must be an RFC3339 timestamp (e.g. 2026-08-01T00:00:00Z), got: {d}"
+                ),
+            ));
+        }
+    }
+
     let vault = state.vault.lock().await;
     let count = vault
         .purge_by_criteria(
@@ -263,13 +278,9 @@ async fn purge(
             req.before_date.as_deref(),
         )
         .await
-        .map_err(|e| {
-            let msg = e.to_string();
-            if msg.contains("At least one purge criterion") {
-                err_json(400, msg)
-            } else {
-                err_json(500, format!("Purge failed: {msg}"))
-            }
+        .map_err(|e| match e {
+            axiom_engram::EngramError::Validation(msg) => err_json(400, msg),
+            other => err_json(500, format!("Purge failed: {other}")),
         })?;
 
     Ok(Json(serde_json::json!({
