@@ -37,13 +37,11 @@ for plat in darwin-arm64 darwin-x86_64 linux-arm64 linux-x86_64; do
   fi
 done
 
-# Rewrite placeholders in the formula's four sha256 lines, in platform order.
-perl -0pi \
-  -e 's/(engramd-darwin-arm64\.tar\.gz"\n\s*)sha256 "[^"]*"/$1sha256 "'"${SHA[darwin-arm64]}"'"/' \
-  -e 's/(engramd-darwin-x86_64\.tar\.gz"\n\s*)sha256 "[^"]*"/$1sha256 "'"${SHA[darwin-x86_64]}"'"/' \
-  -e 's/(engramd-linux-arm64\.tar\.gz"\n\s*)sha256 "[^"]*"/$1sha256 "'"${SHA[linux-arm64]}"'"/' \
-  -e 's/(engramd-linux-x86_64\.tar\.gz"\n\s*)sha256 "[^"]*"/$1sha256 "'"${SHA[linux-x86_64]}"'"/' \
-  "$FORMULA"
+# Rewrite the four sha256 placeholders in file order (the formula lists
+# platforms in the same order as the fetch loop above).
+export FORMULA_SHA1="${SHA[darwin-arm64]}" FORMULA_SHA2="${SHA[darwin-x86_64]}" \
+       FORMULA_SHA3="${SHA[linux-arm64]}"   FORMULA_SHA4="${SHA[linux-x86_64]}"
+perl -0pi -e 'my @sha = @ENV{qw(FORMULA_SHA1 FORMULA_SHA2 FORMULA_SHA3 FORMULA_SHA4)}; s/PLACEHOLDER_UPDATE_ON_RELEASE/shift @sha/ge' "$FORMULA"
 
 if grep -q "PLACEHOLDER_UPDATE_ON_RELEASE" "$FORMULA"; then
   echo "ERROR: placeholders remain in ${FORMULA} — rewrite did not match." >&2
