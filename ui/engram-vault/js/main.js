@@ -16,7 +16,7 @@ function daemonApiBase() {
   if (saved) return saved;
   if (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1' || window.location.hostname === '[::1]') return '';
   if (hasAuth()) return '';  // box console: same-origin via Caddy
-  return 'http://127.0.0.1:8799';  // public site: the user's loopback daemon
+  return 'http://127.0.0.1:8787';  // public site: the user's loopback daemon
 }
 
 // Chrome 142+ Local Network Access: a public site fetching a loopback
@@ -268,7 +268,7 @@ function resumePendingHandoff() {
   const p = pendingHandoff();
   if (!p || !localStorage.getItem('engram-sync-session')) return false;
   sessionStorage.removeItem(HANDOFF_PENDING_KEY);
-  navigate('#/handoff/' + encodeURIComponent(p.token) + '?daemon=' + encodeURIComponent(p.daemon || '127.0.0.1:8799'));
+  navigate('#/handoff/' + encodeURIComponent(p.token) + '?daemon=' + encodeURIComponent(p.daemon || '127.0.0.1:8787'));
   return true;
 }
 
@@ -1463,11 +1463,11 @@ route('/handoff/:token', (token) => {
   // The router's `:token` capture runs to the end of the hash, so a
   // `?daemon=...` suffix lands INSIDE the token string; the daemon then
   // sees a mangled token and reports it as expired/unknown. Strip the
-  // query part — daemon defaults to 127.0.0.1:8799 anyway.
+  // query part — daemon defaults to 127.0.0.1:8787 anyway.
   token = token.split('?')[0];
   const app = document.getElementById('app');
   const ACCT = 'https://sync.ellmstack.dev';
-  const daemon = (window.location.hash.match(/[?&]daemon=([^&]+)/) || [])[1] || '127.0.0.1:8799';
+  const daemon = (window.location.hash.match(/[?&]daemon=([^&]+)/) || [])[1] || '127.0.0.1:8787';
   const daemonOrigin = 'http://' + daemon;
   const fail = (msg) => {
     app.innerHTML = `

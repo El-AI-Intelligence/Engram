@@ -74,11 +74,21 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or_else(|_| EnvFilter::new("info")))
         .init();
 
-    // Resolve --env-file before clap parses, so ENGRAM_* values from the
-    // file (e.g. ENGRAM_PASSPHRASE) are visible to clap's env feature and
-    // to everything after. Real env vars and CLI flags always win.
+    // Resolve the passphrase source before clap parses, so ENGRAM_* values
+    // from the file (e.g. ENGRAM_PASSPHRASE) are visible to clap's env
+    // feature and to everything after. Real env vars and CLI flags always
+    // win. Explicit --env-file / ENGRAM_ENV_FILE takes precedence; without
+    // one, a DAEMON start (`engramd` with no subcommand, or `engram daemon`)
+    // auto-loads ~/.engram/env when it exists — that file is where init /
+    // join / pair / link save the passphrase, so the daemon syncs after
+    // restarts without re-typing. Other subcommands never load it.
     if let Some(path) = env_file_from_args() {
         envfile::load_env_file(&path)?;
+    } else if daemon_mode_requested() {
+        let default_env = user_home_dir().join(".engram").join("env");
+        if default_env.exists() {
+            envfile::load_env_file(&default_env)?;
+        }
     }
 
     let cli = Cli::parse();
@@ -87,7 +97,15 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Some(cmd) => dispatch_cli(cmd).await,
-        None if is_engramd => run_daemon(cli.vault, cli.bind, cli.passphrase, cli.ui_dir).await,
+        None if is_engramd => {
+            run_daemon(
+                cli::default_daemon_vault(&cli.vault),
+                cli.bind,
+                cli.passphrase,
+                cli.ui_dir,
+            )
+            .await
+        }
         None => {
             // `engram` with no subcommand — print help
             Cli::parse_from(["engram", "--help"]);
@@ -128,13 +146,48 @@ fn env_file_from_args() -> Option<PathBuf> {
     std::env::var_os("ENGRAM_ENV_FILE").map(PathBuf::from)
 }
 
+/// True when this invocation starts the daemon: bare `engramd` (legacy
+/// top-level flags, no subcommand), or `engram daemon`. Pre-parse argv
+/// scan — clap hasn't run yet, so a passphrase from ~/.engram/env would
+/// not be visible to its env feature otherwise.
+fn daemon_mode_requested() -> bool {
+    let mut args = std::env::args().skip(1).peekable();
+    let mut saw_subcommand = false;
+    while let Some(arg) = args.next() {
+        if arg.starts_with('-') {
+            // Value-taking legacy/top-level flags: skip their value so it
+            // is never mistaken for a subcommand name.
+            const VALUE_FLAGS: &[&str] = &[
+                "--vault", "-v", "--bind", "-b", "--passphrase", "-p", "--env-file", "--ui-dir",
+            ];
+            if VALUE_FLAGS.contains(&arg.as_str()) {
+                args.next();
+            }
+            continue;
+        }
+        if arg == "daemon" {
+            return true;
+        }
+        saw_subcommand = true;
+    }
+    !saw_subcommand && invoked_as_engramd()
+}
+
+/// $HOME (or $USERPROFILE on Windows) — where the CLI writes ~/.engram/env.
+fn user_home_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
 // ── CLI dispatch ───────────────────────────────────────────────────────────
 
 async fn dispatch_cli(cmd: cli::Commands) -> anyhow::Result<()> {
     match cmd {
         cli::Commands::Daemon { vault, bind, passphrase, ui_dir, env_file: _ } => {
             let addr: SocketAddr = bind.parse()?;
-            run_daemon(vault, addr, passphrase, ui_dir).await
+            run_daemon(cli::default_daemon_vault(&vault), addr, passphrase, ui_dir).await
         }
         cli::Commands::Init => {
             cli::handle_init().await
@@ -541,6 +594,8 @@ async fn run_daemon(
         link_inference: load_link_inference(&vault_path),
         sync_trigger: sync_trigger_tx.clone(),
         sync_keys: None,
+        sync_enabled: false,
+        sync_passphrase_set: passphrase.is_some(),
         key_handoff: KeyHandoff::default(),
     };
 
@@ -556,9 +611,10 @@ async fn run_daemon(
 
     // ── Sync loop (if enabled via config) ──────────────────────────────────
     let sync_config_path = vault_path.join("config.json");
+    let mut sync_enabled = false;
     if let Ok(data) = std::fs::read_to_string(&sync_config_path) {
         if let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&data) {
-            let sync_enabled = cfg
+            sync_enabled = cfg
                 .get("sync")
                 .and_then(|s| s.get("enabled"))
                 .and_then(|v| v.as_bool())
@@ -653,6 +709,13 @@ async fn run_daemon(
         }
     }
 
+    // Publish the sync picture for /health (and the CLI's `mcp status`):
+    // enabled vs off, and whether a passphrase is available for E2E
+    // encryption — sync silently skips cycles without one, and this is
+    // the only place that fact becomes visible.
+    state.sync_enabled = sync_enabled;
+    state.sync_passphrase_set = passphrase.is_some();
+
     // ── Build router ──────────────────────────────────────────────────────
     // Auth from environment (ENGRAMD_API_KEY). Required on non-loopback.
     let auth_state = auth::AuthState::from_env(bind.ip().is_loopback());
@@ -708,10 +771,18 @@ async fn run_daemon(
         app
     };
 
+    let sync_status = if !sync_enabled {
+        "off (enable with `engram link` / `engram pair`, or the vault's config.json)"
+    } else if passphrase.is_some() {
+        "enabled"
+    } else {
+        "DISABLED (passphrase missing — set ENGRAM_PASSPHRASE or run `engram link`)"
+    };
     info!(
-        "Engramd starting on {} (vault: {})",
+        "Engram daemon ready — UI/API: http://{}  Vault: {}  Sync: {}",
         bind,
-        vault_path.display()
+        vault_path.display(),
+        sync_status
     );
     let listener = tokio::net::TcpListener::bind(bind).await?;
 

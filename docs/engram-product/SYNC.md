@@ -289,19 +289,18 @@ Settings → Sync & Team (or edit its `config.json`) instead. Without the
 CLI, the same flow works manually:
 
 ```bash
-# 1. Init a fresh vault with the SAME passphrase
-engram init --vault ~/.engram/vault
+# 1. Init a fresh vault with the SAME passphrase (defaults to ~/.engram/vault)
+engram init
 
 # 2. Point sync at the shared vault
 curl -X PATCH http://localhost:8787/config \
   -H 'Content-Type: application/json' \
   -d '{"sync": {"enabled": true, "server_url": "https://sync.example.com", "api_key": "...", "vault_id": "team-acme"}}'
 
-# 3. Restart with the shared passphrase
-engramd --vault ~/.engram/vault --passphrase "<same passphrase>"
+# 3. Restart the daemon (the passphrase auto-loads from ~/.engram/env)
+engram daemon
 
-# 4. Force the first sync (or wait interval_secs)
-curl -X POST http://localhost:8787/sync/now
+# 4. The first sync starts automatically (or wait interval_secs)
 ```
 
 Memories converge in both directions, and edits propagate (see above). A

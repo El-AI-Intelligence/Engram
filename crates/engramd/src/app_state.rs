@@ -93,6 +93,12 @@ pub struct AppState {
     pub link_inference: Option<LinkInferenceConfig>,
     /// Sync keys for the one-time browser key handoff (None = sync disabled).
     pub sync_keys: Option<Arc<SyncKeyMaterial>>,
-    /// One-time key-handoff tokens (single-use, 300s TTL).
+    /// Sync is enabled in the vault's config.json. Populated at startup;
+    /// drives the `sync` block of /health.
+    pub sync_enabled: bool,
+    /// A passphrase is available for sync (from --passphrase,
+    /// ENGRAM_PASSPHRASE, or ~/.engram/env).
+    pub sync_passphrase_set: bool,
+    /// One-time key-handoff tokens (single-use, 900s TTL).
     pub key_handoff: KeyHandoff,
 }

@@ -159,8 +159,8 @@ pub enum Commands {
         /// Path to vault (overrides config)
         #[arg(long)]
         vault: Option<PathBuf>,
-        /// Daemon address to mint the handoff from (defaults to 127.0.0.1:8799)
-        #[arg(long, default_value = "127.0.0.1:8799")]
+        /// Daemon address to mint the handoff from (defaults to 127.0.0.1:8787)
+        #[arg(long, default_value = "127.0.0.1:8787")]
         bind: String,
         /// Site URL the link opens (defaults to https://engram.ellmstack.dev/app — the SPA root; the bare host serves the landing page, which ignores the #/handoff fragment)
         #[arg(long, default_value = "https://engram.ellmstack.dev/app")]
@@ -207,7 +207,7 @@ pub enum Commands {
         /// Window length in days (1–90)
         #[arg(short, long, default_value = "7")]
         days: u32,
-        /// Generate LLM prose (requires digest.llm in the daemon's config.json)
+        /// Generate LLM prose (requires summarization.llm in the daemon's config.json)
         #[arg(long)]
         prose: bool,
     },
@@ -238,6 +238,48 @@ fn vault_path(cli_opt: Option<PathBuf>) -> PathBuf {
     // Ensure the vault directory exists
     let _ = std::fs::create_dir_all(&path);
     path
+}
+
+/// The vault the daemon opens when no --vault/ENGRAM_VAULT was given:
+/// the global config's `vault_path` (from `engram init`, if it exists),
+/// then `~/.engram/vault`, then the historical `./engram-data` default.
+/// Called only when the flag still equals clap's "./engram-data" default,
+/// so an explicit --vault or ENGRAM_VAULT is always respected. Everything
+/// else in the CLI treats ~/.engram/vault as "the" vault — the daemon
+/// should not be the one place that doesn't.
+pub fn default_daemon_vault(flag: &std::path::Path) -> PathBuf {
+    default_daemon_vault_with(flag, &home_dir())
+}
+
+/// Test seam: same logic with an explicit home directory.
+fn default_daemon_vault_with(flag: &std::path::Path, home: &std::path::Path) -> PathBuf {
+    const CLAP_DEFAULT: &str = "./engram-data";
+    if flag != std::path::Path::new(CLAP_DEFAULT) {
+        return flag.to_path_buf();
+    }
+    let from_config = std::fs::read_to_string(home.join(".engram").join("config.json"))
+        .ok()
+        .and_then(|data| serde_json::from_str::<serde_json::Value>(&data).ok())
+        .and_then(|cfg| cfg.get("vault_path").and_then(|v| v.as_str()).map(PathBuf::from));
+    if let Some(ref p) = from_config {
+        if p.exists() {
+            tracing::warn!(
+                vault = %p.display(),
+                "no --vault given — using the vault from the global config"
+            );
+            return p.clone();
+        }
+    }
+    let home_vault = home.join(".engram").join("vault");
+    if home_vault.exists() {
+        tracing::warn!(
+            vault = %home_vault.display(),
+            "no --vault given — using ~/.engram/vault"
+        );
+        return home_vault;
+    }
+    tracing::warn!("no --vault given and no existing vault found — falling back to ./engram-data");
+    flag.to_path_buf()
 }
 
 fn home_dir() -> PathBuf {
@@ -523,8 +565,9 @@ pub async fn handle_join(
     }
     println!();
     println!("  Next steps:");
-    println!("    engramd --vault {} --passphrase \"<team passphrase>\"", vault_path.display());
-    println!("    curl -X POST http://localhost:8787/sync/now   # force the first sync");
+    println!("    1. engram daemon");
+    println!("       (the passphrase auto-loads from ~/.engram/env — never type it on a command line)");
+    println!("    2. Nothing else to run — the first sync starts automatically.");
     println!();
     println!("  Teammates' memories appear within one sync interval.");
     println!();
@@ -689,16 +732,16 @@ fn save_sync_credential(
 }
 
 /// The post-pair/link next-steps block — identical for both flows.
-fn print_sync_next_steps(fresh_vault: bool, vault_path: &std::path::Path) {
+fn print_sync_next_steps(fresh_vault: bool) {
     println!();
     println!("  Next steps:");
     if fresh_vault {
-        println!("    1. Start the daemon (the passphrase is your vault key — keep it safe):");
-        println!("       ENGRAM_PASSPHRASE=\"<your passphrase>\" engramd --vault {}", vault_path.display());
+        println!("    1. Start the daemon:");
+        println!("       engram daemon        # the passphrase auto-loads from ~/.engram/env");
         println!("    2. The device appears in Account & Sync → Devices after its first sync.");
     } else {
         println!("    1. Restart the daemon so it picks up the sync preset");
-        println!("       (with ENGRAM_PASSPHRASE set, as it already runs).");
+        println!("       (same passphrase setup as it already runs with).");
         println!("    2. The device appears in Account & Sync → Devices after its first sync.");
     }
 }
@@ -794,10 +837,11 @@ pub async fn handle_pair(
     println!("  ✅ Paired! The relay issued a new API key — stored in {}", vault_path.join("config.json").display());
     println!("     (the key is masked in all status output; it is not printed here)");
     if fresh_passphrase.is_some() {
-        println!("     (vault created at {} — passphrase NOT stored on disk)", vault_path.display());
+        println!("     (vault created at {})", vault_path.display());
+        println!("     (passphrase saved to ~/.engram/env (0600) — never in config.json, never printed)");
     }
     println!("     Your vault on the site: {}", vault_site_link(&vault_path, &site));
-    print_sync_next_steps(fresh_passphrase.is_some(), &vault_path);
+    print_sync_next_steps(fresh_passphrase.is_some());
     println!();
 
     Ok(())
@@ -991,10 +1035,11 @@ pub async fn handle_link(
     println!("  ✅ Linked! The relay issued a new API key — stored in {}", vault_path.join("config.json").display());
     println!("     (the key is masked in all status output; it is not printed here)");
     if fresh_passphrase.is_some() {
-        println!("     (vault created at {} — passphrase NOT stored on disk)", vault_path.display());
+        println!("     (vault created at {})", vault_path.display());
+        println!("     (passphrase saved to ~/.engram/env (0600) — never in config.json, never printed)");
     }
     println!("     Your vault on the site: {}", vault_site_link(&vault_path, &site));
-    print_sync_next_steps(fresh_passphrase.is_some(), &vault_path);
+    print_sync_next_steps(fresh_passphrase.is_some());
     println!();
 
     Ok(())
@@ -1197,7 +1242,7 @@ pub async fn handle_capture(
 ) -> Result<()> {
     let content = content_parts.join(" ");
     if content.is_empty() {
-        anyhow::bail!("content is required");
+        anyhow::bail!("content is required (example: engram capture \"We decided to freeze the API for the beta\")");
     }
 
     let vp = vault_path(vault_opt);
@@ -1347,7 +1392,7 @@ pub async fn handle_digest(url: String, days: u32, prose: bool) -> Result<()> {
     }
     let resp = match client.get(&req_url).send().await {
         Ok(r) => r,
-        Err(e) => anyhow::bail!("could not reach engramd at {url}: {e}"),
+        Err(e) => anyhow::bail!("could not reach engramd at {url}: {e}\nStart it with: `engram daemon`"),
     };
     let status = resp.status();
     let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
@@ -1460,7 +1505,7 @@ pub async fn handle_demo(vault_opt: Option<PathBuf>) -> Result<()> {
         println!("    Total:     {}", total);
         println!();
         println!("  To re-run the demo, use a fresh vault:");
-        println!("    engram --vault ./demo-vault demo");
+        println!("    engram demo --vault ./demo-vault");
         println!();
         println!("  Open the UI:");
         println!("    engram daemon");
@@ -2372,6 +2417,36 @@ mod tests {
         std::fs::write(dir.path().join("config.json"), r#"{"sync":{"vault_id":""}}"#).unwrap();
         assert_eq!(vault_site_link(dir.path(), site), format!("{site}/#/unlock"));
     }
+
+    #[test]
+    fn default_daemon_vault_prefers_existing_vaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let flag = PathBuf::from("./engram-data");
+
+        // Nothing exists yet → the historical default survives.
+        assert_eq!(default_daemon_vault_with(&flag, home), flag);
+
+        // ~/.engram/vault exists → chosen over ./engram-data.
+        let home_vault = home.join(".engram").join("vault");
+        std::fs::create_dir_all(&home_vault).unwrap();
+        assert_eq!(default_daemon_vault_with(&flag, home), home_vault);
+
+        // A global config pointing at an existing path wins over ~/.engram/vault.
+        let custom = dir.path().join("custom-vault");
+        std::fs::create_dir_all(&custom).unwrap();
+        std::fs::create_dir_all(home.join(".engram")).unwrap();
+        std::fs::write(
+            home.join(".engram").join("config.json"),
+            serde_json::json!({ "vault_path": custom.display().to_string() }).to_string(),
+        )
+        .unwrap();
+        assert_eq!(default_daemon_vault_with(&flag, home), custom);
+
+        // An explicit --vault (or ENGRAM_VAULT) always wins, whatever exists.
+        let explicit = PathBuf::from("./mine");
+        assert_eq!(default_daemon_vault_with(&explicit, home), explicit);
+    }
 }
 
 // ── Demo data ──────────────────────────────────────────────────────────────
@@ -2430,7 +2505,7 @@ pub fn handle_show_passphrase(env_file: Option<PathBuf>) -> Result<()> {
 
 /// Mint a one-time vault-key handoff: the browser pulls the sync keys from
 /// THIS machine's daemon and wraps them under the signed-in account key —
-/// no passphrase typing, no passphrase display. Single-use, 300s TTL.
+/// no passphrase typing, no passphrase display. Single-use, 900s TTL.
 pub async fn handle_handoff(vault: Option<PathBuf>, bind: String, site: String) -> Result<()> {
     let vault_path = vault.unwrap_or_else(|| home_dir().join(".engram").join("vault"));
     if !vault_path.join("engrams.db").exists() {

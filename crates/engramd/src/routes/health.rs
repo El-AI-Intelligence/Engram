@@ -28,5 +28,9 @@ async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
         "qem_cache_entries": qem_entries,
         "db_size_bytes": db_size,
         "device_id": state.device_id,
+        "sync": {
+            "enabled": state.sync_enabled,
+            "passphrase_set": state.sync_passphrase_set,
+        },
     }))
 }
