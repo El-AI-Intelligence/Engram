@@ -2517,8 +2517,31 @@ pub async fn handle_handoff(vault: Option<PathBuf>, bind: String, site: String) 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()?;
-    let resp = client
-        .post(format!("http://{bind}/sync/key-handoff/start"))
+    // Attach the admin credential the mint endpoint requires: the configured
+    // ENGRAMD_API_KEY when set (the daemon's middleware enforces it anyway),
+    // else the random token the daemon wrote to {vault_path}/.handoff-token
+    // at startup — which is why `engram handoff` must run on the same
+    // machine (and as the same user) as the daemon it talks to.
+    let credential = std::env::var("ENGRAMD_API_KEY")
+        .ok()
+        .filter(|k| !k.is_empty())
+        .or_else(|| {
+            std::fs::read_to_string(vault_path.join(".handoff-token"))
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        });
+    let mut request = client.post(format!("http://{bind}/sync/key-handoff/start"));
+    if let Some(cred) = credential {
+        request = request.bearer_auth(cred);
+    } else {
+        anyhow::bail!(
+            "no key-handoff credential found — set ENGRAMD_API_KEY, or start the daemon \
+             for this vault once (it writes {} on first startup)",
+            vault_path.join(".handoff-token").display()
+        );
+    }
+    let resp = request
         .send()
         .await
         .with_context(|| format!("cannot reach the daemon at {bind} — is engramd running?"))?;

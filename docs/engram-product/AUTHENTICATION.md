@@ -144,7 +144,7 @@ signed-in browser:
 
 ```
 engram handoff
-  → POST daemon /sync/key-handoff/start → token (in-memory map, 900s TTL)
+  → POST daemon /sync/key-handoff/start (Bearer: admin credential) → token (in-memory map, 900s TTL)
   → link: https://engram.ellmstack.dev/app/#/handoff/{token}?daemon=127.0.0.1:8787
   → SPA: account.get (signed-out → stash token, login, resume)
     → POST /sync/key-handoff/{token} (redeem FIRST — dead link fails fast)
@@ -153,6 +153,15 @@ engram handoff
   → vault is open-by-default; the vault passphrase was never typed or shown
 ```
 
+- Minting is gated: `start` requires the daemon's admin credential —
+  `ENGRAMD_API_KEY` when configured, else a random token the daemon
+  generates at startup and persists to `{vault_path}/.handoff-token`
+  (0600). `engram handoff` attaches the env key when set, else reads the
+  token file — which is why it must run **on the same machine, as the same
+  user, for the same vault** as the daemon. (Same-user processes can of
+  course read the file; the gate closes the network-facing hole of any
+  local process/page minting tokens.) Redeem stays token-only — the
+  browser can't carry an admin credential.
 - The token IS the credential; it redeems exactly once and expired tokens
   are swept on access. Tokens live in daemon memory — a daemon restart
   invalidates every outstanding link.

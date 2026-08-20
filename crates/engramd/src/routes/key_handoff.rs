@@ -7,14 +7,18 @@
 //! /sync/key-handoff/start` mints a single-use 900s token that redeems for
 //! the key bytes exactly once at `POST /sync/key-handoff/{token}`.
 //!
-//! Trust boundary: Caddy gates /sync* behind the box basic-auth — the same
-//! wall the /config routes sit behind. The keys never touch the relay.
+//! Trust boundary: minting requires the daemon's admin credential — the
+//! configured ENGRAMD_API_KEY, or (in loopback mode) a random token the
+//! daemon writes to `{vault_path}/.handoff-token` (0600) at startup, so
+//! `engram handoff` run by the same user on the same machine can attach
+//! it. Caddy additionally gates /sync* behind the box basic-auth — the
+//! same wall the /config routes sit behind. The keys never touch the relay.
 
 use crate::app_state::{AppState, KeyHandoff, SyncKeyMaterial};
 use crate::errors::err_json;
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     routing::post,
     Json, Router,
 };
@@ -25,6 +29,34 @@ use std::sync::Arc;
 type ApiError = (StatusCode, Json<Value>);
 
 pub const HANDOFF_TTL_SECS: u64 = 900;
+
+/// Gate the mint side (`start`) behind the daemon's admin credential.
+///
+/// When ENGRAMD_API_KEY is configured the global auth middleware already
+/// enforces it; this check additionally applies in loopback mode, where the
+/// daemon generated a random token at startup (see AppState.handoff_credential
+/// and {vault_path}/.handoff-token). The redeem side deliberately stays
+/// token-only — the browser redeems from the public SPA and cannot carry an
+/// admin credential.
+fn authorize_start(headers: &HeaderMap, expected: Option<&str>) -> Result<(), ApiError> {
+    let Some(expected) = expected else {
+        return Err(err_json(401, "handoff is disabled on this server"));
+    };
+    let auth_header = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| err_json(401, "missing Authorization header"))?;
+    let token = auth_header
+        .strip_prefix("Bearer ")
+        .ok_or_else(|| err_json(401, "expected Bearer token"))?;
+    if token.is_empty() {
+        return Err(err_json(401, "empty token"));
+    }
+    if !crate::auth::constant_time_eq(token.as_bytes(), expected.as_bytes()) {
+        return Err(err_json(401, "invalid API key"));
+    }
+    Ok(())
+}
 
 impl KeyHandoff {
     /// Mint a fresh single-use token, sweeping expired ones first. Injected
@@ -65,9 +97,16 @@ pub fn router() -> Router<AppState> {
         .route("/sync/key-handoff/{token}", post(redeem_handoff))
 }
 
-/// Mint a one-time token. The token is the credential: whoever holds it
-/// (and can reach this box through the Caddy basic-auth wall) gets the keys.
-async fn start_handoff(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+/// Mint a one-time token. The caller must hold the daemon's admin
+/// credential (ENGRAMD_API_KEY when set, else the startup-generated
+/// .handoff-token); the minted token is then the credential for redeem —
+/// whoever holds it (and can reach this box through the Caddy basic-auth
+/// wall) gets the keys.
+async fn start_handoff(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    authorize_start(&headers, state.handoff_credential.as_deref())?;
     keys_or_409(&state)?;
     let token = uuid::Uuid::new_v4().simple().to_string();
     state.key_handoff.mint_swept(&token, now_secs()).await;
@@ -99,6 +138,30 @@ async fn redeem_handoff(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::HeaderValue;
+
+    fn headers_with(bearer: Option<&str>) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        if let Some(tok) = bearer {
+            headers.insert(
+                "authorization",
+                HeaderValue::from_str(&format!("Bearer {tok}")).unwrap(),
+            );
+        }
+        headers
+    }
+
+    #[test]
+    fn start_requires_admin_credential() {
+        // No credential configured → disabled.
+        assert!(authorize_start(&HeaderMap::new(), None).is_err());
+        // Missing / malformed / wrong / empty tokens all rejected.
+        assert!(authorize_start(&HeaderMap::new(), Some("secret")).is_err());
+        assert!(authorize_start(&headers_with(Some("secret")), Some("other")).is_err());
+        assert!(authorize_start(&headers_with(Some("secret")), None).is_err());
+        // Correct credential passes.
+        assert!(authorize_start(&headers_with(Some("secret")), Some("secret")).is_ok());
+    }
 
     #[tokio::test]
     async fn token_redeems_exactly_once() {

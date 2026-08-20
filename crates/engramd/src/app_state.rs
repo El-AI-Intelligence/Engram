@@ -101,4 +101,11 @@ pub struct AppState {
     pub sync_passphrase_set: bool,
     /// One-time key-handoff tokens (single-use, 900s TTL).
     pub key_handoff: KeyHandoff,
+    /// Admin credential for POST /sync/key-handoff/start (the mint side).
+    /// When ENGRAMD_API_KEY is set this is the same key; otherwise the
+    /// daemon generates a random token at startup and persists it to
+    /// {vault_path}/.handoff-token (0600) so `engram handoff` — run by
+    /// the same user on the same machine — can attach it. Redeem stays
+    /// token-only: the browser cannot carry this credential.
+    pub handoff_credential: Option<String>,
 }

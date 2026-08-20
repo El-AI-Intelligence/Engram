@@ -269,6 +269,41 @@ fn load_or_create_device_id(vault_path: &std::path::Path) -> String {
     device_id
 }
 
+/// Load or create the loopback key-handoff credential: a random token
+/// persisted to {vault_path}/.handoff-token (0600) at first startup, reused
+/// across restarts. Only consulted when ENGRAMD_API_KEY is unset; the file
+/// doubles as the credential source for `engram handoff`, which runs as
+/// the same user on the same machine. Best-effort persist — if the file
+/// can't be written the in-memory token still gates this process.
+fn load_or_create_handoff_token(vault_path: &std::path::Path) -> String {
+    let path = vault_path.join(".handoff-token");
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let trimmed = existing.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    let token = uuid::Uuid::new_v4().simple().to_string();
+    match std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(&path) {
+        Ok(mut file) => {
+            use std::io::Write;
+            let _ = writeln!(file, "{token}");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+            }
+            tracing::info!(path = %path.display(), "Generated key-handoff credential");
+        }
+        Err(e) => tracing::warn!(
+            error = %e,
+            path = %path.display(),
+            "Could not persist key-handoff credential — `engram handoff` will fail until the daemon restarts"
+        ),
+    }
+    token
+}
+
 /// Persist the effective sync `vault_id` into config.json when it isn't
 /// pinned there yet, so `/teams/status` and later restarts agree with the
 /// id the sync loop actually uses. Best-effort: a read-only vault dir just
@@ -597,6 +632,7 @@ async fn run_daemon(
         sync_enabled: false,
         sync_passphrase_set: passphrase.is_some(),
         key_handoff: KeyHandoff::default(),
+        handoff_credential: None,
     };
 
     // ── Background scheduler ──────────────────────────────────────────────
@@ -723,6 +759,17 @@ async fn run_daemon(
         tracing::error!("{e}");
         anyhow::bail!(e);
     }
+
+    // Admin credential for the key-handoff mint endpoint. With an API key
+    // configured, the global middleware enforces it on /sync/key-handoff/*
+    // already; without one (loopback mode) the daemon generates a random
+    // token at startup so the mint side is never unauthenticated. The
+    // token persists to {vault_path}/.handoff-token (0600) so `engram
+    // handoff` run by the same user keeps working across daemon restarts.
+    state.handoff_credential = match auth_state.api_key.clone() {
+        Some(key) => Some(key),
+        None => Some(load_or_create_handoff_token(&vault_path)),
+    };
 
     let app = Router::new()
         .merge(routes::health::router())
@@ -902,7 +949,32 @@ async fn background_consolidator(state: AppState) {
 
 #[cfg(test)]
 mod tests {
-    use super::name_is_engramd;
+    use super::{load_or_create_handoff_token, name_is_engramd};
+
+    #[test]
+    fn handoff_token_persists_and_reuses() {
+        let dir = std::env::temp_dir().join(format!(
+            "engram-handoff-token-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = load_or_create_handoff_token(&dir);
+        assert_eq!(first.len(), 32, "uuid simple form");
+        // Second call (i.e. a later daemon restart) reuses the same token.
+        let second = load_or_create_handoff_token(&dir);
+        assert_eq!(first, second);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.join(".handoff-token"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "credential file is owner-only");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn daemon_name_detection() {
