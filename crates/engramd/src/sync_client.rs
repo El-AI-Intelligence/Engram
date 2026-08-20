@@ -189,12 +189,13 @@ impl SyncClient {
         if let Some(ref key) = self.api_key {
             req = req.header("Authorization", format!("Bearer {key}"));
         }
-        req.send()
-            .await
-            .map_err(|e| format!("push failed: {e}"))?
-            .error_for_status()
-            .map_err(|e| format!("push rejected: {e}"))?
-            .json::<PushResponse>()
+        let resp = req.send().await.map_err(|e| format!("push failed: {e}"))?;
+        if !resp.status().is_success() {
+            // Surface the relay's error body — 403s carry actionable hints
+            // (e.g. "re-run `engram pair` or `engram link`").
+            return Err(format!("push rejected: {}", relay_err(resp).await));
+        }
+        resp.json::<PushResponse>()
             .await
             .map_err(|e| format!("push parse: {e}"))
     }
@@ -219,12 +220,13 @@ impl SyncClient {
         if let Some(ref key) = self.api_key {
             req = req.header("Authorization", format!("Bearer {key}"));
         }
-        req.send()
-            .await
-            .map_err(|e| format!("pull failed: {e}"))?
-            .error_for_status()
-            .map_err(|e| format!("pull rejected: {e}"))?
-            .json::<PullResponse>()
+        let resp = req.send().await.map_err(|e| format!("pull failed: {e}"))?;
+        if !resp.status().is_success() {
+            // Surface the relay's error body — 403s carry actionable hints
+            // (e.g. "re-run `engram pair` or `engram link`").
+            return Err(format!("pull rejected: {}", relay_err(resp).await));
+        }
+        resp.json::<PullResponse>()
             .await
             .map_err(|e| format!("pull parse: {e}"))
     }
@@ -1187,6 +1189,25 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
         acc |= x ^ y;
     }
     acc == 0
+}
+
+/// Render a non-success relay response as an error string, preferring the
+/// relay's JSON `error` message (the actionable text, e.g. the NULL-key
+/// re-link hint) over the bare status. Callers have already matched
+/// non-success.
+async fn relay_err(resp: reqwest::Response) -> String {
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    let msg = serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string))
+        .unwrap_or(body);
+    let msg = msg.trim();
+    if msg.is_empty() {
+        format!("HTTP {status}")
+    } else {
+        format!("HTTP {status}: {msg}")
+    }
 }
 
 /// Minimal percent-encoding for URL path/query components.

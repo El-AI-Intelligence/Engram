@@ -92,6 +92,16 @@ async fn register_start(
         Err(e) if e.0 == StatusCode::UNAUTHORIZED => None,
         Err(e) => return Err(e),
     };
+    // Rate-limit the ceremony start: challenges are cheap to mint but floods
+    // would pin the auth_store. Bucketed per account when attaching,
+    // otherwise per source (anonymous starts create accounts).
+    {
+        let bucket = attach_account
+            .as_deref()
+            .map(|a| format!("passkey-reg-start:{a}"))
+            .unwrap_or_else(|| "passkey-reg-start:anon".to_string());
+        password_routes::check_bucket(&state, bucket, 10.0 / 300.0, 10.0).await?;
+    }
     // Attaching a passkey is a credential mutation: a session alone is not
     // proof (7-day TTL). Accounts with a password must verify it here.
     if let Some(ref account_id) = attach_account {
@@ -166,6 +176,15 @@ async fn register_finish(
     // `account` is always Some (set in start); the fallback is unreachable
     // but keeps the tuple shape honest.
     let account_id = account.unwrap_or_else(|| Uuid::new_v4().to_string());
+    // Finishes do the expensive signature verification; bound them per
+    // account so a captured challenge can't be replayed at flood rates.
+    password_routes::check_bucket(
+        &state,
+        format!("passkey-reg-finish:{account_id}"),
+        30.0 / 60.0,
+        30.0,
+    )
+    .await?;
 
     let registration: RegisterPublicKeyCredential =
         serde_json::from_value(body.get("registration").cloned().unwrap_or(Value::Null))
@@ -271,20 +290,20 @@ async fn login_start(
 ) -> Result<Json<Value>, ApiError> {
     let origin = str_field(&body, "origin")?;
     validate_origin(&state, origin)?;
+    // Login starts are cheap to mint; bound them globally so floods can't
+    // pin the auth_store. (login_finish does the expensive verify.)
+    password_routes::check_bucket(&state, "passkey-login-start".into(), 30.0 / 60.0, 30.0)
+        .await?;
 
     let conn = state.conn.lock().await;
-    // User-less login: load every stored passkey and let the browser offer
+    // User-less login: load the stored passkeys and let the browser offer
     // them as a picker. The credential is identified in finish (the auth
-    // state carries the allowed-credential list).
-    let mut stmt = conn
-        .prepare("SELECT public_key FROM passkeys")
-        .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
-    let rows = stmt
-        .query_map([], |r| r.get::<_, Vec<u8>>(0))
-        .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+    // state carries the allowed-credential list). An optional `account_id`
+    // in the body (a "handle" the SPA remembers) filters to one account.
+    let account_filter = body.get("account_id").and_then(|v| v.as_str());
+    let rows = login_passkey_rows(&conn, account_filter)?;
     let mut passkeys: Vec<Passkey> = Vec::new();
-    for row in rows {
-        let bytes = row.map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+    for bytes in rows {
         passkeys.push(
             serde_json::from_slice(&bytes)
                 .map_err(|e| err_json(500, "corrupt_passkey", &e.to_string()))?,
@@ -313,6 +332,31 @@ async fn login_start(
         "challenge": serde_json::to_value(&challenge)
             .map_err(|e| err_json(500, "serialize_error", &e.to_string()))?,
     })))
+}
+
+/// Load the serialized passkeys `login_start` offers. `account_id` filters
+/// to one account's credentials (None = every account). A per-account cap
+/// of 20 (oldest first) keeps one abandoned account's passkey pile from
+/// turning every login into a DoS and from bloating the browser picker.
+/// Row level on purpose: Passkey deserialization needs real blobs and is
+/// tested separately.
+fn login_passkey_rows(
+    conn: &rusqlite::Connection,
+    account_id: Option<&str>,
+) -> Result<Vec<Vec<u8>>, ApiError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT public_key FROM (\
+               SELECT public_key, ROW_NUMBER() OVER (PARTITION BY account_id ORDER BY rowid ASC) AS rn \
+               FROM passkeys WHERE ?1 IS NULL OR account_id = ?1)\
+             WHERE rn <= 20",
+        )
+        .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+    let rows = stmt
+        .query_map(rusqlite::params![account_id], |r| r.get::<_, Vec<u8>>(0))
+        .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+    rows.collect::<Result<Vec<Vec<u8>>, _>>()
+        .map_err(|e| err_json(500, "database_error", &e.to_string()))
 }
 
 async fn login_finish(
@@ -494,26 +538,17 @@ async fn get_account(
 }
 
 /// Mint an account API key. The full key is returned exactly once; the
-/// relay stores only its sha256. `vault_id` (optional) scopes the key to
-/// one vault; omitted = every vault the account reaches.
+/// relay stores only its sha256. `vault_id` is REQUIRED: keys with NULL
+/// scope predate per-vault scoping and are policy-denied everywhere, so
+/// minting one would be dead on arrival. Minting is gated by vault
+/// ownership (see `validate_key_mint`).
 async fn create_account_key(
     State(state): State<SyncState>,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
     let account_id = authenticate_session(&state, &headers).await?;
-    let vault_id = match body.get("vault_id") {
-        Some(Value::Null) | None => None,
-        Some(v) => {
-            let s = v
-                .as_str()
-                .ok_or_else(|| err_json(400, "bad_vault_id", "vault_id must be a string"))?;
-            if s.is_empty() {
-                return Err(err_json(400, "bad_vault_id", "vault_id must not be empty"));
-            }
-            Some(s.to_string())
-        }
-    };
+    let vault_id = required_vault_id(&body)?;
 
     let api_key = auth::generate_api_key()
         .map_err(|e| err_json(500, "rng_error", &e.to_string()))?;
@@ -521,6 +556,7 @@ async fn create_account_key(
     let now_str = chrono::Utc::now().to_rfc3339();
 
     let conn = state.conn.lock().await;
+    validate_key_mint(&conn, &account_id, &vault_id)?;
     conn.execute(
         "INSERT INTO api_keys (id, account_id, key_hash, key_prefix, rate, vault_id, created_at, revoked) \
          VALUES (?1, ?2, ?3, ?4, 100, ?5, ?6, 0)",
@@ -534,6 +570,7 @@ async fn create_account_key(
         ],
     )
     .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+    audit_event(&conn, &account_id, "api_key_mint", Some(&vault_id));
 
     Ok(Json(json!({
         "key_id": key_id,
@@ -543,6 +580,77 @@ async fn create_account_key(
         "vault_id": vault_id,
         "created_at": now_str,
     })))
+}
+
+/// Parse the REQUIRED `vault_id` string field from a JSON body. NULL /
+/// missing / empty are all 400s — no NULL-scoped keys are minted anymore.
+fn required_vault_id(body: &Value) -> Result<String, ApiError> {
+    match body.get("vault_id") {
+        Some(Value::Null) | None => Err(err_json(
+            400,
+            "missing_vault_id",
+            "vault_id is required",
+        )),
+        Some(v) => {
+            let s = v
+                .as_str()
+                .ok_or_else(|| err_json(400, "bad_vault_id", "vault_id must be a string"))?;
+            if s.is_empty() {
+                return Err(err_json(400, "bad_vault_id", "vault_id must not be empty"));
+            }
+            Ok(s.to_string())
+        }
+    }
+}
+
+/// Gate API-key minting on vault ownership. Allow iff the account
+/// (a) holds an unrevoked key scoped to the vault, (b) has stored a vault
+/// key wrap for it (the browser claims vaults it has opened), or (c) is the
+/// founding member — the vault has no blobs on the relay yet, so a fresh
+/// first-device pair/link must work before any key exists. Sync (callers
+/// hold the conn guard).
+fn validate_key_mint(
+    conn: &rusqlite::Connection,
+    account_id: &str,
+    vault_id: &str,
+) -> Result<(), ApiError> {
+    let scoped: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM api_keys \
+             WHERE account_id = ?1 AND vault_id = ?2 AND revoked = 0",
+            rusqlite::params![account_id, vault_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+    if scoped > 0 {
+        return Ok(());
+    }
+    let wrapped: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM vault_key_wraps \
+             WHERE account_id = ?1 AND vault_id = ?2 AND kind = 'account'",
+            rusqlite::params![account_id, vault_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+    if wrapped > 0 {
+        return Ok(());
+    }
+    let blobs: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sync_blobs WHERE vault_id = ?1",
+            rusqlite::params![vault_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+    if blobs == 0 {
+        return Ok(());
+    }
+    Err(err_json(
+        403,
+        "vault_not_owned",
+        "this account has no access to that vault",
+    ))
 }
 
 /// Revoke an account API key (soft: the row stays as an audit trail, the
@@ -569,6 +677,7 @@ async fn revoke_account_key(
             "no such unrevoked key for this account",
         ));
     }
+    audit_event(&conn, &account_id, "api_key_revoke", Some(&key_id));
     Ok(Json(json!({"key_id": key_id, "revoked": true})))
 }
 
@@ -629,6 +738,7 @@ async fn mint_pairing_code(
         ],
     )
     .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+    audit_event(&conn, &account_id, "pairing_code_mint", None);
 
     Ok(Json(json!({
         "code": code, // shown once — the server keeps only its hash
@@ -637,9 +747,9 @@ async fn mint_pairing_code(
 }
 
 /// Redeem a pairing code for an account API key. No session required —
-/// the code itself is the credential (single-use, 10-minute TTL).
-/// The minted key is unscoped in v1 (reaches every vault the account
-/// syncs); per-vault scoping comes once the wizard knows the vault id.
+/// the code itself is the credential (single-use, 10-minute TTL). The body
+/// must carry the client-derived `vault_id`; the minted key is scoped to
+/// that vault (validated against the account's ownership).
 async fn redeem_pairing_code(
     State(state): State<SyncState>,
     Json(body): Json<Value>,
@@ -696,7 +806,11 @@ async fn redeem_pairing_code(
         ));
     }
 
-    // Consume the code first: a concurrent redeem must never mint two keys.
+    let vault_id = required_vault_id(&body)?;
+
+    // Consume the code first: a concurrent redeem must never mint two keys,
+    // and a wrong-vault attempt burns the code (fail-closed — no retries
+    // with a stolen code).
     let consumed = conn
         .execute(
             "UPDATE pairing_codes SET used = 1 WHERE code_hash = ?1 AND used = 0",
@@ -711,30 +825,33 @@ async fn redeem_pairing_code(
         ));
     }
 
-    // Mint the key — same shape as /account/keys (see create_account_key).
+    // Mint the key — scoped, same shape as /account/keys.
+    validate_key_mint(&conn, &account_id, &vault_id)?;
     let api_key = auth::generate_api_key()
         .map_err(|e| err_json(500, "rng_error", &e.to_string()))?;
     let key_id = Uuid::new_v4().to_string();
     let now_str = chrono::Utc::now().to_rfc3339();
     conn.execute(
         "INSERT INTO api_keys (id, account_id, key_hash, key_prefix, rate, vault_id, created_at, revoked) \
-         VALUES (?1, ?2, ?3, ?4, 100, NULL, ?5, 0)",
+         VALUES (?1, ?2, ?3, ?4, 100, ?5, ?6, 0)",
         rusqlite::params![
             key_id,
             account_id,
             auth::hash_key(&api_key).to_vec(),
             auth::API_KEY_PREFIX,
+            vault_id,
             now_str,
         ],
     )
     .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
+    audit_event(&conn, &account_id, "pairing_code_redeem", Some(&vault_id));
 
     Ok(Json(json!({
         "key_id": key_id,
         "api_key": api_key, // shown once — the server keeps only its hash
         "key_prefix": auth::API_KEY_PREFIX,
         "rate": 100.0,
-        "vault_id": Value::Null,
+        "vault_id": vault_id,
         "created_at": now_str,
     })))
 }
@@ -746,10 +863,10 @@ async fn redeem_pairing_code(
 const LINK_INTENT_TTL_SECS: i64 = 600;
 
 /// Create a link intent (unauthenticated): the CLI posts its ephemeral
-/// X25519 public key, gets an intent id + code to put in the confirm URL.
-/// The relay derives its own per-intent keypair from (id, code_hash) —
-/// nothing private is ever at rest. The code is returned once; only its
-/// sha256 is stored.
+/// X25519 public key and the client-derived `vault_id` it wants a key for,
+/// gets an intent id + code to put in the confirm URL. The relay derives
+/// its own per-intent keypair from (id, code_hash) — nothing private is
+/// ever at rest. The code is returned once; only its sha256 is stored.
 async fn create_link_intent(
     State(state): State<SyncState>,
     Json(body): Json<Value>,
@@ -784,6 +901,7 @@ async fn create_link_intent(
         .try_into()
         .map_err(|_| err_json(400, "invalid_public_key", "public_key must be 32 bytes"))?;
     let device_label = body.get("device_label").and_then(|v| v.as_str());
+    let vault_id = required_vault_id(&body)?;
 
     let code =
         auth::generate_pairing_code().map_err(|e| err_json(500, "rng_error", &e.to_string()))?;
@@ -801,13 +919,14 @@ async fn create_link_intent(
     )
     .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
     conn.execute(
-        "INSERT INTO link_intents (id, code_hash, public_key, device_label, status, created_at, expires_at) \
-         VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6)",
+        "INSERT INTO link_intents (id, code_hash, public_key, device_label, status, vault_id, created_at, expires_at) \
+         VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7)",
         rusqlite::params![
             id,
             code_hash.to_vec(),
             public_key.to_vec(),
             device_label,
+            vault_id,
             now.to_rfc3339(),
             expires.to_rfc3339(),
         ],
@@ -911,8 +1030,9 @@ async fn link_intent_status(
 
 /// The signed-in browser approves the intent: verifies the code (the
 /// capability carried in the URL), binds the intent to this account, mints
-/// an unscoped account key, and seals it to the CLI's public key. The
-/// plaintext key is never echoed — the CLI polls for the seal.
+/// a key scoped to the intent's `vault_id` (ownership-validated), and seals
+/// it to the CLI's public key. The plaintext key is never echoed — the CLI
+/// polls for the seal.
 async fn confirm_link_intent(
     State(state): State<SyncState>,
     headers: HeaderMap,
@@ -937,15 +1057,15 @@ async fn confirm_link_intent(
 
     let code = str_field(&body, "code")?.to_ascii_uppercase();
     let conn = state.conn.lock().await;
-    let row: Option<(Vec<u8>, Vec<u8>, String, String)> = conn
+    let row: Option<(Vec<u8>, Vec<u8>, String, String, Option<String>)> = conn
         .query_row(
-            "SELECT code_hash, public_key, status, expires_at FROM link_intents WHERE id = ?1",
+            "SELECT code_hash, public_key, status, expires_at, vault_id FROM link_intents WHERE id = ?1",
             rusqlite::params![id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )
         .optional()
         .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
-    let (code_hash, public_key, status, expires_at) = row.ok_or_else(|| {
+    let (code_hash, public_key, status, expires_at, vault_id) = row.ok_or_else(|| {
         err_json(
             404,
             "link_intent_not_found",
@@ -967,6 +1087,15 @@ async fn confirm_link_intent(
             "link already used or expired — run `engram link` again",
         ));
     }
+    // Intents created before the vault_id column existed have nothing to
+    // scope a key to — they must be re-created (same TTL walk anyway).
+    let vault_id = vault_id.ok_or_else(|| {
+        err_json(
+            410,
+            "link_intent_delivered",
+            "this link predates vault scoping — run `engram link` again",
+        )
+    })?;
 
     // The code is the capability carried in the URL — compare hashes, not
     // plaintexts (nothing plaintext is at rest).
@@ -988,18 +1117,21 @@ async fn confirm_link_intent(
         crate::link_crypto::link_shared_secret(&sk_r, &x25519_dalek::PublicKey::from(pk_bytes))
             .map_err(|e| err_json(400, "invalid_public_key", &e.to_string()))?;
 
-    // Mint the key — same shape as redeem_pairing_code: unscoped account key.
+    // Mint the key — scoped, same shape as redeem_pairing_code. Ownership
+    // validated so a link URL for vault X can't mint a key for vault Y.
+    validate_key_mint(&conn, &account_id, &vault_id)?;
     let api_key = auth::generate_api_key().map_err(|e| err_json(500, "rng_error", &e.to_string()))?;
     let key_id = Uuid::new_v4().to_string();
     let now_str = chrono::Utc::now().to_rfc3339();
     conn.execute(
         "INSERT INTO api_keys (id, account_id, key_hash, key_prefix, rate, vault_id, created_at, revoked) \
-         VALUES (?1, ?2, ?3, ?4, 100, NULL, ?5, 0)",
+         VALUES (?1, ?2, ?3, ?4, 100, ?5, ?6, 0)",
         rusqlite::params![
             key_id,
             account_id,
             auth::hash_key(&api_key).to_vec(),
             auth::API_KEY_PREFIX,
+            vault_id,
             now_str
         ],
     )
@@ -1023,6 +1155,10 @@ async fn confirm_link_intent(
             "link already used or expired — run `engram link` again",
         ));
     }
+    // The confirm is the moment the account binds to the intent — the
+    // creation itself is anonymous and unauditable (auth_events.account_id
+    // is NOT NULL), so this is the security-relevant event.
+    audit_event(&conn, &account_id, "link_intent_confirm", Some(&vault_id));
 
     Ok(Json(json!({
         "status": "confirmed",
@@ -1064,25 +1200,15 @@ pub async fn authenticate_session(
 }
 
 /// What vaults can this account read? Derived from the account's unrevoked
-/// API keys: `None` means "every vault" (an unscoped key exists), `Some(set)`
-/// means exactly these vaults (scoped keys only). Single source of truth for
-/// both the session-pull fallback and the vault list.
+/// SCOPED API keys: `Some(set)` — exactly these vaults. Legacy keys with a
+/// NULL `vault_id` grant nothing anywhere (they are policy-denied on the
+/// key path too, so sessions must not inherit their reach). Single source
+/// of truth for both the session-pull fallback and the vault list.
 pub(crate) async fn account_vault_scope(
     state: &SyncState,
     account_id: &str,
 ) -> Result<Option<HashSet<String>>, ApiError> {
     let conn = state.conn.lock().await;
-    let unscoped: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM api_keys \
-             WHERE account_id = ?1 AND revoked = 0 AND vault_id IS NULL",
-            rusqlite::params![account_id],
-            |r| r.get(0),
-        )
-        .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
-    if unscoped > 0 {
-        return Ok(None);
-    }
     let mut stmt = conn
         .prepare(
             "SELECT DISTINCT vault_id FROM api_keys \
@@ -1641,6 +1767,11 @@ async fn put_vault_wrap(
     let now = chrono::Utc::now().to_rfc3339();
 
     let conn = state.conn.lock().await;
+    // Opening a vault gates access to its keys, so like locking it is a
+    // credential mutation: accounts with a password must verify it fresh,
+    // in this request (passkey-only accounts pass with no password).
+    let password = body.get("password").and_then(|v| v.as_str());
+    password_routes::require_fresh_password(&conn, &account_id, password)?;
     conn.execute(
         "INSERT INTO vault_key_wraps (account_id, vault_id, kind, wrapped_k, generation, created_at, updated_at) \
          VALUES (?1, ?2, 'account', ?3, 1, ?4, ?4) \
@@ -1883,7 +2014,8 @@ mod tests {
                  id TEXT PRIMARY KEY, code_hash BLOB NOT NULL, public_key BLOB NOT NULL,
                  account_id TEXT REFERENCES accounts(id) ON DELETE CASCADE,
                  sealed_key BLOB, nonce BLOB, device_label TEXT,
-                 status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL, expires_at TEXT NOT NULL
+                 status TEXT NOT NULL DEFAULT 'pending', vault_id TEXT,
+                 created_at TEXT NOT NULL, expires_at TEXT NOT NULL
              );
              CREATE TABLE sync_blobs (
                  vault_id TEXT NOT NULL, memory_id TEXT NOT NULL, device_id TEXT NOT NULL,
@@ -2046,15 +2178,21 @@ mod tests {
     // ── Vault list (browser unlock) ──────────────────────────────────────
 
     #[tokio::test]
-    async fn account_vaults_lists_all_vaults_for_unscoped_account() {
+    async fn account_vaults_lists_all_vaults_for_scoped_account() {
         let state = test_state();
         seed_session(&state, "acct-1", "tok-1").await;
         {
             let conn = state.conn.lock().await;
             conn.execute(
                 "INSERT INTO api_keys (id, account_id, key_hash, key_prefix, rate, vault_id, created_at, revoked) \
-                 VALUES ('k1', 'acct-1', ?1, 'en_', 100, NULL, 'now', 0)",
-                rusqlite::params![auth::hash_key("en_unscoped").to_vec()],
+                 VALUES ('k1', 'acct-1', ?1, 'en_', 100, 'vault-a', 'now', 0)",
+                rusqlite::params![auth::hash_key("en_scoped_a").to_vec()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO api_keys (id, account_id, key_hash, key_prefix, rate, vault_id, created_at, revoked) \
+                 VALUES ('k2', 'acct-1', ?1, 'en_', 100, 'vault-b', 'now', 0)",
+                rusqlite::params![auth::hash_key("en_scoped_b").to_vec()],
             )
             .unwrap();
         }
@@ -2114,6 +2252,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn account_vaults_legacy_null_keys_grant_nothing() {
+        let state = test_state();
+        seed_session(&state, "acct-1", "tok-1").await;
+        {
+            let conn = state.conn.lock().await;
+            conn.execute(
+                "INSERT INTO api_keys (id, account_id, key_hash, key_prefix, rate, vault_id, created_at, revoked) \
+                 VALUES ('k1', 'acct-1', ?1, 'en_', 100, NULL, 'now', 0)",
+                rusqlite::params![auth::hash_key("en_unscoped").to_vec()],
+            )
+            .unwrap();
+        }
+        seed_blob(&state, "vault-a", "m1", "2026-01-01T00:00:00Z").await;
+
+        let res = account_vaults(State(state.clone()), bearer("tok-1"))
+            .await
+            .expect("valid session");
+        let vaults = res.0["vaults"].as_array().expect("vaults array");
+        assert_eq!(vaults.len(), 0, "legacy NULL keys must grant no vault visibility");
+    }
+
+    #[tokio::test]
     async fn account_vaults_requires_valid_session() {
         let state = test_state();
         let err = account_vaults(State(state), HeaderMap::new())
@@ -2124,15 +2284,16 @@ mod tests {
 
     // ── Forget vault (DELETE /account/vaults/{vault_id}) ─────────────────
 
-    async fn seed_unscoped_key(state: &SyncState, account_id: &str, id: &str) {
+    async fn seed_scoped_key(state: &SyncState, account_id: &str, id: &str, vault_id: &str) {
         let conn = state.conn.lock().await;
         conn.execute(
             "INSERT INTO api_keys (id, account_id, key_hash, key_prefix, rate, vault_id, created_at, revoked) \
-             VALUES (?1, ?2, ?3, 'en_', 100, NULL, 'now', 0)",
+             VALUES (?1, ?2, ?3, 'en_', 100, ?4, 'now', 0)",
             rusqlite::params![
                 id,
                 account_id,
-                auth::hash_key(&format!("en_unscoped-{id}")).to_vec()
+                auth::hash_key(&format!("en_scoped-{id}")).to_vec(),
+                vault_id
             ],
         )
         .unwrap();
@@ -2142,7 +2303,15 @@ mod tests {
     async fn delete_account_vault_removes_everything_and_is_idempotent() {
         let state = test_state();
         seed_session(&state, "acct-1", "tok-1").await;
-        seed_unscoped_key(&state, "acct-1", "k1").await;
+        {
+            let conn = state.conn.lock().await;
+            conn.execute(
+                "INSERT INTO api_keys (id, account_id, key_hash, key_prefix, rate, vault_id, created_at, revoked) \
+                 VALUES ('k1', 'acct-1', ?1, 'en_', 100, 'vault-a', 'now', 0)",
+                rusqlite::params![auth::hash_key("en_scoped").to_vec()],
+            )
+            .unwrap();
+        }
         seed_blob(&state, "vault-a", "m1", "2026-01-01T00:00:00Z").await;
         seed_blob(&state, "vault-a", "m2", "2026-02-01T00:00:00Z").await;
         seed_label(&state, "vault-a", "dev-a", "Old", "2026-01-01T00:00:00Z").await;
@@ -2157,7 +2326,7 @@ mod tests {
 
         let res = delete_account_vault(State(state.clone()), bearer("tok-1"), Path("vault-a".into()))
             .await
-            .expect("valid session, unscoped");
+            .expect("valid session, scoped to vault-a");
         assert_eq!(res.0["vault_id"], "vault-a");
         assert_eq!(res.0["deleted_blobs"], 2);
 
@@ -2260,6 +2429,96 @@ mod tests {
         assert_eq!(stored_hash, auth::hash_key(api_key).to_vec());
         assert_eq!(stored_prefix, auth::API_KEY_PREFIX);
         assert_ne!(stored_hash, api_key.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn create_account_key_requires_vault_id() {
+        let state = test_state();
+        seed_session(&state, "acct-1", "test-token").await;
+        for (body, code) in [
+            (json!({}), "missing_vault_id"),
+            (json!({"vault_id": null}), "missing_vault_id"),
+            (json!({"vault_id": ""}), "bad_vault_id"),
+            (json!({"vault_id": 42}), "bad_vault_id"),
+        ] {
+            let err = create_account_key(
+                State(state.clone()),
+                bearer("test-token"),
+                Json(body),
+            )
+            .await
+            .expect_err("no NULL-scoped keys are minted");
+            assert_eq!(err.0, StatusCode::BAD_REQUEST);
+            assert_eq!(err.1["code"], code, "body: missing/empty/non-string vault_id");
+        }
+    }
+
+    #[tokio::test]
+    async fn create_account_key_mint_matrix() {
+        let state = test_state();
+        seed_session(&state, "acct-1", "test-token").await;
+        seed_session(&state, "acct-2", "token-2").await;
+        seed_scoped_key(&state, "acct-1", "k1", "vault-a").await;
+        seed_blob(&state, "vault-a", "m1", "2026-01-01T00:00:00Z").await;
+        {
+            let conn = state.conn.lock().await;
+            conn.execute(
+                "INSERT INTO vault_key_wraps (account_id, vault_id, kind, wrapped_k, generation, created_at, updated_at) \
+                 VALUES ('acct-2', 'vault-w', 'account', 'x', 1, 'now', 'now')",
+                [],
+            )
+            .unwrap();
+        }
+
+        // (a) scoped key for the vault → allowed even though the vault has blobs.
+        let _ = create_account_key(
+            State(state.clone()),
+            bearer("test-token"),
+            Json(json!({"vault_id": "vault-a"})),
+        )
+        .await
+        .expect("scoped key mints another key for the same vault");
+
+        // (b) account holds a vault key wrap → allowed.
+        let _ = create_account_key(
+            State(state.clone()),
+            bearer("token-2"),
+            Json(json!({"vault_id": "vault-w"})),
+        )
+        .await
+        .expect("wrap-owning account mints");
+
+        // (c) founding member: vault has no blobs on the relay → allowed.
+        let _ = create_account_key(
+            State(state.clone()),
+            bearer("test-token"),
+            Json(json!({"vault_id": "vault-new"})),
+        )
+        .await
+        .expect("empty vault mints");
+
+        // (d) foreign non-empty vault → denied.
+        seed_blob(&state, "vault-foreign", "m1", "2026-01-01T00:00:00Z").await;
+        let err = create_account_key(
+            State(state.clone()),
+            bearer("test-token"),
+            Json(json!({"vault_id": "vault-foreign"})),
+        )
+        .await
+        .expect_err("no key, no wrap, vault not empty");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert_eq!(err.1["code"], "vault_not_owned");
+        // Once a blob lands in a founding vault, the founding branch closes.
+        seed_blob(&state, "vault-new", "m1", "2026-01-01T00:00:00Z").await;
+        let err = create_account_key(
+            State(state),
+            bearer("token-2"),
+            Json(json!({"vault_id": "vault-new"})),
+        )
+        .await
+        .expect_err("vault-new now has blobs and acct-2 holds no claim");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert_eq!(err.1["code"], "vault_not_owned");
     }
 
     #[tokio::test]
@@ -2382,27 +2641,30 @@ mod tests {
         }
 
         // Redeem — accept lowercase input (typed codes are case-insensitive).
+        // The body carries the client-derived vault_id; the vault is empty on
+        // the relay (founding branch), so the mint is allowed.
         let res = redeem_pairing_code(
             State(state.clone()),
-            Json(json!({"code": code.to_lowercase()})),
+            Json(json!({"code": code.to_lowercase(), "vault_id": "vault-a"})),
         )
         .await
         .expect("fresh code redeems");
         let body = res.0;
         let api_key = body["api_key"].as_str().expect("full key returned once");
         assert!(api_key.starts_with(auth::API_KEY_PREFIX));
-        assert!(body["vault_id"].is_null(), "unscoped in v1");
+        assert_eq!(body["vault_id"], "vault-a", "minted key is scoped");
         // The minted key authenticates through the normal api_keys path.
         {
             let conn = state.conn.lock().await;
-            let stored: Vec<u8> = conn
+            let (stored, scoped): (Vec<u8>, String) = conn
                 .query_row(
-                    "SELECT key_hash FROM api_keys WHERE key_hash = ?1",
+                    "SELECT key_hash, vault_id FROM api_keys WHERE key_hash = ?1",
                     rusqlite::params![auth::hash_key(api_key).to_vec()],
-                    |r| r.get(0),
+                    |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .unwrap();
             assert_eq!(stored, auth::hash_key(api_key).to_vec());
+            assert_eq!(scoped, "vault-a", "stored key carries the scope");
         }
 
         // Second redeem: single-use.
@@ -2422,6 +2684,41 @@ mod tests {
         )
         .await
         .expect_err("unknown code");
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(err.1["code"], "invalid_pairing_code");
+    }
+
+    #[tokio::test]
+    async fn pair_redeem_for_foreign_nonempty_vault_is_denied_and_burns_code() {
+        let state = test_state();
+        seed_session(&state, "acct-1", "test-token").await;
+        seed_scoped_key(&state, "acct-1", "k1", "vault-a").await;
+        seed_blob(&state, "vault-a", "m1", "2026-01-01T00:00:00Z").await;
+        seed_blob(&state, "vault-b", "m1", "2026-01-01T00:00:00Z").await;
+        let res = mint_pairing_code(State(state.clone()), bearer("test-token"))
+            .await
+            .expect("mint");
+        let code = res.0["code"].as_str().unwrap().to_string();
+
+        // The account owns vault-a but not vault-b — redeeming for vault-b
+        // must not mint a key for someone else's non-empty vault.
+        let err = redeem_pairing_code(
+            State(state.clone()),
+            Json(json!({"code": code, "vault_id": "vault-b"})),
+        )
+        .await
+        .expect_err("foreign non-empty vault");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert_eq!(err.1["code"], "vault_not_owned");
+
+        // Fail-closed: the wrong-vault attempt burned the code — no retry
+        // with a stolen code against the right vault.
+        let err = redeem_pairing_code(
+            State(state),
+            Json(json!({"code": code, "vault_id": "vault-a"})),
+        )
+        .await
+        .expect_err("burned");
         assert_eq!(err.0, StatusCode::UNAUTHORIZED);
         assert_eq!(err.1["code"], "invalid_pairing_code");
     }
@@ -2457,13 +2754,18 @@ mod tests {
     }
 
     /// Create an intent, returning (id, code) from the relay's response.
+    /// The body carries the client-derived vault_id — required since W3.
     async fn create_test_link_intent(
         state: &SyncState,
         pk_b64: &str,
     ) -> (String, String, serde_json::Value) {
         let (status, body) = create_link_intent(
             State(state.clone()),
-            Json(json!({"public_key": pk_b64, "device_label": "test-laptop"})),
+            Json(json!({
+                "public_key": pk_b64,
+                "device_label": "test-laptop",
+                "vault_id": "vault-a",
+            })),
         )
         .await
         .expect("mint");
@@ -2570,17 +2872,19 @@ mod tests {
                 .unwrap();
         let api_key = crate::link_crypto::unseal_api_key(&id, &shared, &sealed, &nonce).unwrap();
         assert!(api_key.starts_with(auth::API_KEY_PREFIX), "minted account key");
-        // …and it authenticates through the normal api_keys path.
+        // …and it authenticates through the normal api_keys path, scoped to
+        // the intent's vault.
         {
             let conn = state.conn.lock().await;
-            let stored: Vec<u8> = conn
+            let (stored, scoped): (Vec<u8>, String) = conn
                 .query_row(
-                    "SELECT key_hash FROM api_keys WHERE key_hash = ?1",
+                    "SELECT key_hash, vault_id FROM api_keys WHERE key_hash = ?1",
                     rusqlite::params![auth::hash_key(&api_key).to_vec()],
-                    |r| r.get(0),
+                    |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .unwrap();
             assert_eq!(stored, auth::hash_key(&api_key).to_vec());
+            assert_eq!(scoped, "vault-a", "link-confirmed key carries the intent's vault");
             let account: String = conn
                 .query_row(
                     "SELECT account_id FROM link_intents WHERE id = ?1",
@@ -2654,12 +2958,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn confirm_link_intent_legacy_null_vault_is_410() {
+        // Intents created before the vault_id column existed have no vault to
+        // scope a minted key to — confirming must 410 with a re-run message
+        // instead of minting a dead NULL-scoped key.
+        let state = test_state();
+        seed_session(&state, "acct-1", "test-token").await;
+        let (pk, _sk_cli) = link_test_cli_keypair();
+        let code = "ENG-AAAA-BBBB-CCCC";
+        {
+            let conn = state.conn.lock().await;
+            conn.execute(
+                "INSERT INTO link_intents (id, code_hash, public_key, account_id, sealed_key, nonce, device_label, status, vault_id, created_at, expires_at) \
+                 VALUES ('intent-legacy', ?1, ?2, NULL, NULL, NULL, 'old-laptop', 'pending', NULL, 'now', '2999-01-01T00:00:00Z')",
+                rusqlite::params![auth::hash_key(code).to_vec(), pk.to_vec()],
+            )
+            .unwrap();
+        }
+        let err = confirm_link_intent(
+            State(state),
+            bearer("test-token"),
+            Path("intent-legacy".into()),
+            Json(json!({"code": code})),
+        )
+        .await
+        .expect_err("NULL vault_id → re-create the link");
+        assert_eq!(err.0, StatusCode::GONE);
+        assert_eq!(err.1["code"], "link_intent_delivered");
+        assert!(
+            err.1["error"].as_str().unwrap().contains("predates"),
+            "error must tell the user to re-run `engram link`"
+        );
+    }
+
+    #[tokio::test]
     async fn link_intent_rejects_bad_public_key() {
         let state = test_state();
         // 33 bytes → 400.
         let err = create_link_intent(
             State(state.clone()),
-            Json(json!({"public_key": URL_SAFE_NO_PAD.encode([7u8; 33])})),
+            Json(json!({"public_key": URL_SAFE_NO_PAD.encode([7u8; 33]), "vault_id": "vault-a"})),
         )
         .await
         .expect_err("33-byte key");
@@ -2668,17 +3006,29 @@ mod tests {
         // Not base64url → 400.
         let err = create_link_intent(
             State(state.clone()),
-            Json(json!({"public_key": "not!!base64"})),
+            Json(json!({"public_key": "not!!base64", "vault_id": "vault-a"})),
         )
         .await
         .expect_err("bad b64");
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
         assert_eq!(err.1["code"], "invalid_public_key");
-        // Missing → 400 (str_field).
-        let err = create_link_intent(State(state.clone()), Json(json!({})))
-            .await
-            .expect_err("missing field");
+        // Missing public_key → 400 (str_field).
+        let err = create_link_intent(
+            State(state.clone()),
+            Json(json!({"vault_id": "vault-a"})),
+        )
+        .await
+        .expect_err("missing field");
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        // Missing vault_id → 400 (required since W3).
+        let err = create_link_intent(
+            State(state),
+            Json(json!({"public_key": URL_SAFE_NO_PAD.encode([7u8; 32])})),
+        )
+        .await
+        .expect_err("missing vault_id");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(err.1["code"], "missing_vault_id");
     }
 
     #[tokio::test]
@@ -3006,7 +3356,10 @@ mod tests {
         let state = test_state();
         seed_session(&state, "acct-1", "tok-1").await;
         seed_session(&state, "acct-2", "tok-2").await;
-        seed_unscoped_key(&state, "acct-1", "k1").await;
+        // vault-b stays in scope (no wrap row) so the locked-vault case below
+        // is a 404, not a 403.
+        seed_scoped_key(&state, "acct-1", "k1", "vault-a").await;
+        seed_scoped_key(&state, "acct-1", "k2", "vault-b").await;
         let wrapped_k = base64::engine::general_purpose::STANDARD.encode(b"wrapped-k-bytes");
         let res = put_vault_wrap(
             State(state.clone()),
@@ -3112,7 +3465,7 @@ mod tests {
     async fn vault_wrap_open_lock_flow_flips_is_open() {
         let state = test_state();
         seed_session(&state, "acct-1", "tok-1").await;
-        seed_unscoped_key(&state, "acct-1", "k1").await;
+        seed_scoped_key(&state, "acct-1", "k1", "vault-a").await;
         seed_blob(&state, "vault-a", "m1", "2026-01-01T00:00:00Z").await;
         let wrapped_k = base64::engine::general_purpose::STANDARD.encode(b"wrapped-k-bytes-1");
 
@@ -3215,17 +3568,39 @@ mod tests {
     async fn delete_vault_wrap_requires_fresh_password_for_password_accounts() {
         let state = test_state();
         seed_session(&state, "acct-1", "tok-1").await;
-        seed_unscoped_key(&state, "acct-1", "k1").await;
+        seed_scoped_key(&state, "acct-1", "k1", "vault-a").await;
         insert_password_account(&state, "acct-1", "correct-horse-battery-staple").await;
         let wrapped_k = base64::engine::general_purpose::STANDARD.encode(b"wrapped-k-bytes-1");
-        put_vault_wrap(
+
+        // Opening is a credential mutation too: PUT needs the fresh password.
+        let err = put_vault_wrap(
             State(state.clone()),
             bearer("tok-1"),
             Path("vault-a".into()),
             Json(json!({"wrapped_k": wrapped_k})),
         )
         .await
-        .expect("open");
+        .expect_err("open gate: password required");
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(err.1["code"], "password_required");
+        let err = put_vault_wrap(
+            State(state.clone()),
+            bearer("tok-1"),
+            Path("vault-a".into()),
+            Json(json!({"wrapped_k": wrapped_k, "password": "wrong-password-1"})),
+        )
+        .await
+        .expect_err("open gate: wrong password");
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(err.1["code"], "invalid_password");
+        let _ = put_vault_wrap(
+            State(state.clone()),
+            bearer("tok-1"),
+            Path("vault-a".into()),
+            Json(json!({"wrapped_k": wrapped_k, "password": "correct-horse-battery-staple"})),
+        )
+        .await
+        .expect("open with fresh password");
         assert_eq!(audit_count(&state, "acct-1", "vault_wrap_put").await, 1);
 
         let err = delete_vault_wrap(
@@ -3277,8 +3652,8 @@ mod tests {
         let state = test_state();
         seed_session(&state, "acct-1", "tok-1").await;
         seed_session(&state, "acct-2", "tok-2").await;
-        seed_unscoped_key(&state, "acct-1", "k1").await;
-        seed_unscoped_key(&state, "acct-2", "k2").await;
+        seed_scoped_key(&state, "acct-1", "k1", "vault-shared").await;
+        seed_scoped_key(&state, "acct-2", "k2", "vault-shared").await;
         seed_blob(&state, "vault-shared", "m1", "2026-01-01T00:00:00Z").await;
 
         let wrapped_k = base64::engine::general_purpose::STANDARD.encode(b"wrapped-k-bytes-1");
@@ -3338,5 +3713,65 @@ mod tests {
         .await
         .expect("password verified, challenge issued");
         assert!(res.0["challenge_id"].as_str().unwrap().len() > 0);
+    }
+
+    #[tokio::test]
+    async fn register_start_is_rate_limited() {
+        // Challenge minting is cheap; floods would pin the auth_store. The
+        // per-account bucket allows a burst of 10 starts per 300s.
+        let state = test_state();
+        seed_session(&state, "acct-1", "tok-1").await;
+        for _ in 0..10 {
+            let _ = register_start(
+                State(state.clone()),
+                bearer("tok-1"),
+                Json(json!({"origin": "http://localhost:8787"})),
+            )
+            .await
+            .expect("within burst");
+        }
+        let err = register_start(
+            State(state),
+            bearer("tok-1"),
+            Json(json!({"origin": "http://localhost:8787"})),
+        )
+        .await
+        .expect_err("burst exhausted");
+        assert_eq!(err.0, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(err.1["code"], "rate_limited");
+    }
+
+    #[tokio::test]
+    async fn login_passkey_rows_filters_and_caps() {
+        let state = test_state();
+        seed_session(&state, "acct-1", "tok-1").await;
+        seed_session(&state, "acct-2", "tok-2").await;
+        {
+            let conn = state.conn.lock().await;
+            for i in 0..25u8 {
+                conn.execute(
+                    "INSERT INTO passkeys (account_id, credential_id, public_key, created_at) \
+                     VALUES ('acct-1', ?1, ?2, 'now')",
+                    rusqlite::params![format!("cred-{i}").into_bytes(), vec![i]],
+                )
+                .unwrap();
+            }
+            for i in 0..3u8 {
+                conn.execute(
+                    "INSERT INTO passkeys (account_id, credential_id, public_key, created_at) \
+                     VALUES ('acct-2', ?1, ?2, 'now')",
+                    rusqlite::params![format!("cred2-{i}").into_bytes(), vec![200 + i]],
+                )
+                .unwrap();
+            }
+            // Filtered to the requested account and capped at 20 (oldest by
+            // rowid) — the browser picker and the verifier both stay bounded.
+            let rows = login_passkey_rows(&conn, Some("acct-1")).unwrap();
+            assert_eq!(rows.len(), 20, "cap: 25 rows → 20");
+            assert!(rows.iter().all(|pk| pk.len() == 1 && pk[0] < 100), "only acct-1 rows");
+            // Unfiltered: the cap applies per account, not globally.
+            let rows = login_passkey_rows(&conn, None).unwrap();
+            assert_eq!(rows.len(), 23, "per-account cap: 20 (acct-1) + 3 (acct-2)");
+        }
     }
 }

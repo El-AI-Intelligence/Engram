@@ -248,8 +248,8 @@ async fn push(
 ///
 /// Auth: API key first (existing behavior). On 401 ONLY, falls back to an
 /// account session token — vault visibility then derives from the account's
-/// keys (an unscoped key makes every vault visible). A 429 must never fall
-/// through to the session path, or a rate-limited key would bypass its
+/// scoped keys (legacy NULL-scoped keys grant nothing). A 429 must never
+/// fall through to the session path, or a rate-limited key would bypass its
 /// limiter.
 async fn pull(
     State(state): State<SyncState>,
@@ -743,12 +743,22 @@ async fn rate_limit(
 }
 
 /// Scope check: can this key touch `vault_id` at all?
+///
+/// `None` (unscoped) is the legacy superuser scope: it still passes for
+/// static env keys and the pre-configuration loopback wildcard (account-less
+/// keys), but account keys minted with a NULL `vault_id` predate per-vault
+/// scoping and are policy-denied — re-running `engram pair` / `engram link`
+/// mints a scoped key.
 fn authorize_vault(
     key: &AuthenticatedKey,
     vault_id: &str,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
     match &key.entry.vaults {
-        None => Ok(()),
+        None if key.entry.account_id.is_none() => Ok(()),
+        None => Err(err_json(
+            403,
+            "this API key predates per-vault scoping — re-run `engram pair` or `engram link`",
+        )),
         Some(vaults) if vaults.contains(vault_id) => Ok(()),
         Some(_) => Err(err_json(
             403,
@@ -795,11 +805,13 @@ pub(crate) async fn rate_limit_session(
         .map(|_| ())
 }
 
-/// Admin check: unscoped keys are the legacy superuser; scoped keys must
-/// carry the `+admin` suffix for this vault.
+/// Admin check: account-less unscoped keys (static env / loopback wildcard)
+/// are the superuser; scoped keys must carry the `+admin` suffix for this
+/// vault. Legacy NULL-scoped account keys are never admin — they are
+/// policy-denied by `authorize_vault` anyway.
 fn vault_admin(key: &AuthenticatedKey, vault_id: &str) -> bool {
     match &key.entry.vaults {
-        None => true,
+        None => key.entry.account_id.is_none(),
         Some(_) => key.entry.admin_vaults.contains(vault_id),
     }
 }
@@ -1093,10 +1105,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pull_with_session_unscoped_account_ok() {
+    async fn pull_with_session_scoped_account_ok() {
         let state = test_state();
         seed_account(&state, "acct-1", 0, 0).await;
-        seed_account_key(&state, "acct-1", None, "en_unscoped").await;
+        seed_account_key(&state, "acct-1", Some("vault-a"), "en_scoped").await;
         seed_session(&state, "acct-1", "tok-1").await;
         seed_blob(&state, "vault-a", "m1").await;
         let res = do_session_pull(&state, "tok-1", "vault-a")
@@ -1105,6 +1117,85 @@ mod tests {
         assert_eq!(res.blobs.len(), 1);
         assert_eq!(res.blobs[0].memory_id, "m1");
         assert!(!res.has_more);
+    }
+
+    /// Legacy NULL-scoped account keys grant nothing: not via the API-key
+    /// path, and not via sessions either (account_vault_scope only counts
+    /// scoped keys). Re-linking mints a scoped key.
+    #[tokio::test]
+    async fn pull_with_session_legacy_null_key_denied() {
+        let state = test_state();
+        seed_account(&state, "acct-1", 0, 0).await;
+        seed_account_key(&state, "acct-1", None, "en_unscoped").await;
+        seed_session(&state, "acct-1", "tok-1").await;
+        seed_blob(&state, "vault-a", "m1").await;
+        let err = do_session_pull(&state, "tok-1", "vault-a")
+            .await
+            .expect_err("legacy NULL keys grant no vault access");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn legacy_null_account_key_policy_denied_with_relink_message() {
+        let state = test_state();
+        seed_account(&state, "acct-1", 0, 0).await;
+        seed_account_key(&state, "acct-1", None, "en_unscoped").await;
+        seed_blob(&state, "vault-a", "m1").await;
+        // Push path — legacy NULL-scoped account key hits the policy deny.
+        let blob = axiom_engram::sync::SyncBlob {
+            vault_id: "vault-a".into(),
+            memory_id: "m9".into(),
+            device_id: "dev-1".into(),
+            vector_clock: 2,
+            ciphertext: "x".into(),
+            hmac: "h".into(),
+            created_at: "2026-08-20T00:00:00Z".into(),
+            deleted: false,
+        };
+        let err = do_push(&state, "en_unscoped", "vault-a", vec![blob])
+            .await
+            .expect_err("legacy NULL key must be denied");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        let body = err.1;
+        let msg = body["error"].as_str().unwrap_or_default();
+        assert!(msg.contains("re-run"), "403 must carry the re-link hint: {msg}");
+        assert!(msg.contains("engram"), "403 must name the re-link commands: {msg}");
+    }
+
+    #[tokio::test]
+    async fn unscoped_static_key_stays_superuser() {
+        let mut state = test_state();
+        // A static env key is account-less and unscoped — the wildcard
+        // superuser path. Seed an account key so authenticate() can't take
+        // the loopback branch, then register a static key.
+        seed_account(&state, "acct-1", 0, 0).await;
+        seed_account_key(&state, "acct-1", Some("vault-a"), "en_scoped").await;
+        Arc::get_mut(&mut state.api_keys)
+            .unwrap()
+            .insert(
+                "static-super".into(),
+                Arc::new(ApiKeyEntry {
+                    rate: 1000.0,
+                    vaults: None,
+                    admin_vaults: HashSet::new(),
+                    account_id: None,
+                }),
+            );
+        seed_blob(&state, "vault-any", "m1").await;
+        let blob = axiom_engram::sync::SyncBlob {
+            vault_id: "vault-any".into(),
+            memory_id: "m2".into(),
+            device_id: "dev-1".into(),
+            vector_clock: 2,
+            ciphertext: "x".into(),
+            hmac: "h".into(),
+            created_at: "2026-08-20T00:00:00Z".into(),
+            deleted: false,
+        };
+        let res = do_push(&state, "static-super", "vault-any", vec![blob])
+            .await
+            .expect("static env keys remain superuser");
+        assert_eq!(res.0.accepted, 1);
     }
 
     #[tokio::test]
@@ -1151,12 +1242,13 @@ mod tests {
         seed_account(&state, "acct-1", 0, 0).await;
         seed_session(&state, "acct-1", "tok-1").await;
         // rate 1.0: first request passes, second is 429 — and must NOT fall
-        // through to the (valid) session path.
+        // through to the (valid) session path. Scoped to vault-a: NULL-scoped
+        // keys are policy-denied before the limiter ever runs.
         {
             let conn = state.conn.lock().await;
             conn.execute(
                 "INSERT INTO api_keys (id, account_id, key_hash, key_prefix, rate, vault_id, created_at, revoked) \
-                 VALUES ('k1', 'acct-1', ?1, 'en_', 1.0, NULL, 'now', 0)",
+                 VALUES ('k1', 'acct-1', ?1, 'en_', 1.0, 'vault-a', 'now', 0)",
                 rusqlite::params![crate::auth::hash_key("en_slow").to_vec()],
             )
             .unwrap();
@@ -1177,11 +1269,13 @@ mod tests {
         let state = test_state();
         seed_account(&state, "acct-1", 0, 0).await;
         seed_session(&state, "acct-1", "tok-1").await;
+        // The seeded key keeps the loopback wildcard off AND scopes the
+        // account to vault-a — a NULL scope would be policy-denied.
         {
             let conn = state.conn.lock().await;
             conn.execute(
                 "INSERT INTO api_keys (id, account_id, key_hash, key_prefix, rate, vault_id, created_at, revoked) \
-                 VALUES ('k1', 'acct-1', ?1, 'en_', 1.0, NULL, 'now', 0)",
+                 VALUES ('k1', 'acct-1', ?1, 'en_', 1.0, 'vault-a', 'now', 0)",
                 rusqlite::params![crate::auth::hash_key("en_slow").to_vec()],
             )
             .unwrap();

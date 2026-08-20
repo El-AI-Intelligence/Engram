@@ -207,8 +207,9 @@ const api = {
       acctPut(server, '/account/wraps/recovery', { wrapped_a_rec: wrappedARec, salt_rec: saltRec }),
     getVaultWrap: (server, vaultId) =>
       acctGet(server, '/account/vaults/' + encodeURIComponent(vaultId) + '/wrap'),
-    putVaultWrap: (server, vaultId, wrappedK) =>
-      acctPut(server, '/account/vaults/' + encodeURIComponent(vaultId) + '/wrap', { wrapped_k: wrappedK }),
+    putVaultWrap: (server, vaultId, wrappedK, password) =>
+      acctPut(server, '/account/vaults/' + encodeURIComponent(vaultId) + '/wrap',
+        password ? { wrapped_k: wrappedK, password } : { wrapped_k: wrappedK }),
     // Locking a vault gates key access: password accounts verify their
     // password fresh, in this request (server-enforced).
     deleteVaultWrap: (server, vaultId, password) =>
@@ -1524,19 +1525,32 @@ route('/handoff/:token', (token) => {
       let A = unlock.getAccountKey(accountId);
       if (!A) A = await unlock.requestAccountKey(accountId);
       if (A) unlock.setAccountKey(accountId, A);
+      let acctPassword = null;
       if (!A) {
-        const password = window.prompt('Enter your Engram account password to link the vault keys (it never leaves this tab):');
-        if (!password) return fail('Account password required — run `engram handoff` again when ready.');
+        acctPassword = window.prompt('Enter your Engram account password to link the vault keys (it never leaves this tab):');
+        if (!acctPassword) return fail('Account password required — run `engram handoff` again when ready.');
         const wraps = await api.account.wraps(ACCT);
         if (!wraps.password_wrap) return fail('Your account has no password wrap — sign in with your password first, then re-run `engram handoff`.');
         const blob = await api.account.getPasswordWrap(ACCT);
-        const wk = await unlock.deriveWithSalt(password, unlock.b64decode(blob.salt_pw));
+        const wk = await unlock.deriveWithSalt(acctPassword, unlock.b64decode(blob.salt_pw));
         try {
           A = await unlock.unwrapKey(wk, unlock.b64decode(blob.wrapped_a));
           unlock.setAccountKey(accountId, A);
         } catch {
           return fail('That password does not open your account key — run `engram handoff` again.');
         } finally { wk.fill(0); }
+      }
+      // Storing the wrap gates vault-key access: password accounts must
+      // verify their password fresh in the wrap request (server-enforced),
+      // so prompt when A came from memory instead of this tab's prompt.
+      if (!acctPassword) {
+        try {
+          const creds = await api.account.credentials(ACCT);
+          if (creds && creds.has_password) {
+            acctPassword = window.prompt('Storing your vault keys under your account gates them behind your password.\nConfirm with your account password:');
+            if (!acctPassword) return fail('Account password required — run `engram handoff` again when ready.');
+          }
+        } catch {}
       }
       const h = await r.json();
       const enc = unlock.b64decode(h.enc_key_b64);
@@ -1545,7 +1559,7 @@ route('/handoff/:token', (token) => {
       const K = new Uint8Array(64 + vid.length);
       K.set(enc, 0); K.set(hmac, 32); K.set(vid, 64);
       const wrapped = await unlock.wrapKey(A, K);
-      await api.account.putVaultWrap(ACCT, h.vault_id, unlock.b64encode(wrapped));
+      await api.account.putVaultWrap(ACCT, h.vault_id, unlock.b64encode(wrapped), acctPassword);
       enc.fill(0); hmac.fill(0); K.fill(0);
       // Strip the one-time token from history before moving on.
       history.replaceState(null, '', '#/handoff/');
@@ -1921,13 +1935,24 @@ function unlockView(opts = {}) {
       A = await accountPasswordOnce();
       if (!A) return;
     }
+    // Opening gates key access: password accounts must verify their
+    // password fresh in the wrap request (server-enforced, mirrors lock).
+    let password = null;
+    try {
+      const creds = await api.account.credentials(relay);
+      if (creds && creds.has_password) {
+        password = prompt('Making this vault open by default stores its keys under your account.\nConfirm with your account password:');
+        if (password === null) return;
+        if (!password) { toast('Account password required to open by default', 'error'); return; }
+      }
+    } catch {}
     const idBytes = new TextEncoder().encode(vaultId);
     const K = new Uint8Array(64 + idBytes.length);
     K.set(keys.encRaw, 0); K.set(keys.hmacRaw, 32); K.set(idBytes, 64);
     keys.encRaw.fill(0); keys.hmacRaw.fill(0);
     const wrapped = await unlock.wrapKey(A, K);
     A.fill(0); K.fill(0);
-    await api.account.putVaultWrap(relay, vaultId, unlock.b64encode(wrapped));
+    await api.account.putVaultWrap(relay, vaultId, unlock.b64encode(wrapped), password);
     toast('Vault now opens by default', 'ok');
   }
 
@@ -4048,7 +4073,12 @@ route('/settings', async () => {
 
     document.getElementById('acct-new-key').onclick = async () => {
       try {
+        // Keys are always scoped to a vault now: no vault_id, no key.
         const vaultId = team?.vault_id || sync.vault_id || null;
+        if (!vaultId) {
+          toast('No vault to scope a key to — open a vault or pair this device first', 'error');
+          return;
+        }
         const k = await api.account.createKey(server, vaultId);
         document.getElementById('acct-key-once').innerHTML = `
           <div class="settings-note">

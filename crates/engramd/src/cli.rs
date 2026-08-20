@@ -767,6 +767,51 @@ fn vault_site_link(vault_path: &std::path::Path, site: &str) -> String {
     }
 }
 
+/// Resolve the sync vault id pair/link must mint a key for: the id pinned
+/// in config.json wins (the daemon pins it on first sync), else derive it
+/// from the vault passphrase — the just-created passphrase when this run
+/// made the vault, else the ENGRAM_PASSPHRASE line in ~/.engram/env. Both
+/// paths land the same vault every other device already syncs; the relay
+/// rejects a mint for a vault the account doesn't own (403 vault_not_owned).
+fn resolve_sync_vault_id(
+    vault_path: &std::path::Path,
+    fresh_passphrase: Option<&str>,
+) -> Result<String> {
+    let cfg = std::fs::read_to_string(vault_path.join("config.json"))
+        .ok()
+        .and_then(|data| serde_json::from_str::<serde_json::Value>(&data).ok());
+    if let Some(pinned) = cfg
+        .as_ref()
+        .and_then(|c| c.get("sync"))
+        .and_then(|s| s.get("vault_id"))
+        .and_then(|v| v.as_str())
+        .filter(|v| !v.is_empty())
+    {
+        return Ok(pinned.to_string());
+    }
+    let passphrase = match fresh_passphrase {
+        Some(p) => Some(p.to_string()),
+        None => std::fs::read_to_string(config_dir().join("env")).ok().and_then(|content| {
+            content
+                .lines()
+                .find_map(|line| line.strip_prefix("ENGRAM_PASSPHRASE="))
+                .map(str::trim)
+                .map(|v| v.trim_matches('"').trim_matches('\''))
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+        }),
+    };
+    let passphrase = passphrase.ok_or_else(|| {
+        anyhow::anyhow!(
+            "cannot derive this vault's sync id: config.json pins no vault_id and no \
+             passphrase is available (~/.engram/env has no ENGRAM_PASSPHRASE line).\n\
+             Fix one of: add \"sync\": {{ \"vault_id\": \"...\" }} to config.json, or \
+             set ENGRAM_PASSPHRASE in ~/.engram/env."
+        )
+    })?;
+    Ok(crate::sync_client::derive_vault_id(&passphrase))
+}
+
 pub async fn handle_pair(
     code: String,
     vault_opt: Option<PathBuf>,
@@ -788,9 +833,12 @@ pub async fn handle_pair(
     };
 
     // Redeem the code for an account API key. Codes are single-use and last
-    // 10 minutes — the relay is the source of truth for both.
+    // 10 minutes — the relay is the source of truth for both. The minted
+    // key is scoped to this vault, so the body carries the client-derived
+    // vault id (pinned config value, else derived from the passphrase).
     let code = code.trim().to_ascii_uppercase();
-    let mut body = serde_json::json!({ "code": code });
+    let vault_id = resolve_sync_vault_id(&vault_path, fresh_passphrase.as_deref())?;
+    let mut body = serde_json::json!({ "code": code, "vault_id": vault_id });
     if let Some(ref n) = name {
         body["device_label"] = serde_json::Value::String(n.clone());
     }
@@ -822,6 +870,12 @@ pub async fn handle_pair(
                  Mint a new one from the site: Account & Sync → Pair a device."
             ),
             (429, _) => anyhow::bail!("too many pairing attempts — wait a moment and try again."),
+            (403, "vault_not_owned") => anyhow::bail!(
+                "pairing rejected: this account has no access to that vault.\n\
+                 If the vault is shared, ask its owner to pair you in Account & Sync.\n\
+                 If it is yours, the passphrase on this machine differs from your other\n\
+                 devices — re-check ~/.engram/env."
+            ),
             _ => anyhow::bail!("pairing failed: {err_code}"),
         }
     }
@@ -906,7 +960,11 @@ pub async fn handle_link(
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()?;
-    let mut body = serde_json::json!({ "public_key": pk_b64 });
+    // The intent carries the vault id the minted key will be scoped to —
+    // the signed-in browser confirms it, so the relay can validate
+    // ownership before sealing a key.
+    let vault_id = resolve_sync_vault_id(&vault_path, fresh_passphrase.as_deref())?;
+    let mut body = serde_json::json!({ "public_key": pk_b64, "vault_id": vault_id });
     if let Some(ref n) = name {
         body["device_label"] = serde_json::Value::String(n.clone());
     }

@@ -412,6 +412,7 @@ async fn main() -> anyhow::Result<()> {
             nonce        BLOB,
             device_label TEXT,
             status       TEXT NOT NULL DEFAULT 'pending',
+            vault_id     TEXT,
             created_at   TEXT NOT NULL,
             expires_at   TEXT NOT NULL
         );
@@ -490,6 +491,27 @@ async fn main() -> anyhow::Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_auth_events_account ON auth_events(account_id);",
     )?;
+
+    // ── Migrations (no framework: CREATE TABLE IF NOT EXISTS never adds
+    // ── columns to existing DBs, so each added column needs its own guard.
+    // link_intents.vault_id (2026-08-20): link intents now carry the
+    // client-derived vault id the minted key will be scoped to. NULL on
+    // pre-migration rows — confirm_link_intent 410s those (re-run `engram
+    // link`, the intent TTL makes them dead within 10 minutes anyway).
+    let has_vault_id: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('link_intents') WHERE name = 'vault_id'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if has_vault_id == 0 {
+        conn.execute(
+            "ALTER TABLE link_intents ADD COLUMN vault_id TEXT",
+            [],
+        )?;
+        tracing::info!("migration: added link_intents.vault_id");
+    }
 
     // ── Run tombstone cleanup on startup ───────────────────────────────
     let deleted: u64 = conn
@@ -688,7 +710,11 @@ pub fn send_reset_email(cfg: &SmtpConfig, recipient: &str, link: &str) -> anyhow
     use lettre::transport::smtp::client::{Tls, TlsParameters};
     use lettre::{Message, SmtpTransport, Transport};
 
-    let tls = Tls::Opportunistic(TlsParameters::builder(cfg.host.clone()).build()?);
+    // STARTTLS is mandatory: `Opportunistic` silently sends the reset link
+    // in cleartext to a server that doesn't offer it. `Wrapper` (lettre's
+    // "require STARTTLS") matches the default port 587 path; a relay on
+    // implicit TLS (465) would need `Tls::Required` instead.
+    let tls = Tls::Wrapper(TlsParameters::builder(cfg.host.clone()).build()?);
     let mut builder = SmtpTransport::relay(&cfg.host)?
         .port(cfg.port)
         .tls(tls);

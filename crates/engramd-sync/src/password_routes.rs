@@ -214,7 +214,9 @@ async fn reset_request(
             }
             None => None,
         };
-        let sent = account_id.is_some() && state.smtp.is_some();
+        // Uniform whenever SMTP is configured: `sent` must not leak whether
+        // the email exists on the relay (enumeration oracle).
+        let sent = state.smtp.is_some();
         if let Some(ref account_id) = account_id {
             crate::account_routes::audit_event(&conn, account_id, "reset_request", None);
         }
@@ -402,7 +404,7 @@ pub(crate) fn require_fresh_password(
     }
 }
 
-async fn check_bucket(
+pub(crate) async fn check_bucket(
     state: &SyncState,
     key: String,
     rate: f64,
@@ -783,7 +785,10 @@ mod tests {
         assert_eq!(body["sent"], true, "known account + configured SMTP reports sent immediately");
         let (status, body) = call_reset_request(&state, "nobody@example.com").await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["sent"], false, "unknown account never reports sent");
+        assert_eq!(
+            body["sent"], true,
+            "uniform sent: unknown email must match known when SMTP is configured"
+        );
     }
 
     #[tokio::test]
