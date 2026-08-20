@@ -269,7 +269,19 @@ jobs:
             --apple-id "$APPLE_ID" --password "$APPLE_APP_PASSWORD" --team-id "$APPLE_TEAM_ID" --wait
           mkdir -p staged
           ditto -x -k notary.zip staged/
-          xcrun stapler staple staged/dist/engram staged/dist/engramd
+          # The notarization ticket takes seconds-to-minutes to propagate
+          # through Apple's CloudKit; stapling immediately after "Accepted"
+          # races it and dies with Error 73 ("Record not found"). Retry
+          # with backoff until the ticket lands.
+          STAPLED=0
+          for i in 1 2 3 4 5 6 7 8; do
+            if xcrun stapler staple staged/dist/engram staged/dist/engramd staged/dist/engramd-mcp; then
+              STAPLED=1; break
+            fi
+            echo "stapler attempt $i failed — retrying in 20s"
+            sleep 20
+          done
+          [ "$STAPLED" = "1" ] || { echo "stapler never succeeded"; exit 1; }
           xcrun stapler validate staged/dist/engramd
           tar czf ${{ matrix.artifact }} -C staged/dist engram engramd engramd-mcp
           sha256sum ${{ matrix.artifact }} > ${{ matrix.artifact }}.sha256
