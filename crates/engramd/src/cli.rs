@@ -70,6 +70,9 @@ pub enum Commands {
         /// Sync relay URL (defaults to the public Engram relay)
         #[arg(long, default_value = "https://sync.ellmstack.dev")]
         server_url: String,
+        /// Vault site URL (where your vault opens after pairing)
+        #[arg(long, default_value = "https://engram.ellmstack.dev/app")]
+        site: String,
         /// Device label shown in Account & Sync (optional)
         #[arg(long)]
         name: Option<String>,
@@ -700,10 +703,32 @@ fn print_sync_next_steps(fresh_vault: bool, vault_path: &std::path::Path) {
     }
 }
 
+/// The site URL for this vault: a per-vault deep link once the daemon's
+/// first sync pins `sync.vault_id` into the vault's config.json, the
+/// unlock picker until then (an honest fallback — the per-vault link
+/// appears here after the first sync).
+fn vault_site_link(vault_path: &std::path::Path, site: &str) -> String {
+    let site = site.trim_end_matches('/');
+    let pinned = std::fs::read_to_string(vault_path.join("config.json"))
+        .ok()
+        .and_then(|data| serde_json::from_str::<serde_json::Value>(&data).ok())
+        .and_then(|cfg| {
+            cfg.get("sync")
+                .and_then(|s| s.get("vault_id"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        });
+    match pinned {
+        Some(id) if !id.is_empty() => format!("{site}/#/vault/{id}"),
+        _ => format!("{site}/#/unlock"),
+    }
+}
+
 pub async fn handle_pair(
     code: String,
     vault_opt: Option<PathBuf>,
     server_url: String,
+    site: String,
     name: Option<String>,
 ) -> Result<()> {
     println!();
@@ -771,6 +796,7 @@ pub async fn handle_pair(
     if fresh_passphrase.is_some() {
         println!("     (vault created at {} — passphrase NOT stored on disk)", vault_path.display());
     }
+    println!("     Your vault on the site: {}", vault_site_link(&vault_path, &site));
     print_sync_next_steps(fresh_passphrase.is_some(), &vault_path);
     println!();
 
@@ -967,6 +993,7 @@ pub async fn handle_link(
     if fresh_passphrase.is_some() {
         println!("     (vault created at {} — passphrase NOT stored on disk)", vault_path.display());
     }
+    println!("     Your vault on the site: {}", vault_site_link(&vault_path, &site));
     print_sync_next_steps(fresh_passphrase.is_some(), &vault_path);
     println!();
 
@@ -2328,6 +2355,22 @@ mod tests {
         for no in ["n", "no", "q", "yep", "maybe"] {
             assert!(!parse_yn(no), "{no:?} should be no");
         }
+    }
+
+    #[test]
+    fn vault_site_link_pinned_and_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let site = "https://engram.ellmstack.dev/app";
+        // No config.json yet → the unlock picker is the honest fallback.
+        assert_eq!(vault_site_link(dir.path(), site), format!("{site}/#/unlock"));
+        // A pinned sync.vault_id → the per-vault deep link.
+        std::fs::write(dir.path().join("config.json"), r#"{"sync":{"vault_id":"eng_abc123"}}"#).unwrap();
+        assert_eq!(vault_site_link(dir.path(), site), format!("{site}/#/vault/eng_abc123"));
+        // Trailing slashes on the site are trimmed.
+        assert_eq!(vault_site_link(dir.path(), &format!("{site}/")), format!("{site}/#/vault/eng_abc123"));
+        // Empty pinned id still falls back.
+        std::fs::write(dir.path().join("config.json"), r#"{"sync":{"vault_id":""}}"#).unwrap();
+        assert_eq!(vault_site_link(dir.path(), site), format!("{site}/#/unlock"));
     }
 }
 

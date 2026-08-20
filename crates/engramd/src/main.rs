@@ -142,8 +142,8 @@ async fn dispatch_cli(cmd: cli::Commands) -> anyhow::Result<()> {
         cli::Commands::Join { vault, server_url, api_key, vault_id, name } => {
             cli::handle_join(vault, server_url, api_key, vault_id, name).await
         }
-        cli::Commands::Pair { code, vault, server_url, name } => {
-            cli::handle_pair(code, vault, server_url, name).await
+        cli::Commands::Pair { code, vault, server_url, site, name } => {
+            cli::handle_pair(code, vault, server_url, site, name).await
         }
         cli::Commands::Link { vault, server_url, site, name, force } => {
             cli::handle_link(vault, server_url, site, name, force).await
