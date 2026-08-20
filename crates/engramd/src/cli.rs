@@ -187,8 +187,14 @@ pub enum Commands {
         #[arg(default_value = "status")]
         command: String,
         /// Engramd API URL the MCP server should talk to
-        #[arg(long, default_value = "http://127.0.0.1:8787")]
+        #[arg(long, default_value = "http://127.0.0.1:8787", env = "ENGRAMD_URL")]
         url: String,
+        /// Print what would happen without writing anything
+        #[arg(long)]
+        dry_run: bool,
+        /// Skip all confirmation prompts (non-interactive install)
+        #[arg(long)]
+        yes: bool,
     },
     /// Show the weekly digest — what your AI learned about you this week
     Digest {
@@ -1590,12 +1596,23 @@ fn manual_mcp_snippet(url: &str) -> String {
     .unwrap_or_default()
 }
 
-/// Is `engramd-mcp` available on PATH?
-fn mcp_binary_on_path() -> bool {
-    let name = if cfg!(windows) { "engramd-mcp.exe" } else { "engramd-mcp" };
+/// Is a file with this name anywhere on PATH?
+fn binary_on_path(name: &str) -> bool {
     std::env::var_os("PATH")
         .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(name).is_file()))
         .unwrap_or(false)
+}
+
+/// Is `engramd-mcp` available on PATH?
+fn mcp_binary_on_path() -> bool {
+    let name = if cfg!(windows) { "engramd-mcp.exe" } else { "engramd-mcp" };
+    binary_on_path(name)
+}
+
+/// Is the `claude` CLI available (so `claude mcp add` can run)? On Windows
+/// the CLI is a `claude.cmd` shim, not `claude.exe`.
+fn claude_code_on_path() -> bool {
+    binary_on_path("claude") || (cfg!(windows) && binary_on_path("claude.cmd"))
 }
 
 /// Is the daemon answering /health at `url`? (2s timeout — install-time
@@ -1624,79 +1641,320 @@ fn mcp_config_has_engram(path: &PathBuf) -> bool {
         .is_some()
 }
 
-/// `engram mcp install` — write an `engram` entry into the MCP configs of
-/// the supported clients installed on this machine (Claude Desktop, Cursor,
-/// Windsurf), merging with any servers already configured. Clients that
-/// aren't installed get the exact snippet to paste. Also points Claude Code
-/// users at `claude mcp add` (its config is machine-managed, not edited).
-///
-/// `engram mcp status` — report binary, daemon, and per-client state.
-pub async fn handle_mcp(command: String, engramd_url: String) -> Result<()> {
-    match command.as_str() {
-        "install" => {
-            // Preflight: the configs point at a binary and a daemon that
-            // should actually exist, or the editor will just show a dead
-            // server.
-            if !mcp_binary_on_path() {
+/// One planned `engram mcp install` step. The plan is built without
+/// writing or running anything, so it can be printed for `--dry-run`,
+/// confirmed step by step, and unit-tested.
+#[derive(Debug, PartialEq)]
+enum McpAction {
+    /// Write (or create) an editor's MCP config file.
+    WriteConfig {
+        label: String,
+        path: PathBuf,
+        content: String,
+        creates: bool,
+    },
+    /// Run `claude mcp add` to attach the server to Claude Code.
+    RunClaudeCode { url: String },
+    /// The editor (or the `claude` CLI) isn't installed — show how to
+    /// configure it manually.
+    NotDetected { label: String, hint: String },
+    /// An existing config could not be merged — leave it untouched.
+    WarnMergeFailed { label: String, error: String },
+    /// `engramd-mcp` is not on PATH.
+    WarnMissingBinary,
+    /// The daemon isn't answering /health at the configured URL.
+    WarnDaemonUnreachable { url: String },
+}
+
+/// Build the full install plan for this machine: warnings, per-editor
+/// config writes, the Claude Code step, and manual snippets for editors
+/// that aren't installed. Reads existing configs (to merge, never clobber)
+/// but writes nothing.
+fn mcp_install_plan(
+    clients: &[McpClient],
+    mcp_binary: bool,
+    claude: bool,
+    daemon_up: bool,
+    url: &str,
+) -> Vec<McpAction> {
+    let mut plan = Vec::new();
+    if !mcp_binary {
+        plan.push(McpAction::WarnMissingBinary);
+    }
+    if !daemon_up {
+        plan.push(McpAction::WarnDaemonUnreachable { url: url.to_string() });
+    }
+    for client in clients {
+        if client.config_path.exists() {
+            // Merge into the existing config — never clobber other
+            // servers the user has configured.
+            let existing = std::fs::read_to_string(&client.config_path).unwrap_or_default();
+            match merge_mcp_server(&existing, url) {
+                Ok(merged) => plan.push(McpAction::WriteConfig {
+                    label: client.label.to_string(),
+                    path: client.config_path.clone(),
+                    content: merged,
+                    creates: false,
+                }),
+                Err(e) => plan.push(McpAction::WarnMergeFailed {
+                    label: client.label.to_string(),
+                    error: e,
+                }),
+            }
+        } else if client.config_dir.as_ref().map(|d| d.exists()).unwrap_or(false) {
+            // The app is installed but has no MCP config yet — create a
+            // fresh one rather than making the user hand-write JSON.
+            match merge_mcp_server("", url) {
+                Ok(merged) => plan.push(McpAction::WriteConfig {
+                    label: client.label.to_string(),
+                    path: client.config_path.clone(),
+                    content: merged,
+                    creates: true,
+                }),
+                Err(e) => plan.push(McpAction::WarnMergeFailed {
+                    label: client.label.to_string(),
+                    error: e,
+                }),
+            }
+        } else {
+            plan.push(McpAction::NotDetected {
+                label: client.label.to_string(),
+                hint: manual_mcp_snippet(url),
+            });
+        }
+    }
+    if claude {
+        plan.push(McpAction::RunClaudeCode { url: url.to_string() });
+    } else {
+        plan.push(McpAction::NotDetected {
+            label: "Claude Code".to_string(),
+            hint: claude_add_cmdline(url),
+        });
+    }
+    plan
+}
+
+/// The program + args that attach the engram MCP server to Claude Code.
+/// `--scope user` because Claude Code manages its own config — never
+/// hand-edited. On Windows `claude` is a `.cmd` shim, which CreateProcess
+/// can't run directly — go through `cmd /C`.
+fn claude_add_command(url: &str) -> (String, Vec<String>) {
+    #[cfg(windows)]
+    {
+        (
+            "cmd".to_string(),
+            vec![
+                "/C".to_string(),
+                "claude".to_string(),
+                "mcp".to_string(),
+                "add".to_string(),
+                "--scope".to_string(),
+                "user".to_string(),
+                "engram".to_string(),
+                "--".to_string(),
+                "engramd-mcp".to_string(),
+                "--engramd-url".to_string(),
+                url.to_string(),
+            ],
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        (
+            "claude".to_string(),
+            vec![
+                "mcp".to_string(),
+                "add".to_string(),
+                "--scope".to_string(),
+                "user".to_string(),
+                "engram".to_string(),
+                "--".to_string(),
+                "engramd-mcp".to_string(),
+                "--engramd-url".to_string(),
+                url.to_string(),
+            ],
+        )
+    }
+}
+
+/// The same command as a single display string (for hints and fallbacks).
+fn claude_add_cmdline(url: &str) -> String {
+    let (prog, args) = claude_add_command(url);
+    format!("{prog} {}", args.join(" "))
+}
+
+/// Yes/no parsing for confirmation prompts: empty defaults to yes.
+fn parse_yn(line: &str) -> bool {
+    matches!(line.trim().to_lowercase().as_str(), "" | "y" | "yes")
+}
+
+/// Prompt on stdout and read one line of stdin. Non-TTY stdin counts as
+/// "no" — a piped run should never be prompted into writing.
+fn confirm_yn(prompt: &str) -> bool {
+    if !std::io::stdin().is_terminal() {
+        return false;
+    }
+    print!("{prompt} ");
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return false;
+    }
+    parse_yn(&line)
+}
+
+/// Human-readable plan summary — shared by `--dry-run` and the non-TTY
+/// guard, so both show exactly what would happen.
+fn print_plan_summary(plan: &[McpAction]) {
+    for action in plan {
+        match action {
+            McpAction::WriteConfig { label, path, creates, .. } => {
+                println!(
+                    "  write  {label} — {} {}",
+                    if *creates { "create" } else { "update" },
+                    path.display()
+                );
+            }
+            McpAction::RunClaudeCode { url } => {
+                println!("  run    Claude Code — {}", claude_add_cmdline(url));
+            }
+            McpAction::NotDetected { label, hint } => {
+                println!("  manual {label} — not detected; to configure manually:");
+                println!("{hint}");
+                println!();
+            }
+            McpAction::WarnMergeFailed { label, error } => {
+                println!("  skip   {label} — {error} (left untouched)");
+            }
+            McpAction::WarnMissingBinary => {
+                println!("  warn   `engramd-mcp` is not on your PATH.");
+                println!("         Install it first: cargo install --path crates/engramd-mcp");
+            }
+            McpAction::WarnDaemonUnreachable { url } => {
+                println!(
+                    "  warn   engramd is not reachable at {url} — MCP tools will fail until it is."
+                );
+                println!("         Start it with: engram daemon");
+            }
+        }
+    }
+}
+
+/// Execute an install plan. `--dry-run` prints it and exits; a piped
+/// non-TTY without `--yes` prints it and refuses (exit 1 — nothing is
+/// ever written silently); an interactive session confirms each write and
+/// the Claude Code step one at a time, default yes.
+fn apply_mcp_plan(plan: &[McpAction], dry_run: bool, yes: bool) -> Result<()> {
+    if dry_run {
+        println!("engram mcp install — plan (nothing was written):");
+        print_plan_summary(plan);
+        println!();
+        println!("Nothing was written. Re-run without --dry-run to install.");
+        return Ok(());
+    }
+    if !std::io::stdin().is_terminal() && !yes {
+        println!("engram mcp install would:");
+        print_plan_summary(plan);
+        println!();
+        println!("stdin is not interactive and --yes was not given — nothing was written.");
+        println!("Re-run with: engram mcp install --yes");
+        std::process::exit(1);
+    }
+    let mut applied = false;
+    for action in plan {
+        match action {
+            McpAction::WriteConfig { label, path, content, creates } => {
+                let ok = yes
+                    || confirm_yn(&format!(
+                        "[{label}] Write this config to {}? [Y/n]:",
+                        path.display()
+                    ));
+                if ok {
+                    std::fs::write(path, content)?;
+                    println!(
+                        "✅ {label} — {} {}",
+                        if *creates { "created" } else { "updated" },
+                        path.display()
+                    );
+                    applied = true;
+                } else {
+                    println!("  skipped {label}");
+                }
+            }
+            McpAction::RunClaudeCode { url } => {
+                let (prog, args) = claude_add_command(url);
+                let ok = yes
+                    || confirm_yn("[Claude Code] Add the engram MCP server to Claude Code? [Y/n]:");
+                if ok {
+                    match std::process::Command::new(&prog).args(&args).status() {
+                        Ok(s) if s.success() => {
+                            println!("✅ Claude Code — engram MCP server added");
+                            applied = true;
+                        }
+                        _ => {
+                            // Never claim success on failure — fall back to
+                            // the exact command so the user can run it.
+                            println!(
+                                "⚠️  Claude Code — `{prog}` did not complete successfully; run it manually:"
+                            );
+                            println!("     {}", claude_add_cmdline(url));
+                            println!("     Or add this entry to your editor's MCP config:");
+                            println!("{}", manual_mcp_snippet(url));
+                        }
+                    }
+                } else {
+                    println!("  skipped Claude Code");
+                }
+            }
+            McpAction::NotDetected { label, hint } => {
+                println!("ℹ️  {label} — not detected; to configure it manually:");
+                println!("{hint}");
+                println!();
+            }
+            McpAction::WarnMergeFailed { label, error } => {
+                println!("⚠️  {label} — {error}; left the existing config untouched");
+            }
+            McpAction::WarnMissingBinary => {
                 println!("⚠️  `engramd-mcp` is not on your PATH.");
                 println!("   Install it first:");
                 println!("     cargo install --path crates/engramd-mcp   # from the engram repo");
                 println!();
             }
-            if !daemon_reachable(&engramd_url).await {
-                println!("⚠️  engramd is not reachable at {engramd_url} — MCP tools will fail until it is.");
+            McpAction::WarnDaemonUnreachable { url } => {
+                println!("⚠️  engramd is not reachable at {url} — MCP tools will fail until it is.");
                 println!("   Start it with: engram daemon");
                 println!();
             }
+        }
+    }
+    if applied {
+        println!();
+        println!("Restart the editor after installing — MCP servers load at startup.");
+    }
+    println!("Docs: docs/engram-product/MCP.md");
+    Ok(())
+}
 
-            for client in mcp_clients() {
-                if client.config_path.exists() {
-                    // Merge into the existing config — never clobber other
-                    // servers the user has configured.
-                    let existing =
-                        std::fs::read_to_string(&client.config_path).unwrap_or_default();
-                    match merge_mcp_server(&existing, &engramd_url) {
-                        Ok(merged) => {
-                            std::fs::write(&client.config_path, merged)?;
-                            println!(
-                                "✅ {} — updated {}",
-                                client.label,
-                                client.config_path.display()
-                            );
-                        }
-                        Err(e) => println!(
-                            "⚠️  {} — {e}; left the existing config untouched",
-                            client.label
-                        ),
-                    }
-                } else if client.config_dir.as_ref().map(|d| d.exists()).unwrap_or(false) {
-                    // The app is installed but has no MCP config yet — create
-                    // a fresh one rather than making the user hand-write JSON.
-                    let merged = merge_mcp_server("", &engramd_url).map_err(anyhow::Error::msg)?;
-                    std::fs::write(&client.config_path, merged)?;
-                    println!(
-                        "✅ {} — created {}",
-                        client.label,
-                        client.config_path.display()
-                    );
-                } else {
-                    println!(
-                        "ℹ️  {} — not detected; add this to its MCP config file manually:",
-                        client.label
-                    );
-                    println!("{}", manual_mcp_snippet(&engramd_url));
-                    println!();
-                }
-            }
-
-            println!("ℹ️  Claude Code — run:");
-            println!(
-                "     claude mcp add --scope user engram -- engramd-mcp --engramd-url {engramd_url}"
+/// `engram mcp install` — write an `engram` entry into the MCP configs of
+/// the supported clients installed on this machine (Claude Desktop, Cursor,
+/// Windsurf), merging with any servers already configured, and run
+/// `claude mcp add` for Claude Code. Every write is confirmed first
+/// (skipped with `--yes`, previewed with `--dry-run`); clients that
+/// aren't installed get the exact snippet to paste.
+///
+/// `engram mcp status` — report binary, daemon, and per-client state.
+pub async fn handle_mcp(command: String, engramd_url: String, dry_run: bool, yes: bool) -> Result<()> {
+    match command.as_str() {
+        "install" => {
+            let clients = mcp_clients();
+            let plan = mcp_install_plan(
+                &clients,
+                mcp_binary_on_path(),
+                claude_code_on_path(),
+                daemon_reachable(&engramd_url).await,
+                &engramd_url,
             );
-            println!();
-            println!("Restart the editor after installing — MCP servers load at startup.");
-            println!("Docs: docs/engram-product/MCP.md");
-            Ok(())
+            apply_mcp_plan(&plan, dry_run, yes)
         }
         "status" => {
             let binary = if mcp_binary_on_path() { "on PATH ✅" } else { "NOT on PATH ⚠️" };
@@ -1705,6 +1963,7 @@ pub async fn handle_mcp(command: String, engramd_url: String) -> Result<()> {
             } else {
                 format!("{engramd_url} unreachable ⚠️")
             };
+            let claude = claude_code_on_path();
             println!("MCP server status:");
             println!("  Command:  engramd-mcp --engramd-url {engramd_url}");
             println!("  Binary:   {binary}");
@@ -1712,7 +1971,7 @@ pub async fn handle_mcp(command: String, engramd_url: String) -> Result<()> {
             println!("  Tools:    6 (engram_search, engram_capture, engram_get, engram_context, engram_health, engram_decay)");
             println!("  Transport: stdio");
             println!();
-            let mut any = false;
+            let mut any = claude;
             for client in mcp_clients() {
                 let state = if client.config_path.exists() {
                     if mcp_config_has_engram(&client.config_path) {
@@ -1726,6 +1985,11 @@ pub async fn handle_mcp(command: String, engramd_url: String) -> Result<()> {
                 println!("  {:<16} {}", client.label, state);
                 any |= client.config_path.exists();
             }
+            println!(
+                "  {:<16} {}",
+                "Claude Code",
+                if claude { "on PATH ✅" } else { "not detected" }
+            );
             if !any {
                 println!();
                 println!("No supported editors detected. Run: engram mcp install");
@@ -1931,6 +2195,139 @@ mod tests {
         assert!(merge_mcp_server("{not json", "http://127.0.0.1:8787").is_err());
         assert!(merge_mcp_server("[1,2,3]", "http://127.0.0.1:8787").is_err());
         assert!(merge_mcp_server(r#"{"mcpServers": "oops"}"#, "http://127.0.0.1:8787").is_err());
+    }
+
+    #[test]
+    fn plan_builder_merges_creates_and_detects() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = "http://127.0.0.1:8787";
+
+        let existing_dir = dir.path().join("existing");
+        std::fs::create_dir_all(&existing_dir).unwrap();
+        let existing_path = existing_dir.join("mcp.json");
+        let existing_json = r#"{"mcpServers":{"other":{"command":"x","args":[]}}}"#;
+        std::fs::write(&existing_path, existing_json).unwrap();
+
+        let fresh_dir = dir.path().join("fresh");
+        std::fs::create_dir_all(&fresh_dir).unwrap();
+        let fresh_path = fresh_dir.join("mcp.json");
+
+        let absent_dir = dir.path().join("absent"); // never created
+        let absent_path = absent_dir.join("mcp.json");
+
+        let clients = vec![
+            McpClient {
+                label: "Existing",
+                config_path: existing_path.clone(),
+                config_dir: Some(existing_dir),
+            },
+            McpClient {
+                label: "Fresh",
+                config_path: fresh_path.clone(),
+                config_dir: Some(fresh_dir),
+            },
+            McpClient {
+                label: "Absent",
+                config_path: absent_path,
+                config_dir: Some(absent_dir),
+            },
+        ];
+        let plan = mcp_install_plan(&clients, true, true, true, url);
+
+        assert_eq!(
+            plan,
+            vec![
+                McpAction::WriteConfig {
+                    label: "Existing".into(),
+                    path: existing_path,
+                    content: merge_mcp_server(existing_json, url).unwrap(),
+                    creates: false,
+                },
+                McpAction::WriteConfig {
+                    label: "Fresh".into(),
+                    path: fresh_path,
+                    content: merge_mcp_server("", url).unwrap(),
+                    creates: true,
+                },
+                McpAction::NotDetected {
+                    label: "Absent".into(),
+                    hint: manual_mcp_snippet(url),
+                },
+                McpAction::RunClaudeCode { url: url.into() },
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_builder_warns_and_hints_when_things_are_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = "http://127.0.0.1:8787";
+        let absent_dir = dir.path().join("absent");
+        let clients = vec![McpClient {
+            label: "Claude Desktop",
+            config_path: absent_dir.join("claude_desktop_config.json"),
+            config_dir: Some(absent_dir),
+        }];
+        let plan = mcp_install_plan(&clients, false, false, false, url);
+
+        assert_eq!(plan[0], McpAction::WarnMissingBinary);
+        assert_eq!(plan[1], McpAction::WarnDaemonUnreachable { url: url.into() });
+        assert!(matches!(
+            &plan[2],
+            McpAction::NotDetected { label, .. } if label == "Claude Desktop"
+        ));
+        let McpAction::NotDetected { label, hint } = &plan[3] else {
+            panic!("expected Claude Code NotDetected, got {:?}", plan[3]);
+        };
+        assert_eq!(label, "Claude Code");
+        assert!(hint.contains("claude mcp add"), "hint should carry the command: {hint}");
+    }
+
+    #[test]
+    fn plan_builder_merge_failure_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broken.json");
+        std::fs::write(&path, "{not json").unwrap();
+        let clients = vec![McpClient { label: "Broken", config_path: path, config_dir: None }];
+        let plan = mcp_install_plan(&clients, true, true, true, "http://127.0.0.1:8787");
+        assert!(matches!(
+            &plan[0],
+            McpAction::WarnMergeFailed { label, .. } if label == "Broken"
+        ));
+    }
+
+    #[test]
+    fn claude_add_command_shape() {
+        let (prog, args) = claude_add_command("http://127.0.0.1:8787");
+        #[cfg(windows)]
+        {
+            assert_eq!(prog, "cmd");
+            assert_eq!(&args[0..2], &["/C", "claude"]);
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(prog, "claude");
+        }
+        let tail = if cfg!(windows) { &args[2..] } else { &args[..] };
+        let tail: Vec<&str> = tail.iter().map(String::as_str).collect();
+        assert_eq!(
+            tail,
+            ["mcp", "add", "--scope", "user", "engram", "--", "engramd-mcp", "--engramd-url", "http://127.0.0.1:8787"]
+        );
+        assert_eq!(
+            claude_add_cmdline("http://127.0.0.1:8787"),
+            format!("{prog} {}", args.join(" "))
+        );
+    }
+
+    #[test]
+    fn parse_yn_defaults_to_yes() {
+        for yes in ["", "y", "Y", "yes", "YES", " y ", "Yes "] {
+            assert!(parse_yn(yes), "{yes:?} should be yes");
+        }
+        for no in ["n", "no", "q", "yep", "maybe"] {
+            assert!(!parse_yn(no), "{no:?} should be no");
+        }
     }
 }
 

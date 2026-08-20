@@ -169,8 +169,8 @@ async fn dispatch_cli(cmd: cli::Commands) -> anyhow::Result<()> {
         cli::Commands::BackfillLinks { vault, max_links, min_similarity } => {
             cli::handle_backfill_links(vault, max_links, min_similarity).await
         }
-        cli::Commands::Mcp { command, url } => {
-            cli::handle_mcp(command, url).await
+        cli::Commands::Mcp { command, url, dry_run, yes } => {
+            cli::handle_mcp(command, url, dry_run, yes).await
         }
         cli::Commands::Digest { url, days, prose } => {
             cli::handle_digest(url, days, prose).await

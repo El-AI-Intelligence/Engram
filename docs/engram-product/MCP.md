@@ -27,16 +27,34 @@ engram daemon        # → http://localhost:8787
 # 2. Install the MCP server binary
 cargo install --path crates/engramd-mcp
 
-# 3. Write MCP config for every supported editor on this machine
+# 3. Configure every supported AI tool on this machine
 engram mcp install
 ```
 
-`engram mcp install` merges an `engram` entry into the configs it finds
-(Claude Desktop, Cursor, Windsurf), creates a config where the editor is
-installed but unconfigured, and prints the exact snippet for anything it
-can't detect — it never clobbers other MCP servers you've configured.
+`engram mcp install` is interactive: it shows what it will do, then asks
+**yes/no per editor** before writing anything (default yes — press Enter
+to accept). It:
+
+- merges an `engram` entry into the configs it finds (Claude Desktop,
+  Cursor, Windsurf) — it never clobbers other MCP servers you've
+  configured,
+- creates a fresh config where an editor is installed but unconfigured,
+- runs `claude mcp add --scope user` for Claude Code when the `claude` CLI
+  is on your PATH,
+- prints the exact snippet for anything it can't detect.
+
 Preflight checks warn you if `engramd-mcp` is missing from your PATH or
 the daemon isn't answering at the URL.
+
+Non-interactive use:
+
+```bash
+engram mcp install --yes       # skip the prompts, write everything
+engram mcp install --dry-run   # print the plan, write nothing
+```
+
+A piped/scripted run without `--yes` prints the plan and exits 1 —
+nothing is ever written silently.
 
 Check state any time:
 
@@ -65,15 +83,17 @@ engram mcp status
 
 ### Claude Code
 
-Claude Code manages its own config — don't hand-edit it:
+`engram mcp install` adds the server for you via `claude mcp add --scope
+user`. To do it manually (or after installing the `claude` CLI):
 
 ```bash
 claude mcp add --scope user engram -- engramd-mcp --engramd-url http://127.0.0.1:8787
 ```
 
-(Or run `claude mcp add --scope project ...` inside a repo. The engram
-repo ships a project-scoped [`.mcp.json`](../../.mcp.json) you can approve
-on first use.)
+Claude Code manages its own config — don't hand-edit it. (Or run `claude
+mcp add --scope project ...` inside a repo. The engram repo ships a
+project-scoped [`.mcp.json`](../../.mcp.json) you can approve on first
+use.)
 
 ### Cursor
 
@@ -97,7 +117,7 @@ on first use.)
 ## Talking to a different daemon
 
 Everything defaults to `http://127.0.0.1:8787`. Point elsewhere with the
-`--engramd-url` flag (or the `ENGRAMD_URL` env var):
+`--url` flag (or the `ENGRAMD_URL` env var):
 
 ```bash
 engram mcp install --url http://127.0.0.1:8799
