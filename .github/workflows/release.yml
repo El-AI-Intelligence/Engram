@@ -153,7 +153,9 @@ jobs:
             sleep 15
           done
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu libssl-dev:arm64
+          # g++ too: esaxx-rs (tokenizer) compiles C++ and needs
+          # aarch64-linux-gnu-g++, not just the C cross-compiler.
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libssl-dev:arm64
           # openssl-sys (via reqwest/hf-hub native-tls) must find an aarch64
           # OpenSSL; without these env vars pkg-config refuses cross builds.
           echo "PKG_CONFIG_ALLOW_CROSS=1" >> "$GITHUB_ENV"
@@ -202,7 +204,24 @@ jobs:
           # -T only for codesign: /usr/bin/notarytool no longer exists on the
           # runner image (notarytool is invoked via xcrun), and security
           # import fails hard on a missing -T path.
-          security import "$RUNNER_TEMP/engram-cert.p12" -k "$KEYCHAIN" -P "$APPLE_CERT_PASSWORD" -A -T /usr/bin/codesign
+          if security import "$RUNNER_TEMP/engram-cert.p12" -k "$KEYCHAIN" -P "$APPLE_CERT_PASSWORD" -A -T /usr/bin/codesign; then
+            echo "p12 imported directly"
+          else
+            # Some p12 encodings trip Apple's importer with a bogus "MAC
+            # verification failed (wrong password?)" even when the password
+            # is right. Fall back: split to PEM with openssl and re-pack as
+            # a legacy-algorithm p12, which the importer always accepts.
+            echo "p12 import failed — falling back to legacy re-pack"
+            openssl pkcs12 -in "$RUNNER_TEMP/engram-cert.p12" -passin "env:APPLE_CERT_PASSWORD" \
+              -clcerts -nokeys -out "$RUNNER_TEMP/engram-cert.pem"
+            openssl pkcs12 -in "$RUNNER_TEMP/engram-cert.p12" -passin "env:APPLE_CERT_PASSWORD" \
+              -nocerts -nodes -out "$RUNNER_TEMP/engram-key.pem"
+            openssl pkcs12 -export -legacy -macalg sha1 \
+              -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES \
+              -inkey "$RUNNER_TEMP/engram-key.pem" -in "$RUNNER_TEMP/engram-cert.pem" \
+              -out "$RUNNER_TEMP/engram-cert-legacy.p12" -passout "pass:legacy"
+            security import "$RUNNER_TEMP/engram-cert-legacy.p12" -k "$KEYCHAIN" -P "legacy" -A -T /usr/bin/codesign
+          fi
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "ephemeral" "$KEYCHAIN"
           echo "CODESIGN_KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
 
