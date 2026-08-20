@@ -249,8 +249,11 @@ jobs:
           # imported Developer ID G2 identity on the runner image even
           # though codesign and notarytool accept it fine.
           IDENTITY=$(security find-identity -p codesigning "$CODESIGN_KEYCHAIN" | awk '/Developer ID Application/ {print $2; exit}')
+          # Sign ALL three binaries that ship in the tarball: an unsigned
+          # engramd-mcp in the notarize zip makes Apple return
+          # "status: Invalid" for the whole submission.
           codesign --force --options runtime --timestamp --sign "$IDENTITY" --keychain "$CODESIGN_KEYCHAIN" \
-            target/${{ matrix.target }}/release/engram target/${{ matrix.target }}/release/engramd
+            target/${{ matrix.target }}/release/engram target/${{ matrix.target }}/release/engramd target/${{ matrix.target }}/release/engramd-mcp
           codesign --verify --strict --verbose=2 target/${{ matrix.target }}/release/engramd
 
       - name: Notarize + staple + repackage
