@@ -54,8 +54,8 @@ impl SyncClient {
         //
         // We use domain-separated salts so the sync keys are cryptographically
         // independent from the vault encryption key.
-        let enc_key = derive_sync_key(passphrase, b"axiom-sync-enc-v2");
-        let hmac_key = derive_sync_key(passphrase, b"axiom-sync-hmac-v2");
+        let enc_key = derive_sync_key(passphrase, b"axiom-sync-enc-v2", 65536);
+        let hmac_key = derive_sync_key(passphrase, b"axiom-sync-hmac-v2", 65536);
 
         Self {
             http: reqwest::Client::builder()
@@ -1234,18 +1234,25 @@ fn urlencoding(s: &str) -> String {
 /// Uses the same parameters as vault key derivation (64 MiB, 3 iterations,
 /// 4 lanes) but with a domain-separated salt so sync keys are independent
 /// from the vault encryption key.
-/// Derive a stable shared-vault id from the sync passphrase.
 ///
-/// Used as the `vault_id` fallback when the config doesn't pin one: two
-/// devices initialized with the same passphrase derive the same id, so
-/// they land in the same vault on the sync server with no configuration.
-/// Domain-separated from the encryption/HMAC keys.
-pub fn derive_vault_id(passphrase: &str) -> String {
-    let key = derive_sync_key(passphrase, b"axiom-sync-vaultid-v1");
+/// v1 vault id (pre-2026-08-20 binary): the id was derived with a 64 MiB
+/// cost and the `axiom-sync-vaultid-v1` domain salt. Existing pinned vaults
+/// keep it; fresh derivations probe it only to converge with an existing
+/// team, never to create.
+pub fn derive_vault_id_v1(passphrase: &str) -> String {
+    let key = derive_sync_key(passphrase, b"axiom-sync-vaultid-v1", 65536);
     key.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn derive_sync_key(passphrase: &str, salt: &[u8]) -> [u8; 32] {
+/// v2 vault id: fixed `axiom-sync-vaultid-v2` domain salt and a modestly
+/// higher Argon2id cost (96 MiB / 3 iterations / 4 lanes). All NEW vault
+/// id derivations use this; v1 exists only for backward convergence.
+pub fn derive_vault_id_v2(passphrase: &str) -> String {
+    let key = derive_sync_key(passphrase, b"axiom-sync-vaultid-v2", 98304);
+    key.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn derive_sync_key(passphrase: &str, salt: &[u8], m_cost_kib: u32) -> [u8; 32] {
     use argon2::{
         password_hash::{PasswordHasher, SaltString},
         Argon2,
@@ -1257,11 +1264,10 @@ fn derive_sync_key(passphrase: &str, salt: &[u8]) -> [u8; 32] {
     let salt_str =
         SaltString::encode_b64(&salt_bytes[..16]).expect("16 bytes is valid salt length");
 
-    // Match axiom-engram's Argon2id params: 64 MiB / 3 iterations / 4 lanes
     let argon2 = Argon2::new(
         argon2::Algorithm::Argon2id,
         argon2::Version::V0x13,
-        argon2::Params::new(65536, 3, 4, None).expect("valid Argon2 params"),
+        argon2::Params::new(m_cost_kib, 3, 4, None).expect("valid Argon2 params"),
     );
     let hash = argon2
         .hash_password(passphrase.as_bytes(), &salt_str)
@@ -1274,4 +1280,114 @@ fn derive_sync_key(passphrase: &str, salt: &[u8]) -> [u8; 32] {
         key[..len].copy_from_slice(&bytes[..len]);
     }
     key
+}
+
+/// What the relay's stats endpoint says about a vault id, from the probing
+/// device's point of view. The relay never discloses existence to a key
+/// that isn't authorized for the vault, so `Unknown` covers both "doesn't
+/// exist" and "not yours".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeVault {
+    /// 200 with `total_blobs > 0` — the vault exists and this key can see it.
+    Exists,
+    /// 200 with `total_blobs == 0` — the id resolves but holds nothing yet.
+    Empty,
+    /// 403 or another non-401 status — not authorized (or a probe error);
+    /// indistinguishable from a nonexistent vault by design.
+    Unknown,
+    /// 401 — the configured api_key itself is rejected. The probe result is
+    /// not trustworthy; callers must abort rather than guess.
+    KeyRejected,
+}
+
+/// Probe the relay's per-vault stats endpoint for one candidate vault id.
+/// A 404 never happens (the route is id-agnostic); non-401 failures collapse
+/// to `Unknown`.
+pub async fn probe_vault_stats(
+    server_url: &str,
+    api_key: Option<&str>,
+    vault_id: &str,
+) -> Result<ProbeVault, String> {
+    let url = format!(
+        "{}/sync/{}/stats",
+        server_url.trim_end_matches('/'),
+        urlencoding(vault_id)
+    );
+    let mut req = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("probe client: {e}"))?
+        .get(&url);
+    if let Some(k) = api_key {
+        req = req.header("Authorization", format!("Bearer {k}"));
+    }
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("stats probe failed: {e}"))?;
+    let status = resp.status();
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .unwrap_or_else(|_| serde_json::Value::Null);
+    Ok(match status.as_u16() {
+        401 => ProbeVault::KeyRejected,
+        403 => ProbeVault::Unknown,
+        200 => match body.get("total_blobs").and_then(|v| v.as_u64()).unwrap_or(0) {
+            0 => ProbeVault::Empty,
+            _ => ProbeVault::Exists,
+        },
+        _ => ProbeVault::Unknown,
+    })
+}
+
+/// Resolve the vault id for a device whose config pins none: probe the v2
+/// derivation first, then v1, and pick whichever EXISTS on the relay. If
+/// neither exists (both empty/unknown) the fresh vault is created under v2.
+/// Returns the chosen id plus the kdf version that produced it (stamped
+/// into config by the caller).
+///
+/// Errors are hard aborts: a rejected api_key (401) means the probe result
+/// is meaningless, and transport failures mean the relay can't vouch for
+/// either candidate — guessing would silently split a shared vault.
+///
+/// Residual race (documented): two never-paired devices with the same
+/// passphrase — one old binary, one new — starting simultaneously both see
+/// "empty" and the old one pins v1 while the new one pins v2. Recovery:
+/// `engram join --vault-id <id>` re-points the odd device.
+pub async fn converge_vault_id(
+    server_url: &str,
+    api_key: Option<&str>,
+    passphrase: &str,
+) -> Result<(String, &'static str), String> {
+    let v2 = derive_vault_id_v2(passphrase);
+    // No key yet (never paired): nothing to converge with — the relay can't
+    // attest any vault, and the device couldn't push anyway. Fresh vaults
+    // are created under v2; when the user pairs, the CLI derives the same id.
+    if api_key.is_none() {
+        return Ok((v2, "v2"));
+    }
+    match probe_vault_stats(server_url, api_key, &v2).await? {
+        ProbeVault::KeyRejected => Err(
+            "the sync relay rejected the configured api_key (401) — fix sync.api_key in \
+             config.json and restart"
+                .into(),
+        ),
+        ProbeVault::Exists => Ok((v2, "v2")),
+        ProbeVault::Empty | ProbeVault::Unknown => {
+            // Only derive v1 when the probe actually needs it — the common
+            // paths (fresh v2 vault, no key) skip a 64 MiB Argon2 run.
+            let v1 = derive_vault_id_v1(passphrase);
+            match probe_vault_stats(server_url, api_key, &v1).await? {
+                ProbeVault::KeyRejected => Err(
+                    "the sync relay rejected the configured api_key (401) — fix sync.api_key in \
+                     config.json and restart"
+                        .into(),
+                ),
+                ProbeVault::Exists => Ok((v1, "v1")),
+                // Both unknown/empty: the vault is fresh — create under v2.
+                ProbeVault::Empty | ProbeVault::Unknown => Ok((v2, "v2")),
+            }
+        }
+    }
 }

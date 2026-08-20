@@ -809,7 +809,9 @@ fn resolve_sync_vault_id(
              set ENGRAM_PASSPHRASE in ~/.engram/env."
         )
     })?;
-    Ok(crate::sync_client::derive_vault_id(&passphrase))
+    // Fresh vaults (no pinned id) are created under the v2 derivation —
+    // pre-existing vaults are covered by the pinned config value above.
+    Ok(crate::sync_client::derive_vault_id_v2(&passphrase))
 }
 
 pub async fn handle_pair(

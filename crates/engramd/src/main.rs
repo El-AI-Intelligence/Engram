@@ -308,7 +308,9 @@ fn load_or_create_handoff_token(vault_path: &std::path::Path) -> String {
 /// pinned there yet, so `/teams/status` and later restarts agree with the
 /// id the sync loop actually uses. Best-effort: a read-only vault dir just
 /// means the id is re-derived on each start (it is deterministic anyway).
-fn pin_vault_id(vault_path: &std::path::Path, vault_id: &str) {
+/// `kdf_version` stamps which derivation produced the id ("v1"/"v2") — pins
+/// written before the v2 rollout have no stamp and are left untouched.
+fn pin_vault_id(vault_path: &std::path::Path, vault_id: &str, kdf_version: &str) {
     let config_path = vault_path.join("config.json");
     let Ok(data) = std::fs::read_to_string(&config_path) else {
         return;
@@ -321,6 +323,10 @@ fn pin_vault_id(vault_path: &std::path::Path, vault_id: &str) {
             obj.insert(
                 "vault_id".to_string(),
                 serde_json::Value::String(vault_id.to_string()),
+            );
+            obj.insert(
+                "kdf_version".to_string(),
+                serde_json::Value::String(kdf_version.to_string()),
             );
             true
         }
@@ -709,59 +715,84 @@ async fn run_daemon(
                 // Passphrase: for sync, we use the same passphrase used to open the vault.
                 // If no passphrase was provided, sync won't work (encryption is required).
                 if let Some(ref pw) = passphrase {
-                    // The vault_id is pinned in config, or derived from the sync
-                    // passphrase — same passphrase ⇒ same id, so teammates land
-                    // in the same vault with no configuration. (It must NOT come
-                    // from the vault directory name: directory names differ
-                    // across devices and binary versions, which silently split
-                    // a shared vault across devices on the server.)
+                    // The vault_id is pinned in config, or resolved against
+                    // the relay: probe the v2 derivation then v1 and pick
+                    // whichever vault EXISTS, else create fresh under v2.
+                    // (It must NOT come from the vault directory name:
+                    // directory names differ across devices and binary
+                    // versions, which silently split a shared vault across
+                    // devices on the server.)
                     let vault_id = match cfg
                         .get("sync")
                         .and_then(|s| s.get("vault_id"))
                         .and_then(|v| v.as_str())
                     {
-                        Some(v) => v.to_string(),
+                        Some(v) => Some(v.to_string()),
                         None => {
-                            let derived = sync_client::derive_vault_id(pw);
-                            pin_vault_id(&vault_path, &derived);
-                            info!(
-                                vault_id = %derived,
-                                "vault_id unset — derived from passphrase and pinned to config"
-                            );
-                            derived
+                            match sync_client::converge_vault_id(
+                                &server_url,
+                                api_key.as_deref(),
+                                pw,
+                            )
+                            .await
+                            {
+                                Ok((derived, version)) => {
+                                    pin_vault_id(&vault_path, &derived, version);
+                                    info!(
+                                        vault_id = %derived,
+                                        kdf_version = version,
+                                        "vault_id unset — converged with relay and pinned to config"
+                                    );
+                                    Some(derived)
+                                }
+                                Err(e) => {
+                                    // Hard abort of sync (not the daemon): a
+                                    // rejected api_key or an unreachable relay
+                                    // makes the probe result untrustworthy, and
+                                    // guessing would silently split a shared
+                                    // vault. The local vault keeps working.
+                                    tracing::error!(
+                                        error = %e,
+                                        "sync disabled: vault id resolution failed"
+                                    );
+                                    None
+                                }
+                            }
                         }
                     };
 
-                    let initial_clock = sync_client::SyncClient::load_clock(&vault_path);
-                    let sync_client = Arc::new(sync_client::SyncClient::new(
-                        server_url.to_string(),
-                        vault_id,
-                        pw,
-                        device_id.clone(),
-                        api_key,
-                        initial_clock,
-                    ));
-                    // Hold the SAME key bytes the sync loop uses, for the
-                    // one-time browser key handoff (account migration).
-                    state.sync_keys = Some(Arc::new(SyncKeyMaterial {
-                        enc_key: sync_client.encryption_key(),
-                        hmac_key: sync_client.hmac_key(),
-                        vault_id: sync_client.vault_id().to_string(),
-                    }));
-                    info!(
-                        server_url = %server_url,
-                        interval_secs,
-                        %initial_clock,
-                        "Starting sync loop"
-                    );
-                    sync_client::spawn_sync_loop(
-                        sync_client,
-                        vault.clone(),
-                        vault_path.clone(),
-                        std::time::Duration::from_secs(interval_secs),
-                        sync_trigger_rx,
-                        state.events_tx.clone(),
-                    );
+                    if let Some(vault_id) = vault_id {
+                        let initial_clock = sync_client::SyncClient::load_clock(&vault_path);
+                        let sync_client = Arc::new(sync_client::SyncClient::new(
+                            server_url.to_string(),
+                            vault_id,
+                            pw,
+                            device_id.clone(),
+                            api_key,
+                            initial_clock,
+                        ));
+                        // Hold the SAME key bytes the sync loop uses, for the
+                        // one-time browser key handoff (account migration).
+                        state.sync_keys = Some(Arc::new(SyncKeyMaterial {
+                            enc_key: sync_client.encryption_key(),
+                            hmac_key: sync_client.hmac_key(),
+                            vault_id: sync_client.vault_id().to_string(),
+                        }));
+                        info!(
+                            server_url = %server_url,
+                            interval_secs,
+                            %initial_clock,
+                            "Starting sync loop"
+                        );
+                        sync_client::spawn_sync_loop(
+                            sync_client,
+                            vault.clone(),
+                            vault_path.clone(),
+                            std::time::Duration::from_secs(interval_secs),
+                            sync_trigger_rx,
+                            state.events_tx.clone(),
+                        );
+                    }
                 } else {
                     tracing::error!(
                         "Sync is enabled but no passphrase is set. \

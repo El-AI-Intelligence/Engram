@@ -9,9 +9,24 @@
 //   - Vector clock conflict resolution (LWW)
 //   - Deletion tombstone propagation
 //   - Malformed HMAC rejection
+//   - KDF vault-id derivation (v1/v2) + probe convergence
 
 use axiom_engram::sync::SyncBlob;
 use engramd::sync_client::SyncClient;
+
+use axum::{
+    extract::{Path, State},
+    http::StatusCode,
+    response::Json,
+    routing::get,
+    Router,
+};
+use serde_json::json;
+use std::collections::HashMap;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc, OnceLock,
+};
 
 /// Helper: create a test client with a deterministic passphrase.
 fn test_client() -> SyncClient {
@@ -336,24 +351,192 @@ fn lww_edit_beats_original() {
 
 /// Two devices sharing a passphrase must derive the same fallback vault_id
 /// (that's what puts them in the same vault on the server), and the id must
-/// be stable and hex-shaped.
+/// be stable and hex-shaped. The v2 derivation is what fresh vaults use; v1
+/// exists only so an old-pinned vault can be converged on — the two must
+/// differ for the same passphrase or the probe flow could not tell them apart.
 #[test]
 fn vault_id_fallback_is_stable_across_devices() {
-    let a = engramd::sync_client::derive_vault_id("correct-horse-battery-staple");
-    let b = engramd::sync_client::derive_vault_id("correct-horse-battery-staple");
+    let a = engramd::sync_client::derive_vault_id_v2("correct-horse-battery-staple");
+    let b = engramd::sync_client::derive_vault_id_v2("correct-horse-battery-staple");
     assert_eq!(a, b, "same passphrase must derive the same vault_id");
     assert_eq!(a.len(), 64, "vault_id should be 32-byte hex");
     assert!(
         a.chars().all(|c| c.is_ascii_hexdigit()),
         "vault_id must be lowercase hex"
     );
+    let v1 = engramd::sync_client::derive_vault_id_v1("correct-horse-battery-staple");
+    assert_ne!(v1, a, "v1 and v2 derivations must diverge for one passphrase");
 }
 
 /// Different passphrases must derive different vault ids (a collision here
 /// would merge two teams into one vault on the server).
 #[test]
 fn vault_id_fallback_is_distinct_per_passphrase() {
-    let a = engramd::sync_client::derive_vault_id("correct-horse-battery-staple");
-    let b = engramd::sync_client::derive_vault_id("correct-horse-battery-stapler");
+    let a = engramd::sync_client::derive_vault_id_v2("correct-horse-battery-staple");
+    let b = engramd::sync_client::derive_vault_id_v2("correct-horse-battery-stapler");
     assert_ne!(a, b, "different passphrases must derive different vault_ids");
+}
+
+// ── KDF v2 probe convergence (W4a) ──────────────────────────────────────────
+//
+// converge_vault_id probes the relay's /sync/{id}/stats endpoint to pick
+// between the v1 and v2 vault-id derivations. The stub below scripts the
+// relay's replies per vault id and counts requests, so every decision path
+// (including the no-network no-key path) is exercised without a real relay.
+
+/// A scripted reply the stub relay returns for one vault id.
+#[derive(Clone)]
+enum StubReply {
+    /// 200 with `total_blobs > 0` — the vault exists and holds data.
+    Exists,
+    /// 200 with `total_blobs == 0` — the id resolves but is empty.
+    Empty,
+    /// 403 — the key is not authorized for this vault (or it doesn't exist).
+    Denied,
+    /// 401 — the api_key itself is rejected.
+    Rejected,
+}
+
+#[derive(Clone)]
+struct StubRelay {
+    replies: Arc<HashMap<String, StubReply>>,
+    requests: Arc<AtomicUsize>,
+}
+
+async fn stats_handler(
+    State(stub): State<StubRelay>,
+    Path((id,)): Path<(String,)>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    stub.requests.fetch_add(1, Ordering::SeqCst);
+    match stub.replies.get(&id) {
+        Some(StubReply::Exists) => Ok(Json(json!({ "total_blobs": 7 }))),
+        Some(StubReply::Empty) => Ok(Json(json!({ "total_blobs": 0 }))),
+        Some(StubReply::Rejected) => Err(StatusCode::UNAUTHORIZED),
+        Some(StubReply::Denied) | None => Err(StatusCode::FORBIDDEN),
+    }
+}
+
+/// Start a stub relay on an ephemeral 127.0.0.1 port; returns its base URL
+/// and the request counter for no-HTTP assertions.
+fn spawn_stub(replies: HashMap<String, StubReply>) -> (String, Arc<AtomicUsize>) {
+    let requests = Arc::new(AtomicUsize::new(0));
+    let stub = StubRelay {
+        replies: Arc::new(replies),
+        requests: requests.clone(),
+    };
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral bind");
+    let addr = listener.local_addr().expect("local addr");
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking listener");
+    let router = Router::new()
+        .route("/sync/{id}/stats", get(stats_handler))
+        .with_state(stub);
+    tokio::spawn(async move {
+        let listener = tokio::net::TcpListener::from_std(listener).expect("tokio listener");
+        axum::serve(listener, router).await.expect("stub serve");
+    });
+    (format!("http://{addr}"), requests)
+}
+
+const CONVERGE_PW: &str = "correct-horse-battery-staple-converge-test";
+
+/// Both KDF derivations for the shared passphrase — computed once per
+/// process (Argon2 is deliberately expensive; converge re-derives internally
+/// on every call regardless).
+fn converge_ids() -> &'static (String, String) {
+    static IDS: OnceLock<(String, String)> = OnceLock::new();
+    IDS.get_or_init(|| {
+        (
+            engramd::sync_client::derive_vault_id_v2(CONVERGE_PW),
+            engramd::sync_client::derive_vault_id_v1(CONVERGE_PW),
+        )
+    })
+}
+
+/// The v2 id already holds blobs on the relay → the device joins it under v2.
+#[tokio::test]
+async fn converge_picks_v2_when_v2_exists() {
+    let (v2, v1) = converge_ids();
+    let (url, _requests) = spawn_stub(HashMap::from([
+        (v2.clone(), StubReply::Exists),
+        (v1.clone(), StubReply::Denied),
+    ]));
+    let (id, version) =
+        engramd::sync_client::converge_vault_id(&url, Some("test-key"), CONVERGE_PW)
+            .await
+            .expect("converge should succeed");
+    assert_eq!(&id, v2, "must pick the existing v2 vault");
+    assert_eq!(version, "v2");
+}
+
+/// v2 resolves empty while v1 holds the team's data (an old binary pinned
+/// v1) → the new device must converge onto the existing v1 vault, not split.
+#[tokio::test]
+async fn converge_picks_v1_when_only_v1_exists() {
+    let (v2, v1) = converge_ids();
+    let (url, _requests) = spawn_stub(HashMap::from([
+        (v2.clone(), StubReply::Empty),
+        (v1.clone(), StubReply::Exists),
+    ]));
+    let (id, version) =
+        engramd::sync_client::converge_vault_id(&url, Some("test-key"), CONVERGE_PW)
+            .await
+            .expect("converge should succeed");
+    assert_eq!(&id, v1, "must join the existing v1 vault");
+    assert_eq!(version, "v1");
+}
+
+/// Neither derivation exists on the relay → fresh vault is created under v2.
+#[tokio::test]
+async fn converge_defaults_to_v2_when_both_empty() {
+    let (v2, v1) = converge_ids();
+    let (url, _requests) = spawn_stub(HashMap::from([
+        (v2.clone(), StubReply::Empty),
+        (v1.clone(), StubReply::Empty),
+    ]));
+    let (id, version) =
+        engramd::sync_client::converge_vault_id(&url, Some("test-key"), CONVERGE_PW)
+            .await
+            .expect("converge should succeed");
+    assert_eq!(&id, v2, "fresh vaults are created under v2");
+    assert_eq!(version, "v2");
+}
+
+/// A 401 on the first probe means the key itself is bad — the result of a
+/// second probe would be meaningless, so converge aborts instead of guessing.
+#[tokio::test]
+async fn converge_aborts_on_rejected_key() {
+    let (v2, v1) = converge_ids();
+    let (url, requests) = spawn_stub(HashMap::from([
+        (v2.clone(), StubReply::Rejected),
+        (v1.clone(), StubReply::Rejected),
+    ]));
+    let err = engramd::sync_client::converge_vault_id(&url, Some("bad-key"), CONVERGE_PW)
+        .await
+        .expect_err("a rejected api_key must abort convergence");
+    assert!(err.contains("api_key"), "error should name the api_key: {err}");
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        1,
+        "must stop after the rejected v2 probe — never probe v1"
+    );
+}
+
+/// With no api_key (never paired) converge answers v2 immediately and makes
+/// zero network requests — the relay can't attest anything anyway.
+#[tokio::test]
+async fn converge_without_key_returns_v2_without_http() {
+    let (v2, _v1) = converge_ids();
+    let (url, requests) = spawn_stub(HashMap::new());
+    let (id, version) = engramd::sync_client::converge_vault_id(&url, None, CONVERGE_PW)
+        .await
+        .expect("no-key converge should succeed");
+    assert_eq!(&id, v2, "unpaired devices derive v2");
+    assert_eq!(version, "v2");
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        0,
+        "no probe may fire without an api_key"
+    );
 }
