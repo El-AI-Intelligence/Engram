@@ -182,11 +182,14 @@ curl -X PATCH http://localhost:8787/config \
 ### 3. Restart engramd
 
 The sync loop starts when engramd boots with sync enabled in the config
-and a passphrase is provided:
+and a passphrase available. `engram init` saved the passphrase to
+`~/.engram/env` (0600), which the daemon loads automatically:
 
 ```bash
-engramd --vault ~/.engram/vault --passphrase "your-passphrase"
+engram daemon
 ```
+
+(Without that file, pass it explicitly: `engram daemon --passphrase "<your passphrase>"`.)
 
 ### 4. Verify sync is working
 
@@ -275,11 +278,10 @@ and blob counts, never names or content.
 #    Omit --vault-id to derive it from the passphrase (same id ⇒ same vault).
 engram join --server-url https://sync.example.com
 
-# 2. Start the daemon with the shared passphrase
-engramd --vault ~/.engram/vault --passphrase "<same passphrase>"
+# 2. Start the daemon (the passphrase auto-loads from ~/.engram/env)
+engram daemon
 
-# 3. Force the first sync (or wait interval_secs)
-curl -X POST http://localhost:8787/sync/now
+# 3. The first sync starts automatically (or wait interval_secs)
 ```
 
 `engram join` refuses to touch a vault that already has memories — it is

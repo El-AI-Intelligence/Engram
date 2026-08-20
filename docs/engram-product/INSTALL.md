@@ -108,7 +108,10 @@ Or step through it manually:
    ```bash
    engram daemon
    ```
-   Opens the API at `http://localhost:8787`.
+   Opens the API at `http://localhost:8787`. With no `--vault`, the
+   daemon opens the vault `engram init` created (`~/.engram/vault`), and
+   loads the passphrase from `~/.engram/env` (0600) automatically — no
+   re-typing. Point elsewhere with `--vault <path>` or `ENGRAM_VAULT`.
 
 3. **Open the dashboard**:
    Visit `http://localhost:8787` in your browser.

@@ -120,7 +120,7 @@ Everything defaults to `http://127.0.0.1:8787`. Point elsewhere with the
 `--url` flag (or the `ENGRAMD_URL` env var):
 
 ```bash
-engram mcp install --url http://127.0.0.1:8799
+engram mcp install --url http://192.168.1.50:8787   # a daemon on another machine
 ```
 
 ## What a session looks like
@@ -137,7 +137,8 @@ You: "Remember: we're freezing the API for the beta."   # (again)
 ## Troubleshooting
 
 - **Tools error with "engramd unreachable"** — the daemon isn't running.
-  Start it: `engram daemon` (or `engramd --vault ~/.engram/vault`).
+  Start it: `engram daemon` (it opens your init-created vault and loads
+  the passphrase automatically).
 - **Editor shows the server as failed/crashed** — `engramd-mcp` isn't on
   the PATH the editor spawns with. Use an absolute path in `command`, or
   run `cargo install --path crates/engramd-mcp` and restart the editor.

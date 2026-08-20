@@ -145,7 +145,7 @@ signed-in browser:
 ```
 engram handoff
   → POST daemon /sync/key-handoff/start → token (in-memory map, 900s TTL)
-  → link: https://engram.ellmstack.dev/app/#/handoff/{token}?daemon=127.0.0.1:8799
+  → link: https://engram.ellmstack.dev/app/#/handoff/{token}?daemon=127.0.0.1:8787
   → SPA: account.get (signed-out → stash token, login, resume)
     → POST /sync/key-handoff/{token} (redeem FIRST — dead link fails fast)
     → A from memory → BroadcastChannel → password prompt (last resort)
@@ -162,7 +162,7 @@ engram handoff
   (`crates/engramd/src/main.rs`) and the SPA fetch
   (`targetAddressSpace`).
 - The `?daemon=` param points at the user's loopback (or tunnel-forwarded)
-  daemon — the CLI prints `127.0.0.1:8799` by default.
+  daemon — the CLI prints `127.0.0.1:8787` by default.
 
 ## Device linking (`engram link`)
 
