@@ -67,6 +67,35 @@ struct ImportMemory {
     grounded: bool,
 }
 
+/// Import-field hardening. The SPA escapes everything it renders, but an
+/// import must not plant values that would be storable raw: ids must be
+/// plain (they land in hrefs and attributes), content must be non-empty
+/// and bounded, project is bounded. Returns Err(reason) — the caller skips
+/// the memory and reports the reason.
+fn validate_import(m: &ImportMemory) -> Result<(), String> {
+    if let Some(ref id) = m.id {
+        let plain = id.len() <= 64
+            && id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+        if !plain {
+            return Err(format!("invalid id: {}", &id[..id.len().min(24)]));
+        }
+    }
+    if m.content.trim().is_empty() {
+        return Err("empty content".to_string());
+    }
+    if m.content.len() > 1_000_000 {
+        return Err("content exceeds 1 MiB".to_string());
+    }
+    if let Some(ref p) = m.project {
+        if p.len() > 512 {
+            return Err("project exceeds 512 chars".to_string());
+        }
+    }
+    Ok(())
+}
+
 async fn export_memories(
     State(state): State<AppState>,
     Json(q): Json<ExportQuery>,
@@ -142,8 +171,17 @@ async fn import_memories(
     let vault = state.vault.lock().await;
     let mut imported = 0;
     let mut skipped = 0;
+    let mut rejected: Vec<String> = Vec::new();
 
     for m in memories {
+        if let Err(reason) = validate_import(&m) {
+            tracing::warn!(reason, "import: rejecting memory");
+            if rejected.len() < 50 {
+                rejected.push(reason);
+            }
+            skipped += 1;
+            continue;
+        }
         let layer = m.layer.as_deref()
             .and_then(axiom_engram::EngramLayer::from_str)
             .unwrap_or(axiom_engram::EngramLayer::Episodic);
@@ -193,5 +231,48 @@ async fn import_memories(
         "ok": true,
         "imported": imported,
         "skipped": skipped,
+        "rejected": rejected,
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mem(id: Option<&str>, content: &str) -> ImportMemory {
+        ImportMemory {
+            id: id.map(String::from),
+            content: content.to_string(),
+            layer: None,
+            source: None,
+            context: None,
+            tags: None,
+            valence: None,
+            strength: None,
+            privacy_level: None,
+            project: None,
+            imagined: false,
+            grounded: false,
+        }
+    }
+
+    #[test]
+    fn rejects_non_plain_ids() {
+        assert!(validate_import(&mem(Some("eng_abc-123"), "hi")).is_ok());
+        assert!(validate_import(&mem(Some("ok_9"), "hi")).is_ok());
+        assert!(validate_import(&mem(None, "hi")).is_ok());
+        // XSS-plant vectors and structural junk are rejected.
+        assert!(validate_import(&mem(Some("\"><img src=x onerror=alert(1)>"), "hi")).is_err());
+        assert!(validate_import(&mem(Some("a/b"), "hi")).is_err());
+        assert!(validate_import(&mem(Some("a b"), "hi")).is_err());
+        assert!(validate_import(&mem(Some(&"x".repeat(65)), "hi")).is_err());
+    }
+
+    #[test]
+    fn rejects_empty_or_huge_content() {
+        assert!(validate_import(&mem(None, "   ")).is_err());
+        assert!(validate_import(&mem(None, "")).is_err());
+        assert!(validate_import(&mem(None, &"x".repeat(1_000_001))).is_err());
+        assert!(validate_import(&mem(None, &"x".repeat(1_000_000))).is_ok());
+    }
 }

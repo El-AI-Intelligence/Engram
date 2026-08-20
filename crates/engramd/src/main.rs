@@ -563,6 +563,40 @@ async fn pna_opt_in(
     res
 }
 
+/// CSP for the daemon-served UI (the hosted copy at engram.ellmstack.dev
+/// gets its policy from deploy/caddy/engram.Caddyfile — keep the two in
+/// sync). `wasm-unsafe-eval` allows WebAssembly.instantiate for the
+/// vendored hash-wasm Argon2id used by the browser unlock view; the
+/// loopback connect-src entries (wildcard port) cover the `?daemon=`
+/// key-handoff target, which the CLI defaults to 127.0.0.1:8787.
+const UI_CSP: &str = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; \
+    style-src 'self' 'unsafe-inline'; img-src 'self' data:; \
+    connect-src 'self' https://sync.ellmstack.dev http://127.0.0.1:* http://localhost:*; \
+    font-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'self'";
+
+/// Security headers on every daemon response. Harmless on JSON bodies;
+/// essential on the served UI, which had no CSP at all.
+async fn csp_headers(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let mut res = next.run(req).await;
+    let h = res.headers_mut();
+    h.insert(
+        axum::http::HeaderName::from_static("content-security-policy"),
+        axum::http::HeaderValue::from_static(UI_CSP),
+    );
+    h.insert(
+        axum::http::HeaderName::from_static("x-content-type-options"),
+        axum::http::HeaderValue::from_static("nosniff"),
+    );
+    h.insert(
+        axum::http::HeaderName::from_static("x-frame-options"),
+        axum::http::HeaderValue::from_static("DENY"),
+    );
+    res
+}
+
 // ── Daemon ─────────────────────────────────────────────────────────────────
 
 async fn run_daemon(
@@ -802,6 +836,7 @@ async fn run_daemon(
             allowed_origins.clone(),
             pna_opt_in,
         ))
+        .layer(axum::middleware::from_fn(csp_headers))
         .layer(TraceLayer::new_for_http())
         // Reject oversized bodies (10 MiB) with structured JSON errors
         .layer(DefaultBodyLimit::max(10 * 1024 * 1024))

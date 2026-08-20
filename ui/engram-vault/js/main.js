@@ -507,7 +507,7 @@ window.addEventListener('DOMContentLoaded', render);
 // ── Helpers ───────────────────────────────────────────────────────────────
 
 function esc(s) {
-  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
 function ago(ts) {
@@ -521,11 +521,11 @@ function ago(ts) {
 
 function layerIcon(layer) {
   const icons = { episodic: '●', semantic: '◆', imagined: '✦' };
-  return `<span class="layer-icon ${layer}">${icons[layer] || '●'}</span>`;
+  return `<span class="layer-icon ${esc(layer)}">${icons[layer] || '●'}</span>`;
 }
 
 function layerBadge(layer) {
-  return `<span class="badge badge-${layer}">${layerIcon(layer)} ${layer}</span>`;
+  return `<span class="badge badge-${esc(layer)}">${layerIcon(layer)} ${esc(layer)}</span>`;
 }
 
 function valenceLabel(v) {
@@ -553,7 +553,7 @@ function sourceIcon(src) {
 
 function resultLabel(t) {
   const labels = { fts5: 'FTS5', qem_cache: 'QEM', vector: 'VECTOR', like: 'LIKE', hybrid: 'HYBRID' };
-  return labels[t] || t;
+  return labels[t] || esc(t);
 }
 
 function toast(msg, kind = 'info') {
@@ -738,7 +738,7 @@ function notesBadge(m) {
 function liveFeedItem(m) {
   const content = m.content || '';
   return `
-    <a href="#/memories/${m.id}" class="feed-item live-item">
+    <a href="#/memories/${encodeURIComponent(m.id)}" class="feed-item live-item">
       ${layerIcon(m.layer)}
       <span class="faint" title="${esc(m.source || '?')}">${sourceIcon(m.source)}</span>
       <span class="feed-text">${esc(content.slice(0, 120))}${content.length > 120 ? '…' : ''}</span>
@@ -2126,7 +2126,7 @@ function unlockView(opts = {}) {
         <div class="modal detail-modal">
           <div class="detail-card">
             <div class="detail-header">
-              ${layerIcon(m.layer)} <span class="detail-layer">${(m.layer || '').toUpperCase()} MEMORY</span>
+              ${layerIcon(m.layer)} <span class="detail-layer">${esc((m.layer || '').toUpperCase())} MEMORY</span>
               ${strengthBar(m.strength || 0)}
               <span class="faint ml-auto mono">${esc(m.id)}</span>
             </div>
@@ -2138,8 +2138,8 @@ function unlockView(opts = {}) {
               <div class="meta-row"><span class="faint">Last retrieved</span> ${m.last_retrieved ? ago(m.last_retrieved) : 'never'}</div>
               <div class="meta-row"><span class="faint">Retrievals</span> ${m.retrievals || 0}</div>
               ${m.occurred_at ? `<div class="meta-row"><span class="faint">Occurred</span> ${new Date(m.occurred_at).toLocaleString()}</div>` : ''}
-              <div class="meta-row"><span class="faint">Source</span> ${sourceIcon(m.source)} ${m.source || '?'}</div>
-              <div class="meta-row"><span class="faint">Project</span> ${m.project || '—'}</div>
+              <div class="meta-row"><span class="faint">Source</span> ${sourceIcon(m.source)} ${esc(m.source || '?')}</div>
+              <div class="meta-row"><span class="faint">Project</span> ${esc(m.project || '—')}</div>
               ${m.scope ? `<div class="meta-row"><span class="faint">Scope</span> ${esc(m.scope)}</div>` : ''}
               ${m.privacy_level ? `<div class="meta-row"><span class="faint">Privacy</span> ${esc(m.privacy_level)}</div>` : ''}
               ${m.content_type ? `<div class="meta-row"><span class="faint">Type</span> ${esc(m.content_type)}</div>` : ''}
@@ -2188,7 +2188,7 @@ function unlockView(opts = {}) {
             <div class="memory-card" data-unlock-id="${esc(m.id)}">
               <div class="card-top">
                 ${layerIcon(m.layer)}
-                <span class="card-source">${sourceIcon(m.source)} ${m.source || '?'}</span>
+                <span class="card-source">${sourceIcon(m.source)} ${esc(m.source || '?')}</span>
                 ${strengthBar(m.strength || 0)}
                 <span class="faint ml-auto">${ago(m.created_at)}</span>
               </div>
@@ -2716,7 +2716,7 @@ route('/tracker', async () => {
         <div class="ti-preview">${esc(content.slice(0, 140))}${content.length > 140 ? '…' : ''}</div>
         <div class="ti-full">
           <div class="ti-full-content">${esc(content)}</div>
-          <a href="#/memories/${m.id}" class="ti-open">Open detail →</a>
+          <a href="#/memories/${encodeURIComponent(m.id)}" class="ti-open">Open detail →</a>
         </div>
       </div>`;
   }
@@ -2856,10 +2856,10 @@ route('/memories', async () => {
         return;
       }
       results.innerHTML = list.map(m => `
-        <a href="#/memories/${m.id}" class="memory-card">
+        <a href="#/memories/${encodeURIComponent(m.id)}" class="memory-card">
           <div class="card-top">
             ${layerIcon(m.layer)}
-            <span class="card-source">${sourceIcon(m.source)} ${m.source || '?'}</span>
+            <span class="card-source">${sourceIcon(m.source)} ${esc(m.source || '?')}</span>
             ${strengthBar(m.strength || 0)}
             <span class="faint ml-auto">${ago(m.created_at)}</span>
           </div>
@@ -2869,7 +2869,7 @@ route('/memories', async () => {
             ${m.links && m.links.length ? `<span class="faint">→ ${m.links.length} links</span>` : ''}
             ${notesBadge(m)}
             ${m.imagined && !m.grounded ? '<span class="badge badge-quarantined">⚠ quarantined</span>' : ''}
-            ${!m.imagined || m.grounded ? `<button class="btn btn-sm" data-action="mark-noise" data-id="${m.id}">Mark noise</button>` : ''}
+            ${!m.imagined || m.grounded ? `<button class="btn btn-sm" data-action="mark-noise" data-id="${esc(m.id)}">Mark noise</button>` : ''}
           </div>
         </a>
       `).join('');
@@ -2920,9 +2920,9 @@ route('/memories/:id', async (id) => {
           <div class="panel" style="margin-top:1rem;">
             <div class="panel-header">Links (${linkList.length} outgoing)</div>
             ${linkList.map(ln => `
-              <a href="#/memories/${ln.target_id}" class="feed-item">
+              <a href="#/memories/${encodeURIComponent(ln.target_id)}" class="feed-item">
                 ${ln.link_type === 'causal' ? '▶' : ln.link_type === 'associative' ? '··' : ln.link_type === 'analogical' ? '--' : '··>'}
-                <span class="faint">${ln.link_type}</span>
+                <span class="faint">${esc(ln.link_type)}</span>
                 <span>${esc(ln.target_id)}</span>
                 <span class="faint ml-auto">weight ${ln.weight.toFixed(2)}</span>
               </a>
@@ -2936,9 +2936,9 @@ route('/memories/:id', async (id) => {
         <a href="#/memories" class="back-link">← Back to Explorer</a>
         <div class="detail-card">
           <div class="detail-header">
-            ${layerIcon(m.layer)} <span class="detail-layer">${m.layer?.toUpperCase()} MEMORY</span>
+            ${layerIcon(m.layer)} <span class="detail-layer">${esc(m.layer?.toUpperCase())} MEMORY</span>
             ${strengthBar(m.strength || 0)}
-            <span class="faint ml-auto">${m.id}</span>
+            <span class="faint ml-auto">${esc(m.id)}</span>
           </div>
           <div class="detail-content">${esc(m.content || '')}</div>
           <div class="detail-meta">
@@ -2946,8 +2946,8 @@ route('/memories/:id', async (id) => {
             <div class="meta-row"><span class="faint">Created</span> ${m.created_at ? new Date(m.created_at).toLocaleString() : '?'} · ${ago(m.created_at)}</div>
             <div class="meta-row"><span class="faint">Last retrieved</span> ${m.last_retrieved ? ago(m.last_retrieved) : 'never'}</div>
             <div class="meta-row"><span class="faint">Retrievals</span> ${m.retrieval_count || 0}</div>
-            <div class="meta-row"><span class="faint">Source</span> ${sourceIcon(m.source)} ${m.source || '?'}</div>
-            <div class="meta-row"><span class="faint">Project</span> ${m.project || '—'}</div>
+            <div class="meta-row"><span class="faint">Source</span> ${sourceIcon(m.source)} ${esc(m.source || '?')}</div>
+            <div class="meta-row"><span class="faint">Project</span> ${esc(m.project || '—')}</div>
             <div class="meta-row">${tagList(m.tags)}</div>
           </div>
         </div>

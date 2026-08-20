@@ -6,6 +6,13 @@
 <meta name="color-scheme" content="dark light">
 <meta name="theme-color" content="#0b0f14">
 <meta name="description" content="ELLM Engram Memory Vault — browse, search and inspect agent memories.">
+<!-- CSP for the daemon-served copy; the hosted copy gets its (equivalent)
+     policy from deploy/caddy/engram.Caddyfile — keep the two in sync.
+     `wasm-unsafe-eval` = hash-wasm Argon2id in the unlock view; loopback
+     wildcard ports = `?daemon=` key-handoff target. Meta CSP cannot set
+     frame-ancestors, so this omits it (the daemon also sends the full
+     policy as a header, which does include frame-ancestors 'none'). -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' https://sync.ellmstack.dev http://127.0.0.1:* http://localhost:*; font-src 'self'; form-action 'self'; base-uri 'self'">
 <title>ELLM Engram Vault</title>
 <link rel="stylesheet" href="styles.css">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='13' font-size='13'>◆</text></svg>">
