@@ -160,6 +160,12 @@ jobs:
           # OpenSSL; without these env vars pkg-config refuses cross builds.
           echo "PKG_CONFIG_ALLOW_CROSS=1" >> "$GITHUB_ENV"
           echo "PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig" >> "$GITHUB_ENV"
+          # lto=true in the release profile makes rustc drive its own lld
+          # through the target's default "cc" linker; for the cross target
+          # that resolves to the HOST x86_64 gcc, which runs lld without
+          # aarch64 emulation ("incompatible with elf64-x86-64"). Point the
+          # linker at the real cross gcc so lld gets the right emulation.
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
 
       - name: Install NASM (Windows — vendored OpenSSL build)
         if: matrix.os == 'windows-latest'
@@ -228,7 +234,14 @@ jobs:
       - name: Codesign binaries
         if: matrix.os == 'macos-latest' && env.APPLE_CERT_P12_BASE64 != ''
         run: |
-          IDENTITY=$(security find-identity -v -p codesigning "$CODESIGN_KEYCHAIN" | awk '/Developer ID Application/ {print $2; exit}')
+          echo "=== all identities in keychain ==="
+          security find-identity "$CODESIGN_KEYCHAIN" || true
+          echo "=== codesigning identities ==="
+          security find-identity -p codesigning "$CODESIGN_KEYCHAIN" || true
+          # No -v: the validity filter has been observed to drop a freshly
+          # imported Developer ID G2 identity on the runner image even
+          # though codesign and notarytool accept it fine.
+          IDENTITY=$(security find-identity -p codesigning "$CODESIGN_KEYCHAIN" | awk '/Developer ID Application/ {print $2; exit}')
           codesign --force --options runtime --timestamp --sign "$IDENTITY" --keychain "$CODESIGN_KEYCHAIN" \
             target/${{ matrix.target }}/release/engram target/${{ matrix.target }}/release/engramd
           codesign --verify --strict --verbose=2 target/${{ matrix.target }}/release/engramd
