@@ -293,6 +293,26 @@ function resumePendingLink() {
   return true;
 }
 
+// A `#/vault/:id` deep link opened without a live session must survive
+// the sign-in round-trip: the vault route stashes the id here, /login
+// resumes it the moment a session exists. Single-shot, like the link one.
+const VAULT_PENDING_KEY = 'engram-pending-vault';
+
+function pendingVault() {
+  try {
+    const v = JSON.parse(sessionStorage.getItem(VAULT_PENDING_KEY) || 'null');
+    return v && v.vaultId ? v.vaultId : null;
+  } catch { return null; }
+}
+
+function resumePendingVault() {
+  const id = pendingVault();
+  if (!id || !localStorage.getItem('engram-sync-session')) return false;
+  sessionStorage.removeItem(VAULT_PENDING_KEY);
+  navigate('#/vault/' + encodeURIComponent(id));
+  return true;
+}
+
 function getCreds() {
   return sessionStorage.getItem(VAULT_CREDS_KEY);
 }
@@ -445,7 +465,7 @@ async function render() {
   // no nav: the gate below bounces them to login.
   const mainNav = document.getElementById('main-nav');
   if (mainNav) mainNav.style.display = (hasAuth() || api.account.token()) ? '' : 'none';
-  if (!hasAuth() && !api.account.token() && hash !== '/login' && hash !== '/unlock' && hash !== '/settings' && !hash.startsWith('/reset/') && !hash.startsWith('/handoff/') && !hash.startsWith('/link/')) {
+  if (!hasAuth() && !api.account.token() && hash !== '/login' && hash !== '/unlock' && hash !== '/settings' && !hash.startsWith('/reset/') && !hash.startsWith('/handoff/') && !hash.startsWith('/link/') && !hash.startsWith('/vault/')) {
     navigate('#/login');
     return;
   }
@@ -1115,11 +1135,11 @@ route('/login', () => {
           const keyState = await acquireAccountKey(PAIR_CODE_SERVER, res.account_id, password);
           if (keyState === 'setup') {
             // Signup was aborted before the wraps landed — create the key now.
-            renderPhraseGate(PAIR_CODE_SERVER, res.account_id, email, password, () => { if (resumePendingHandoff() || resumePendingLink()) return; navigate('#/unlock'); });
+            renderPhraseGate(PAIR_CODE_SERVER, res.account_id, email, password, () => { if (resumePendingHandoff() || resumePendingLink() || resumePendingVault()) return; navigate('#/unlock'); });
           } else if (keyState === 'recovery') {
             renderRecoveryGate(PAIR_CODE_SERVER, res.account_id, password);
           } else {
-            if (resumePendingHandoff() || resumePendingLink()) return;
+            if (resumePendingHandoff() || resumePendingLink() || resumePendingVault()) return;
             navigate('#/unlock');
           }
         } catch (e) {
@@ -1171,7 +1191,7 @@ route('/login', () => {
         try {
           const res = await api.account.signup(PAIR_CODE_SERVER, email, password);
           api.account.setToken(res.session_token);
-          renderPhraseGate(PAIR_CODE_SERVER, res.account_id, email, password, () => { if (resumePendingHandoff() || resumePendingLink()) return; navigate('#/unlock'); });
+          renderPhraseGate(PAIR_CODE_SERVER, res.account_id, email, password, () => { if (resumePendingHandoff() || resumePendingLink() || resumePendingVault()) return; navigate('#/unlock'); });
         } catch (e) {
           if (e.code === 'email_taken') fail('An account with that email already exists — sign in instead.');
           else if (e.code === 'weak_password') fail('Password must be 12–128 characters.');
@@ -1426,7 +1446,7 @@ route('/login', () => {
 
   // A key-handoff link that bounced here signed-out resumes the moment a
   // session token exists (signin/signup paths also call this directly).
-  if (resumePendingHandoff() || resumePendingLink()) return;
+  if (resumePendingHandoff() || resumePendingLink() || resumePendingVault()) return;
 });
 
 // ── Password reset link (from the reset email: #/reset/{token}) ────────────
@@ -1530,7 +1550,7 @@ route('/handoff/:token', (token) => {
       // Strip the one-time token from history before moving on.
       history.replaceState(null, '', '#/handoff/');
       toast('Vault linked — it now opens with your account', 'ok');
-      navigate('#/unlock');
+      navigate(h.vault_id ? '#/vault/' + encodeURIComponent(String(h.vault_id)) : '#/unlock');
     } catch (e) {
       if (e && e.status === 401) {
         // Signed-out (or stale session): keep the link alive across the
@@ -1601,6 +1621,26 @@ route('/link/:id', (id) => {
       await acctPost(SERVER, '/devices/link-intents/' + encodeURIComponent(id) + '/confirm', { code });
       // Strip the one-time code from history before moving on.
       history.replaceState(null, '', '#/link/' + encodeURIComponent(id));
+      // The session is live — list the account's vaults as per-vault deep
+      // links (best-effort: a failed fetch keeps today's generic panel).
+      let vaultRows = '';
+      try {
+        const vaults = await unlock.listVaults(SERVER);
+        if (vaults.length) {
+          const shown = vaults.slice(0, 5);
+          vaultRows = `
+              <p class="faint" style="margin:0.8rem 0 0.2rem;">Your vaults:</p>
+              <div class="unlock-vaults">
+                ${shown.map(v => `
+                <div class="unlock-vault-row">
+                  <div>
+                    <a href="#/vault/${encodeURIComponent(v.vault_id)}">${esc(v.label || v.vault_id)} · ${esc(v.vault_id)}</a>
+                  </div>
+                </div>`).join('')}
+                ${vaults.length > shown.length ? `<div class="faint">+ ${vaults.length - shown.length} more in the vault picker</div>` : ''}
+              </div>`;
+        }
+      } catch {}
       app.innerHTML = `
         <div class="modal-overlay">
           <div class="modal login-modal">
@@ -1608,6 +1648,7 @@ route('/link/:id', (id) => {
             <div class="modal-body">
               <p>✓ This machine is now linked to your account.</p>
               <p class="faint">Back in the terminal, <code>engram link</code> finishes on its own. The device appears in Account &amp; Sync after its first sync.</p>
+              ${vaultRows}
               <div class="login-alt">
                 <p class="faint"><a href="#/login">← Back to sign in</a> · <a href="#/unlock">Go to vault picker</a></p>
               </div>
@@ -1682,9 +1723,18 @@ route('/reset/:token', (token) => {
 // account session (for pull); passphrase/keys never leave this tab and are
 // wiped on lock/sign-out/reload.
 
-route('/unlock', async () => {
-  const app = document.getElementById('app');
-  let relay = null;
+route('/unlock', () => unlockView());
+route('/vault/:id', (id) => unlockView({ vaultId: decodeURIComponent(id) }));
+
+// Shared implementation for /unlock and /vault/:id deep links: the same
+// view, with an optional target vault the picker opens directly. The
+// target is consumed once — returning to the picker shows the full list.
+function unlockView(opts = {}) {
+  return (async () => {
+    const app = document.getElementById('app');
+    let relay = null;
+    let deepLink = opts.vaultId || null;
+    const cameFromDeepLink = !!opts.vaultId;
 
   // Relay base: daemon config for custom-relay users. This view is
   // gate-exempt, so the config read can 401 (no box creds in this tab) —
@@ -1913,6 +1963,29 @@ route('/unlock', async () => {
   function picker() {
     app.innerHTML = '<div class="loading">Loading vaults…</div>';
     unlock.listVaults(relay).then(vaults => {
+      // Deep link: open the target vault directly (single-shot — a later
+      // return to the picker shows the full list).
+      const target = deepLink;
+      deepLink = null;
+      if (target) {
+        const v = vaults.find(x => x.vault_id === target);
+        if (v) {
+          if (v.is_open) openWithAccountKey(v.vault_id, v.label || v.vault_id);
+          else passphrase(v.vault_id, v.label || v.vault_id);
+          return;
+        }
+        app.innerHTML = `
+          <div class="page">
+            <div class="panel" style="max-width:34rem;margin:2rem auto;">
+              <div class="panel-header">Vault not found</div>
+              <div class="error-panel"><p>No vault <code>${esc(target)}</code> on this account — it may have been forgotten, or the link is wrong.</p></div>
+              <div class="login-alt">
+                <p class="faint"><a href="#/unlock">← All vaults</a></p>
+              </div>
+            </div>
+          </div>`;
+        return;
+      }
       if (!vaults.length) {
         app.innerHTML = '<div class="error-panel"><p>No synced vaults for this account yet. Pair a device to start syncing.</p></div>';
         return;
@@ -2010,6 +2083,7 @@ route('/unlock', async () => {
               <button class="btn btn-primary" id="unlock-go">Unlock</button>
               <button class="btn" id="unlock-back">Back</button>
             </div>
+            ${cameFromDeepLink ? `<div class="login-alt"><p class="faint"><a href="#/unlock">← All vaults</a></p></div>` : ''}
           </div>
         </div>
       </div>`;
@@ -2167,7 +2241,17 @@ route('/unlock', async () => {
 
   if (unlock.isUnlocked()) { list(); return; }
   relay = await relayUrl();
-  if (!api.account.token()) { signedOut(); return; }
+  if (!api.account.token()) {
+    if (deepLink) {
+      // A deep link opened while signed out must survive the sign-in
+      // round-trip: stash the target, /login resumes it with a live session.
+      sessionStorage.setItem(VAULT_PENDING_KEY, JSON.stringify({ vaultId: deepLink }));
+      navigate('#/login');
+      return;
+    }
+    signedOut();
+    return;
+  }
   picker();
   // Route cleanup: the "lock when I leave" policy locks the vault on
   // navigation away; the inactivity timer dies with the route.
@@ -2176,7 +2260,8 @@ route('/unlock', async () => {
     if (vaultId && localStorage.getItem('engram-lock-policy:' + vaultId) === 'close') unlock.lock();
     if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
   };
-});
+  })();
+}
 
 // ── Dashboard ─────────────────────────────────────────────────────────────
 
