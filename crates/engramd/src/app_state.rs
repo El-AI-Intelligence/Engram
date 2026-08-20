@@ -108,4 +108,8 @@ pub struct AppState {
     /// the same user on the same machine — can attach it. Redeem stays
     /// token-only: the browser cannot carry this credential.
     pub handoff_credential: Option<String>,
+    /// Browser origins allowed to call the daemon (resolved once at
+    /// startup). Shared by the CORS layer, the PNA middleware, and the
+    /// /ws/events handshake — exact match only.
+    pub cors_allowed_origins: Arc<Vec<String>>,
 }

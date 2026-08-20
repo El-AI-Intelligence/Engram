@@ -11,12 +11,14 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         Query, State,
     },
+    http::{header, HeaderMap, StatusCode},
     response::IntoResponse,
     routing::get,
-    Router,
+    Json, Router,
 };
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
+use serde_json::json;
 
 #[derive(Deserialize, Default)]
 struct EventsFilter {
@@ -31,8 +33,25 @@ pub fn router() -> Router<AppState> {
 async fn handler(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(filter): Query<EventsFilter>,
 ) -> impl IntoResponse {
+    // The stream carries full memory contents, so the handshake must be
+    // origin-gated: browsers always send Origin on WebSocket upgrades, and
+    // anything without an allowed one (missing included — non-browser
+    // clients don't send it) must not get a socket.
+    let origin_allowed = headers
+        .get(header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .map(|o| state.cors_allowed_origins.iter().any(|a| a == o))
+        .unwrap_or(false);
+    if !origin_allowed {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "origin not allowed", "code": "forbidden"})),
+        )
+            .into_response();
+    }
     ws.on_upgrade(move |socket| handle_socket(socket, state, filter))
 }
 

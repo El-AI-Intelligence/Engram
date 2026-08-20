@@ -496,45 +496,43 @@ fn load_consolidation_schedule(vault_path: &std::path::Path) -> (u64, bool) {
 /// This replaces the previous `CorsLayer::permissive()` which allowed ANY origin
 /// to exfiltrate memories via cross-origin fetch from malicious websites.
 ///
-/// Additional allowed origins can be configured via the `ENGRAM_CORS_ORIGINS`
-/// environment variable (comma-separated URLs).
-fn cors_layer() -> CorsLayer {
+/// Origins are resolved ONCE at startup into `resolved_allowed_origins` and
+/// shared by the CORS layer, the PNA middleware, and the WebSocket handshake —
+/// one list, one truth. Extra origins can be configured via the
+/// `ENGRAM_CORS_ORIGINS` env var (comma-separated URLs).
+fn cors_layer(allowed: Arc<Vec<String>>) -> CorsLayer {
     use tower_http::cors::AllowOrigin;
-
-    let extra_origins = cors_extra_origins();
 
     CorsLayer::new()
         .allow_origin(AllowOrigin::predicate(
-            move |origin: &axum::http::HeaderValue, _req| origin_is_allowed(origin, &extra_origins),
+            move |origin: &axum::http::HeaderValue, _req| origin_is_allowed(origin, &allowed),
         ))
         .allow_methods(Any)
         .allow_headers(Any)
 }
 
-/// Extra allowed origins from the ENGRAM_CORS_ORIGINS env var (comma-separated).
-fn cors_extra_origins() -> Vec<String> {
-    std::env::var("ENGRAM_CORS_ORIGINS")
-        .ok()
-        .map(|s| s.split(',').map(|o| o.trim().to_string()).collect())
-        .unwrap_or_default()
+/// The full allow-list, built once at startup: the production SPA domain,
+/// the daemon's own UI origins (as reached via the bind address — the
+/// WebSocket handshake needs these even though same-origin fetches bypass
+/// CORS), and any ENGRAM_CORS_ORIGINS extras (e.g. a dev server or a custom
+/// hostname). Exact match only — the old `localhost:*` wildcard let any
+/// local page mint an allowed origin on any port.
+fn resolved_allowed_origins(bind: &std::net::SocketAddr) -> Vec<String> {
+    let mut out = vec!["https://engram.ellmstack.dev".to_string()];
+    if let Ok(extra) = std::env::var("ENGRAM_CORS_ORIGINS") {
+        out.extend(extra.split(',').map(|o| o.trim().to_string()).filter(|o| !o.is_empty()));
+    }
+    let port = bind.port();
+    for host in ["127.0.0.1", "localhost", "[::1]"] {
+        out.push(format!("http://{host}:{port}"));
+    }
+    out
 }
 
 /// Single source of truth for which browser origins may call the daemon.
-fn origin_is_allowed(origin: &axum::http::HeaderValue, extra_origins: &[String]) -> bool {
+fn origin_is_allowed(origin: &axum::http::HeaderValue, allowed: &[String]) -> bool {
     let Ok(s) = origin.to_str() else { return false };
-    // Allow localhost on any port (dev UI, Python server, etc.)
-    if s.starts_with("http://localhost:")
-        || s.starts_with("http://127.0.0.1:")
-        || s.starts_with("http://[::1]:")
-    {
-        return true;
-    }
-    // Allow the production domain
-    if s == "https://engram.ellmstack.dev" {
-        return true;
-    }
-    // Allow any domains configured via ENGRAM_CORS_ORIGINS
-    extra_origins.iter().any(|o| o == s)
+    allowed.iter().any(|o| o == s)
 }
 
 /// Chrome 142+ enforces Local Network Access (successor to Private Network
@@ -546,14 +544,14 @@ fn origin_is_allowed(origin: &axum::http::HeaderValue, extra_origins: &[String])
 /// the CORS layer, never `*` (a wildcard would let any public page probe
 /// loopback daemons through this opt-in).
 async fn pna_opt_in(
+    axum::extract::State(allowed): axum::extract::State<Arc<Vec<String>>>,
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    let extras = cors_extra_origins();
     let origin_allowed = req
         .headers()
         .get(axum::http::header::ORIGIN)
-        .map(|o| origin_is_allowed(o, &extras))
+        .map(|o| origin_is_allowed(o, &allowed))
         .unwrap_or(false);
     let mut res = next.run(req).await;
     if origin_allowed {
@@ -633,6 +631,7 @@ async fn run_daemon(
         sync_passphrase_set: passphrase.is_some(),
         key_handoff: KeyHandoff::default(),
         handoff_credential: None,
+        cors_allowed_origins: Arc::new(Vec::new()),
     };
 
     // ── Background scheduler ──────────────────────────────────────────────
@@ -771,6 +770,11 @@ async fn run_daemon(
         None => Some(load_or_create_handoff_token(&vault_path)),
     };
 
+    // Resolved once at startup and shared by the CORS layer, the PNA
+    // middleware, and the WS handshake — see resolved_allowed_origins.
+    let allowed_origins: Arc<Vec<String>> = Arc::new(resolved_allowed_origins(&bind));
+    state.cors_allowed_origins = allowed_origins.clone();
+
     let app = Router::new()
         .merge(routes::health::router())
         .merge(routes::memories::router())
@@ -793,8 +797,11 @@ async fn run_daemon(
             auth_state,
             auth::auth_middleware,
         ))
-        .layer(cors_layer())
-        .layer(axum::middleware::from_fn(pna_opt_in))
+        .layer(cors_layer(allowed_origins.clone()))
+        .layer(axum::middleware::from_fn_with_state(
+            allowed_origins.clone(),
+            pna_opt_in,
+        ))
         .layer(TraceLayer::new_for_http())
         // Reject oversized bodies (10 MiB) with structured JSON errors
         .layer(DefaultBodyLimit::max(10 * 1024 * 1024))
@@ -949,7 +956,38 @@ async fn background_consolidator(state: AppState) {
 
 #[cfg(test)]
 mod tests {
-    use super::{load_or_create_handoff_token, name_is_engramd};
+    use super::{load_or_create_handoff_token, name_is_engramd, origin_is_allowed, resolved_allowed_origins};
+
+    #[test]
+    fn origin_allowlist_is_exact() {
+        use axum::http::HeaderValue;
+        let bind: std::net::SocketAddr = "127.0.0.1:8787".parse().unwrap();
+        let allowed = resolved_allowed_origins(&bind);
+        let ok = |o: &str| origin_is_allowed(&HeaderValue::from_str(o).unwrap(), &allowed);
+        // Allowed: the prod SPA and the daemon's own origins on the bind port.
+        assert!(ok("https://engram.ellmstack.dev"));
+        assert!(ok("http://127.0.0.1:8787"));
+        assert!(ok("http://localhost:8787"));
+        assert!(ok("http://[::1]:8787"));
+        // Rejected: any OTHER localhost port (the old wildcard hole), other
+        // hosts/schemes, and hostname-suffix tricks (exact match only).
+        assert!(!ok("http://localhost:9999"));
+        assert!(!ok("http://127.0.0.1:9999"));
+        assert!(!ok("http://evil.example"));
+        assert!(!ok("https://engram.ellmstack.dev.evil.example"));
+        assert!(!ok("http://engram.ellmstack.dev"));
+    }
+
+    #[test]
+    fn env_extra_origins_are_honored() {
+        std::env::set_var("ENGRAM_CORS_ORIGINS", "http://dev.example:5173, http://other.example");
+        let bind: std::net::SocketAddr = "127.0.0.1:8787".parse().unwrap();
+        let allowed = resolved_allowed_origins(&bind);
+        std::env::remove_var("ENGRAM_CORS_ORIGINS");
+        assert!(allowed.iter().any(|o| o == "http://dev.example:5173"));
+        assert!(allowed.iter().any(|o| o == "http://other.example"));
+    }
+
 
     #[test]
     fn handoff_token_persists_and_reuses() {
