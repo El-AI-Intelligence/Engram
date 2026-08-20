@@ -50,7 +50,16 @@ client-side before data leaves your machine.
 | **Memory content** | ❌ | Never leaves your device in plaintext |
 | **Tags, context, metadata** | ❌ | Encrypted inside ciphertext |
 
-## Conflict Resolution: Last-Write-Wins
+### Per-vault key scoping (tenant isolation)
+
+Account API keys on the relay are **scoped to one vault** and authorize
+push/pull/stats for that vault only — a key can never read another vault's
+blob counts, never mind its contents. Pairing and linking mint vault-scoped
+keys automatically (the vault id is derived from the device's passphrase),
+and minting a key for a vault your account doesn't own is refused. Keys
+minted before 2026-08-20 are account-wide ("unscoped") and are now
+**policy-denied with a 403** — run `engram link` or `engram pair` again on
+affected devices to mint a scoped replacement.
 
 Engram uses **monotonic vector clocks** for conflict resolution:
 
@@ -144,10 +153,14 @@ you pass `--force` (the old key stays active until revoked in
 Account & Sync → API keys).
 
 Notes: pairing codes are single-use, 10-minute TTL, and stored server-side
-only as sha256 — the plaintext is shown once. Issued keys are **unscoped in
-v1** (account-wide); the vault UI can also mint per-vault keys manually.
-Machine-keyed vaults (created without a passphrase) cannot link or pair —
-sync keys derive from the passphrase, so both commands refuse them.
+only as sha256 — the plaintext is shown once. Issued keys are **scoped to
+the device's vault** (the vault id is derived from the passphrase at
+pair/link time and minted into the key); the vault UI mints per-vault keys
+the same way. Keys minted before 2026-08-20 are account-wide ("unscoped")
+and the relay now policy-denies them with a 403 — re-run `engram link` or
+`engram pair` on affected devices. Machine-keyed vaults (created without a
+passphrase) cannot link or pair — sync keys derive from the passphrase, so
+both commands refuse them.
 
 ### 2. Configure your vault
 
@@ -190,6 +203,17 @@ engram daemon
 ```
 
 (Without that file, pass it explicitly: `engram daemon --passphrase "<your passphrase>"`.)
+
+Other daemon env vars:
+
+- `ENGRAMD_API_KEY` — bearer token the daemon requires on API routes
+  (including the key-handoff mint endpoint) and uses for sync key handoff.
+- `ENGRAM_CORS_ORIGINS` — comma-separated extra origins allowed to call the
+  daemon from a browser, on top of the daemon's own origin and the hosted
+  vault UI. Needed when developing against a local web server (e.g. a vite
+  dev server); wildcard `localhost:*` ports are **not** allowed by default.
+  Affects CORS, the /ws/events upgrade, and Private Network Access
+  preflights alike.
 
 ### 4. Verify sync is working
 
@@ -318,6 +342,16 @@ them to push.
 > server. Explicit `vault_id` still wins over the fallback, and is
 > recommended for anything you want to name.
 
+**Vault id convergence (2026-08-20).** The fallback derivation uses a v2
+KDF (new domain salt, higher Argon2id cost). An unpinned device probes the
+relay — v2 first, then the v1 derivation — and joins whichever vault
+EXISTS, creating fresh vaults under v2. Pinned `vault_id` values are never
+touched, so existing teams are unaffected. Rare edge: two never-paired
+devices (one old binary, one new) starting simultaneously can pin different
+derivations — recover with `engram join --vault-id <id>`. A device whose
+`api_key` is rejected (401) keeps the local vault working but skips sync
+until the key is fixed.
+
 ### Seeing the team
 
 - **Settings → Sync & Team** in the web UI: vault ID (copy button), team
@@ -352,7 +386,9 @@ register/sign-in, quota bars, API key list, "Connect this device").
 
 ### Account API keys
 
-Minted at `POST /account/keys` (optionally scoped to one `vault_id`):
+Minted at `POST /account/keys`, scoped to exactly one `vault_id`
+(required since 2026-08-20 — the mint is refused unless the account owns
+the vault or the vault is empty):
 
 - Format `en_` + 43 base64url chars. The **full key is returned exactly
   once**; the relay stores only `sha256(full_key)` and a prefix, so keys
