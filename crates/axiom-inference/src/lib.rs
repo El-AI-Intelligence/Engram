@@ -56,10 +56,11 @@ pub struct InferenceRequest {
 // ─────────────────────────────────────────────────── InferenceConfig ─────────
 
 /// The kind of inference provider to use.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderKind {
     /// OpenAI-compatible API (Ollama, vLLM, etc.)
+    #[default]
     OpenAI,
     /// ONNX Runtime (local, CPU/NPU) — requires `onnx` feature
     #[cfg(feature = "onnx")]
@@ -72,12 +73,6 @@ pub enum ProviderKind {
         n_gpu_layers: u32,
         n_threads: usize,
     },
-}
-
-impl Default for ProviderKind {
-    fn default() -> Self {
-        ProviderKind::OpenAI
-    }
 }
 
 /// Cloud fallback configuration for when local inference is unavailable.
@@ -1182,11 +1177,10 @@ pub fn route_request_with_coherence(
 }
 
 // ──────────────────────────────────── Prompt Cache ────────────────────────────
-/// Caches system prompts and repeated context to reduce token usage.
-/// Uses content-addressable hashing for cache keys.
-
 use std::collections::HashMap as StdHashMap;
 
+/// Caches system prompts and repeated context to reduce token usage.
+/// Uses content-addressable hashing for cache keys.
 pub struct PromptCache {
     entries: StdHashMap<String, CachedPrompt>,
     max_entries: usize,
