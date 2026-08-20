@@ -447,7 +447,7 @@ The sync server is designed to be self-hosted:
   key-only behavior — passkey accounts, sessions, and quota enforcement
   activate on top of it without changing anything for static keys
 - **Resource-light:** ~20 MB RAM, minimal CPU
-- **Docker:** `docker run -v ./data:/data -p 8788:8788 -e SYNC_API_KEYS=... ghcr.io/pixelphantomai/engramd-sync:latest`
+- **Docker:** `docker run -v ./data:/data -p 8788:8788 -e SYNC_API_KEYS=... ghcr.io/el-ai-intelligence/engramd-sync:latest` (sync image not published by the v0.1.0 release workflow yet — deploy from source, see deploy/sync-relay.md)
 
 ### API key scoping & revocation (teams v1)
 

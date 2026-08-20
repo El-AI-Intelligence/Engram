@@ -62,7 +62,13 @@ cargo install engramd
 
 ### Docker
 ```bash
-docker run -v ./vault:/vault -p 8787:8787 ghcr.io/pixelphantomai/engramd:latest
+# One-time setup: initialize the vault (interactive wizard)
+docker run --rm -it -v ./vault:/vault --entrypoint engram \
+  ghcr.io/el-ai-intelligence/engramd:latest init
+
+# Run the daemon (passphrase required on every start):
+docker run -d -v ./vault:/vault -p 8787:8787 \
+  -e ENGRAM_PASSPHRASE=... ghcr.io/el-ai-intelligence/engramd:latest
 ```
 
 ## Post-install
