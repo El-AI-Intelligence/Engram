@@ -29,7 +29,18 @@
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::error::Error;
 use std::io::{BufRead, Write};
+
+/// Human-readable transport failure. The source chain carries the OS-level
+/// cause (connection refused vs reset vs timeout) — the difference matters
+/// when a user reports "unreachable" and we need to know which.
+fn unreachable_error(e: &reqwest::Error) -> String {
+    match e.source() {
+        Some(src) => format!("engramd unreachable: {e} ({src})"),
+        None => format!("engramd unreachable: {e}"),
+    }
+}
 
 /// MCP server configuration.
 #[derive(Parser, Debug)]
@@ -216,7 +227,7 @@ impl McpServer {
             .json(&body)
             .send()
             .await
-            .map_err(|e| format!("engramd unreachable: {e}"))?
+            .map_err(|e| unreachable_error(&e))?
             .json::<Value>()
             .await
             .map_err(|e| format!("parse error: {e}"))?;
@@ -276,7 +287,7 @@ impl McpServer {
             .json(&body)
             .send()
             .await
-            .map_err(|e| format!("engramd unreachable: {e}"))?;
+            .map_err(|e| unreachable_error(&e))?;
 
         // A rejection (401/403 when the daemon is API-keyed) must surface the
         // daemon's own message — previously the error body parsed as JSON and
@@ -346,7 +357,7 @@ impl McpServer {
             .get(format!("{}/memories/{}", self.engramd_url, id))
             .send()
             .await
-            .map_err(|e| format!("engramd unreachable: {e}"))?;
+            .map_err(|e| unreachable_error(&e))?;
 
         if resp.status() == 404 {
             return Ok(json!({
@@ -387,7 +398,7 @@ impl McpServer {
             .json(&body)
             .send()
             .await
-            .map_err(|e| format!("engramd unreachable: {e}"))?;
+            .map_err(|e| unreachable_error(&e))?;
 
         let result = resp
             .json::<Value>()
@@ -414,7 +425,7 @@ impl McpServer {
             .get(format!("{}/health", self.engramd_url))
             .send()
             .await
-            .map_err(|e| format!("engramd unreachable: {e}"))?;
+            .map_err(|e| unreachable_error(&e))?;
 
         let health = resp
             .json::<Value>()
@@ -436,7 +447,7 @@ impl McpServer {
             .json(&json!({"mode": "decay_only"}))
             .send()
             .await
-            .map_err(|e| format!("engramd unreachable: {e}"))?;
+            .map_err(|e| unreachable_error(&e))?;
 
         let result = resp
             .json::<Value>()
@@ -601,46 +612,36 @@ fn emit(stdout: &std::io::Stdout, response: &JsonRpcResponse) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
-    use tokio::io::AsyncWriteExt;
 
-    /// Spin a raw TCP stub that answers every request with one canned HTTP
-    /// response (status line + JSON body, content-length computed here so it
-    /// always matches) and return its base URL.
+    /// Spin a stub daemon on an ephemeral 127.0.0.1 port that answers every
+    /// request with one canned status + JSON body, and return its base URL.
+    ///
+    /// The bind → nonblocking → from_std-in-task → axum::serve shape mirrors
+    /// engramd's sync_integration spawn_stub, which is proven on Windows CI.
+    /// A hand-rolled tokio accept loop here consistently failed to accept
+    /// connections on Windows runners (every request came back "unreachable").
     async fn spawn_http_stub(status_line: &'static str, body: &'static str) -> String {
-        let response = Arc::new(
-            format!(
-                "HTTP/1.1 {status_line}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                body.len()
-            )
-            .into_bytes(),
-        );
-        // std bind first so the port is listening before this function
-        // returns, then hand the socket to tokio — the same pattern proven
-        // on Windows CI by sync_integration.rs's spawn_stub.
+        let status = axum::http::StatusCode::from_u16(
+            status_line
+                .split_whitespace()
+                .next()
+                .expect("status code in status line")
+                .parse()
+                .expect("numeric status code"),
+        )
+        .expect("valid HTTP status");
+        let body: serde_json::Value = serde_json::from_str(body).expect("valid stub JSON");
+        let app = axum::Router::new().fallback(move || async move {
+            (status, axum::Json(body.clone()))
+        });
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral bind");
         let addr = listener.local_addr().expect("local addr");
         listener
             .set_nonblocking(true)
             .expect("nonblocking listener");
-        let listener = tokio::net::TcpListener::from_std(listener).expect("tokio listener");
         tokio::spawn(async move {
-            loop {
-                // Never exit on an accept error: Windows surfaces transient
-                // ones (e.g. WSAECONNABORTED when a peer aborts mid-handshake)
-                // that Unix accept loops retry internally. Breaking here
-                // drops the listener and every later connect is refused.
-                match listener.accept().await {
-                    Ok((mut sock, _)) => {
-                        let response = response.clone();
-                        tokio::spawn(async move {
-                            let _ = sock.write_all(&response).await;
-                            let _ = sock.shutdown().await;
-                        });
-                    }
-                    Err(_) => continue,
-                }
-            }
+            let listener = tokio::net::TcpListener::from_std(listener).expect("tokio listener");
+            axum::serve(listener, app).await.expect("stub serve");
         });
         format!("http://{addr}")
     }
