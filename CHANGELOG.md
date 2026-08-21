@@ -43,6 +43,10 @@ misc hardening — all findings reproduced against HEAD before fixing.
   the relay and converge on whichever derivation (v2 or legacy v1) already
   EXISTS, creating fresh vaults under v2. Pinned ids are untouched; a
   rejected api_key aborts sync (daemon stays up). (`247ca39`)
+- **Pair onto manually-named vaults** — `engram pair --vault-id <id>`
+  overrides the passphrase-derived vault id and pins it into
+  `config.json`, so devices can join teams whose vault id was named by
+  hand (`engram join`) — passphrase convergence can never reach those.
 - **MCP capture honesty** — `engram_capture` checks the daemon's HTTP
   status and reports rejection bodies (401/403) instead of a false
   "captured successfully". (`8cdb5d1`)

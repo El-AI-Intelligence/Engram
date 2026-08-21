@@ -145,6 +145,20 @@ Machines without a browser can still use a one-time pairing code:
 engram pair ENG-XXXX-XXXX-XXXX
 ```
 
+**Manually-named vault ids:** vault ids are normally 64-hex strings derived
+from the passphrase, and devices converge on the same vault automatically.
+If your team's vault id was **named by hand** (e.g. created with
+`engram join --vault-id <id>`), no passphrase derivation can reach it —
+new devices must pair explicitly, or they would silently land in a fresh
+empty vault:
+
+```bash
+engram pair ENG-XXXX-XXXX-XXXX --vault-id <the team's vault id>
+```
+
+The flag overrides the derived id at redeem time and pins `sync.vault_id`
+into the vault's `config.json`, so the daemon skips probe-convergence.
+
 The device's roster label is taken from `--name` if given, otherwise the
 vault's sync name, otherwise the machine hostname — both commands replace
 a placeholder label (`unknown`) in the vault's `device.json` automatically.

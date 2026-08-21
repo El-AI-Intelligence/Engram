@@ -76,6 +76,11 @@ pub enum Commands {
         /// Device label shown in Account & Sync (optional)
         #[arg(long)]
         name: Option<String>,
+        /// Shared vault ID to pair onto. Overrides the passphrase-derived id —
+        /// required when the team vault has a manually-named id (created with
+        /// `engram join` or an explicit name), which no passphrase can derive.
+        #[arg(long)]
+        vault_id: Option<String>,
     },
     /// Link this machine to your Engram account — opens your browser, one
     /// click to approve (WARP-style). Use `engram pair` for headless setups.
@@ -672,6 +677,7 @@ fn save_sync_credential(
     server_url: &str,
     api_key: &str,
     name: &Option<String>,
+    vault_id: Option<&str>,
 ) -> Result<()> {
     let cfg_path = vault_path.join("config.json");
     let mut config: serde_json::Value = std::fs::read_to_string(&cfg_path)
@@ -688,6 +694,13 @@ fn save_sync_credential(
     sync["interval_secs"] = serde_json::json!(60);
     if let Some(ref n) = name {
         sync["name"] = serde_json::Value::String(n.clone());
+    }
+    // An explicit --vault-id pins the id right away so the daemon skips
+    // probe-convergence — passphrase derivation can never reach a
+    // manually-named vault id. Derived ids stay unpinned: convergence may
+    // still pick v1 for an existing team vault.
+    if let Some(id) = vault_id {
+        sync["vault_id"] = serde_json::Value::String(id.to_string());
     }
     // The roster label comes from vault-local device.json (the sync loop
     // registers it on startup). Older vaults carry the "unknown" placeholder —
@@ -820,6 +833,7 @@ pub async fn handle_pair(
     server_url: String,
     site: String,
     name: Option<String>,
+    vault_id_opt: Option<String>,
 ) -> Result<()> {
     println!();
     println!("  ╔══════════════════════════════════════════╗");
@@ -839,7 +853,13 @@ pub async fn handle_pair(
     // key is scoped to this vault, so the body carries the client-derived
     // vault id (pinned config value, else derived from the passphrase).
     let code = code.trim().to_ascii_uppercase();
-    let vault_id = resolve_sync_vault_id(&vault_path, fresh_passphrase.as_deref())?;
+    // --vault-id is authoritative (the team's id may not be derivable);
+    // otherwise fall back to the pinned config value, else the passphrase.
+    let vault_id = match vault_id_opt.as_deref() {
+        Some(id) if !id.trim().is_empty() => id.trim().to_string(),
+        Some(_) => anyhow::bail!("--vault-id must not be empty"),
+        None => resolve_sync_vault_id(&vault_path, fresh_passphrase.as_deref())?,
+    };
     let mut body = serde_json::json!({ "code": code, "vault_id": vault_id });
     if let Some(ref n) = name {
         body["device_label"] = serde_json::Value::String(n.clone());
@@ -876,7 +896,8 @@ pub async fn handle_pair(
                 "pairing rejected: this account has no access to that vault.\n\
                  If the vault is shared, ask its owner to pair you in Account & Sync.\n\
                  If it is yours, the passphrase on this machine differs from your other\n\
-                 devices — re-check ~/.engram/env."
+                 devices — re-check ~/.engram/env — or the team vault has a manually-named\n\
+                 id: re-run with --vault-id <the team's vault id>."
             ),
             _ => anyhow::bail!("pairing failed: {err_code}"),
         }
@@ -887,11 +908,14 @@ pub async fn handle_pair(
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("relay response missing api_key"))?;
 
-    save_sync_credential(&vault_path, &server_url, api_key, &name)?;
+    save_sync_credential(&vault_path, &server_url, api_key, &name, vault_id_opt.as_deref())?;
 
     println!();
     println!("  ✅ Paired! The relay issued a new API key — stored in {}", vault_path.join("config.json").display());
     println!("     (the key is masked in all status output; it is not printed here)");
+    if vault_id_opt.is_some() {
+        println!("     (sync pinned to vault {} — --vault-id)", vault_id);
+    }
     if fresh_passphrase.is_some() {
         println!("     (vault created at {})", vault_path.display());
         println!("     (passphrase saved to ~/.engram/env (0600) — never in config.json, never printed)");
@@ -1089,7 +1113,7 @@ pub async fn handle_link(
     // decrypted key is written to disk.
     drop(sk_cli.take());
 
-    save_sync_credential(&vault_path, &server_url, &api_key, &name)?;
+    save_sync_credential(&vault_path, &server_url, &api_key, &name, None)?;
 
     println!();
     println!("  ✅ Linked! The relay issued a new API key — stored in {}", vault_path.join("config.json").display());
@@ -2327,6 +2351,47 @@ mod tests {
         assert!(merge_mcp_server("{not json", "http://127.0.0.1:8787").is_err());
         assert!(merge_mcp_server("[1,2,3]", "http://127.0.0.1:8787").is_err());
         assert!(merge_mcp_server(r#"{"mcpServers": "oops"}"#, "http://127.0.0.1:8787").is_err());
+    }
+
+    #[test]
+    fn save_sync_credential_pins_explicit_vault_id() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"schedule":{"decay_cron":"0 3 * * *"}}"#,
+        )
+        .unwrap();
+        save_sync_credential(
+            dir.path(),
+            "https://relay.example",
+            "secret-key",
+            &None,
+            Some("engram-local"),
+        )
+        .unwrap();
+        let cfg: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("config.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cfg["sync"]["vault_id"], "engram-local");
+        assert_eq!(cfg["sync"]["api_key"], "secret-key");
+        assert_eq!(cfg["sync"]["enabled"], true);
+        assert_eq!(cfg["schedule"]["decay_cron"], "0 3 * * *"); // other keys untouched
+    }
+
+    #[test]
+    fn save_sync_credential_without_vault_id_stays_unpinned() {
+        let dir = tempfile::tempdir().unwrap();
+        save_sync_credential(dir.path(), "https://relay.example", "secret-key", &None, None)
+            .unwrap();
+        let cfg: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("config.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            cfg["sync"].get("vault_id").is_none(),
+            "no explicit id → probe-convergence decides"
+        );
     }
 
     #[test]
