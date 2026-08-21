@@ -19,20 +19,20 @@ class Engramd < Formula
   on_macos do
     if Hardware::CPU.arm?
       url "https://github.com/El-AI-Intelligence/engram/releases/download/v#{version}/engramd-darwin-arm64.tar.gz"
-      sha256 "67be8457125950efb347caa216a1bb59a96042f9ee2a30ec759848b860d593f4"
+      sha256 "e3e47831eb5877942e60e39c537693fe9e4c53afcdfd51fcdc571d5877c52173"
     else
       url "https://github.com/El-AI-Intelligence/engram/releases/download/v#{version}/engramd-darwin-x86_64.tar.gz"
-      sha256 "9c466c76451e2a52cc58d837ee18ce40d18ac92a847097558d7cd572a5cd8fbd"
+      sha256 "069a10ee2ef989a058c440d72db2f72271c8f3c56b3d76d16de5b1b53e841b14"
     end
   end
 
   on_linux do
     if Hardware::CPU.arm?
       url "https://github.com/El-AI-Intelligence/engram/releases/download/v#{version}/engramd-linux-arm64.tar.gz"
-      sha256 "b73d32e5ecdb5fc919df366b14a60cb8c55baf41330d7f25c505f9cc8fd92f4f"
+      sha256 "d16287a0efe3b91ae3c70cde39b16fee3b430856f7c224220dcc81db162f0652"
     else
       url "https://github.com/El-AI-Intelligence/engram/releases/download/v#{version}/engramd-linux-x86_64.tar.gz"
-      sha256 "32db43c7e89f1534a996c9fa2bd241ff628bfb7b9241c50966b933b9f5974a25"
+      sha256 "5db0d5b105a6dbb0d60f13d30060054ae4ba758fde8327769597cad9bb117253"
     end
   end
 

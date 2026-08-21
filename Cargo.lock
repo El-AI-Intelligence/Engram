@@ -1108,6 +1108,7 @@ dependencies = [
 name = "engramd-mcp"
 version = "0.1.1"
 dependencies = [
+ "axum",
  "clap",
  "reqwest",
  "serde",
