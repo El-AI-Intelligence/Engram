@@ -1,0 +1,6 @@
+vault/
+runs/
+data-k*/
+mcp-engram.json
+daemon.log
+__pycache__/
