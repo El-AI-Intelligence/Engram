@@ -231,6 +231,7 @@
     <a href="#how" class="hide-sm">How it works</a>
     <a href="#everywhere" class="hide-sm">Everywhere</a>
     <a href="#science" class="hide-sm">Science</a>
+    <a href="#eco" class="hide-sm">Sustainability</a>
     <a href="#compare" class="hide-sm">Compare</a>
     <a href="https://github.com/El-AI-Intelligence/engram" target="_blank" rel="noopener">GitHub</a>
     <a href="/app" class="btn btn-outline">Open Vault</a>
@@ -322,8 +323,8 @@
         <div class="step-num">3</div>
         <h3>Recall</h3>
         <p>
-          Engram by El AI Intelligence assembles relevant context for every query, reducing your LLM's
-          token consumption by 40-70%. Forgetting is efficient — and green.
+          Engram by El AI Intelligence assembles relevant context for every query, so your LLM's
+          token cost stops growing as your memory grows. Forgetting is efficient — and green.
         </p>
       </div>
     </div>
@@ -418,10 +419,41 @@
     <div class="section-title">Forgetting is green.</div>
     <div class="section-sub">
       Every memory retrieved is a thousand tokens <em>not</em> re-generated.
-      Move the slider to estimate your CO₂ savings.
+      We measured it against the alternative: an A/B benchmark pitting Engram's
+      retrieval against wholesale context injection on the same corpus.
     </div>
 
-    <div class="calc" id="carbon-calc">
+    <div class="steps">
+      <div class="step">
+        <h3>+4.5% vs +11%</h3>
+        <p>
+          When the memory corpus grew 4× (25→100 memories), Engram's input tokens
+          per question grew +4.5% — bounded by top-k retrieval. Wholesale injection
+          grew +11% and rising: linear by construction, and it fills the entire
+          context window around ~4,000 memories.
+        </p>
+      </div>
+      <div class="step">
+        <h3>Embedded once, not re-broadcast</h3>
+        <p>
+          Injection re-ships the whole knowledge base into every interaction, in
+          every session, forever. A 20-person team asking 10 memory-dependent
+          questions a day at 1,000 memories burns ≈14M vs ≈10M input tokens/day —
+          and every 1,000 memories added costs injection another +8.4M/day while
+          Engram barely moves.
+        </p>
+      </div>
+      <div class="step">
+        <h3>Retrieval runs locally</h3>
+        <p>
+          Embeddings and search run on your machine — local-only inference. The
+          only datacenter load per query is the tokens your AI actually reads.
+          Cloud-RAG pays for retrieval compute too; Engram doesn't.
+        </p>
+      </div>
+    </div>
+
+    <div class="calc" id="carbon-calc" style="margin-top:28px;">
       <div class="calc-row">
         <label for="hours">Hours/day using AI agents:</label>
         <input type="range" id="hours" min="1" max="12" value="4" step="1">
@@ -446,6 +478,12 @@
         </div>
       </div>
     </div>
+
+    <p style="text-align:center;margin-top:22px;font-size:0.85rem;color:var(--faint);">
+      Measured, not vibes — the full A/B, including where the claim does
+      <em>not</em> hold yet (below ~100–150 memories retrieval costs a few
+      percent more tokens): <a href="https://github.com/El-AI-Intelligence/engram/blob/main/docs/engram-product/MEMORY-COMPARISON.md" target="_blank" rel="noopener">benchmark methodology + results</a>.
+    </p>
   </div>
 </section>
 
