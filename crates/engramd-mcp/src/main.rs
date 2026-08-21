@@ -615,20 +615,31 @@ mod tests {
             )
             .into_bytes(),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("ephemeral bind");
+        // std bind first so the port is listening before this function
+        // returns, then hand the socket to tokio — the same pattern proven
+        // on Windows CI by sync_integration.rs's spawn_stub.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral bind");
         let addr = listener.local_addr().expect("local addr");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        let listener = tokio::net::TcpListener::from_std(listener).expect("tokio listener");
         tokio::spawn(async move {
             loop {
-                let Ok((mut sock, _)) = listener.accept().await else {
-                    break;
-                };
-                let response = response.clone();
-                tokio::spawn(async move {
-                    let _ = sock.write_all(&response).await;
-                    let _ = sock.shutdown().await;
-                });
+                // Never exit on an accept error: Windows surfaces transient
+                // ones (e.g. WSAECONNABORTED when a peer aborts mid-handshake)
+                // that Unix accept loops retry internally. Breaking here
+                // drops the listener and every later connect is refused.
+                match listener.accept().await {
+                    Ok((mut sock, _)) => {
+                        let response = response.clone();
+                        tokio::spawn(async move {
+                            let _ = sock.write_all(&response).await;
+                            let _ = sock.shutdown().await;
+                        });
+                    }
+                    Err(_) => continue,
+                }
             }
         });
         format!("http://{addr}")
