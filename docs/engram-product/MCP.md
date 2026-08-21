@@ -1,6 +1,6 @@
-# Engram MCP — Your Memory in Every AI Tool
+# Engram by El AI Intelligence MCP — Your Memory in Every AI Tool
 
-`engramd-mcp` exposes your Engram vault to any Model Context Protocol
+`engramd-mcp` exposes your Engram by El AI Intelligence vault to any Model Context Protocol
 client over stdio. The assistant on the other end can search, capture, and
 recall — memories you save in Claude show up in Cursor, and vice versa.
 

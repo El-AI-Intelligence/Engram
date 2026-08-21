@@ -1,4 +1,4 @@
-# Engram Memory Vault — UI Design Brief for Kimi K3
+# Engram by El AI Intelligence — UI Design Brief for Kimi K3
 
 **Date:** 2026-08-05  
 **Target:** Standalone web application (desktop-first, responsive)
@@ -9,7 +9,7 @@
 
 ## 0. Product Context
 
-The Engram Memory Vault is a local-first, encrypted memory layer for AI agents. It's not a chat app or a companion — it's a **memory management console**. The user is a developer or power user managing what their AI remembers.
+The Engram by El AI Intelligence is a local-first, encrypted memory layer for AI agents. It's not a chat app or a companion — it's a **memory management console**. The user is a developer or power user managing what their AI remembers.
 
 Three core jobs:
 1. **Browse and search** what the AI remembers
@@ -148,7 +148,7 @@ Landing page. At-a-glance overview of vault health and recent activity.
 
 ---
 
-## 4. Screen: Engram Explorer (`/memories`)
+## 4. Screen: Engram by El AI Intelligence Explorer (`/memories`)
 
 ### Purpose
 Browse, search, and filter all memories. The main working screen.
@@ -223,7 +223,7 @@ Each card shows:
 
 ---
 
-## 5. Screen: Engram Detail (`/memories/:id`)
+## 5. Screen: Engram by El AI Intelligence Detail (`/memories/:id`)
 
 ### Purpose
 Full view of a single memory: content, metadata, links, evidence, timeline.

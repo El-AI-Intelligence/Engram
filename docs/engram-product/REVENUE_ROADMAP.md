@@ -1,4 +1,4 @@
-# Engram Revenue Roadmap
+# Engram by El AI Intelligence Revenue Roadmap
 
 **Date:** 2026-08-12
 **License:** MIT (core stays open — the paid layers are services, and the open core is what earns the trust that sells them)
@@ -21,7 +21,7 @@
 
 ---
 
-## Layer 1 — Engram Cloud Sync
+## Layer 1 — Engram by El AI Intelligence Cloud Sync
 
 The Obsidian play: sell the cloud layer of a local-first product. The relay already exists; this layer is deployment + accounts + billing.
 

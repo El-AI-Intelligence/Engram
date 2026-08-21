@@ -333,10 +333,10 @@ fn expand_tilde(path: &str) -> PathBuf {
 
 pub async fn handle_init() -> Result<()> {
     println!();
-    println!("  ╔══════════════════════════════════════════╗");
-    println!("  ║     Engram Memory Vault — Setup          ║");
-    println!("  ║     Your AI deserves a memory.           ║");
-    println!("  ╚══════════════════════════════════════════╝");
+    println!("  ╔═════════════════════════════════════╗");
+    println!("  ║   Engram by El AI Intelligence — Setup║");
+    println!("  ║   Your AI deserves a memory.        ║");
+    println!("  ╚═════════════════════════════════════╝");
     println!();
 
     let home = home_dir();
@@ -466,10 +466,10 @@ pub async fn handle_join(
     name: Option<String>,
 ) -> Result<()> {
     println!();
-    println!("  ╔══════════════════════════════════════════╗");
-    println!("  ║     Engram — Join a Team Vault           ║");
-    println!("  ║     One passphrase. One vault.           ║");
-    println!("  ╚══════════════════════════════════════════╝");
+    println!("  ╔═════════════════════════════════════════════════╗");
+    println!("  ║   Engram by El AI Intelligence — Join a Team Vault║");
+    println!("  ║   One passphrase. One vault.                    ║");
+    println!("  ╚═════════════════════════════════════════════════╝");
     println!();
 
     let default_path = home_dir().join(".engram").join("vault");
@@ -836,10 +836,10 @@ pub async fn handle_pair(
     vault_id_opt: Option<String>,
 ) -> Result<()> {
     println!();
-    println!("  ╔══════════════════════════════════════════╗");
-    println!("  ║     Engram — Pair This Device            ║");
-    println!("  ║     One code. One machine.               ║");
-    println!("  ╚══════════════════════════════════════════╝");
+    println!("  ╔════════════════════════════════════════════════╗");
+    println!("  ║   Engram by El AI Intelligence — Pair This Device║");
+    println!("  ║   One code. One machine.                       ║");
+    println!("  ╚════════════════════════════════════════════════╝");
     println!();
 
     let Some((vault_path, _existing, fresh_passphrase)) =
@@ -941,10 +941,10 @@ pub async fn handle_link(
     force: bool,
 ) -> Result<()> {
     println!();
-    println!("  ╔══════════════════════════════════════════╗");
-    println!("  ║   Engram — Link This Machine             ║");
-    println!("  ║   Your browser opens. One click. Done.   ║");
-    println!("  ╚══════════════════════════════════════════╝");
+    println!("  ╔═════════════════════════════════════════════════╗");
+    println!("  ║   Engram by El AI Intelligence — Link This Machine║");
+    println!("  ║   Your browser opens. One click. Done.          ║");
+    println!("  ╚═════════════════════════════════════════════════╝");
     println!();
 
     // Already linked? Re-linking orphans the old key (revocable at
@@ -1054,7 +1054,7 @@ pub async fn handle_link(
         intent_id,
         code
     );
-    println!("  A browser tab is opening to link this machine to your Engram account.");
+    println!("  A browser tab is opening to link this machine to your Engram by El AI Intelligence account.");
     println!("  Sign in and click \"Link this machine\" — this window finishes on its own.");
     println!();
     println!("  {}", confirm_url);
@@ -1140,7 +1140,7 @@ fn install_service(vault_path: &PathBuf, home: &PathBuf) -> std::result::Result<
         let svc_path = svc_dir.join("engramd.service");
         let service = format!(
             "[Unit]\n\
-             Description=Engram Memory Vault daemon\n\
+             Description=Engram by El AI Intelligence daemon\n\
              After=network-online.target\n\
              Wants=network-online.target\n\
              \n\
@@ -1449,8 +1449,8 @@ pub async fn handle_eco(vault_opt: Option<PathBuf>) -> Result<()> {
     let estimated_kg_co2 = (estimated_tokens_saved as f64 / 1000.0) * 0.0004; // 0.4g CO2e per 1K tokens
 
     println!();
-    println!("  🌱 Engram Environmental Impact");
-    println!("  ═══════════════════════════════");
+    println!("  🌱 Engram by El AI Intelligence — Environmental Impact");
+    println!("  ═══════════════════════════════════════════════════════");
     println!("  Total memories:     {:>8}", total);
     println!("  Total content:      {:>8} chars", total_chars);
     println!("  Est. tokens saved:  {:>8} (by avoiding re-generation)", estimated_tokens_saved);
@@ -1490,8 +1490,8 @@ pub async fn handle_digest(url: String, days: u32, prose: bool) -> Result<()> {
 
     let stats = &body["stats"];
     println!();
-    println!("  🧠 Engram Weekly Digest");
-    println!("  ═══════════════════════");
+    println!("  🧠 Engram by El AI Intelligence — Weekly Digest");
+    println!("  ════════════════════════════════════════════════");
     let start = body["window_start"].as_str().unwrap_or("?");
     let end = body["window_end"].as_str().unwrap_or("?");
     println!("  Window:   {} → {}", start.chars().take(10).collect::<String>(), end.chars().take(10).collect::<String>());
@@ -1572,8 +1572,8 @@ pub async fn handle_demo(vault_opt: Option<PathBuf>) -> Result<()> {
     let store = EngramStore::open(&vp).await?;
 
     println!();
-    println!("  🧬 Engram Demo — The Memory Lifecycle");
-    println!("  ══════════════════════════════════════");
+    println!("  🧬 Engram by El AI Intelligence Demo — The Memory Lifecycle");
+    println!("  ════════════════════════════════════════════════════════════");
     println!();
 
     // Dedup: if demo data already exists, skip seeding
@@ -2167,10 +2167,10 @@ pub async fn handle_mcp(command: String, engramd_url: String, dry_run: bool, yes
 /// never argv — argv is visible in `ps`).
 pub async fn handle_onboarding(bind: String) -> Result<()> {
     println!();
-    println!("  ╔══════════════════════════════════════════════╗");
-    println!("  ║   Engram — 5-minute onboarding               ║");
-    println!("  ║   Your AI deserves a memory.                 ║");
-    println!("  ╚══════════════════════════════════════════════╝");
+    println!("  ╔═══════════════════════════════════════════════════╗");
+    println!("  ║   Engram by El AI Intelligence — 5-minute onboarding║");
+    println!("  ║   Your AI deserves a memory.                      ║");
+    println!("  ╚═══════════════════════════════════════════════════╝");
     println!();
 
     let vault_path = home_dir().join(".engram").join("vault");

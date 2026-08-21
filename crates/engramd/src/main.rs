@@ -35,7 +35,7 @@ use axiom_inference::InferenceProvider;
 // ── Top-level CLI ──────────────────────────────────────────────────────────
 
 #[derive(Parser, Debug)]
-#[command(name = "engram", version, about = "Engram Memory Vault — your AI deserves a memory.")]
+#[command(name = "engram", version, about = "Engram by El AI Intelligence — your AI deserves a memory.")]
 struct Cli {
     #[command(subcommand)]
     command: Option<cli::Commands>,
@@ -899,7 +899,7 @@ async fn run_daemon(
         "DISABLED (passphrase missing — set ENGRAM_PASSPHRASE or run `engram link`)"
     };
     info!(
-        "Engram daemon ready — UI/API: http://{}  Vault: {}  Sync: {}",
+        "Engram by El AI Intelligence daemon ready — UI/API: http://{}  Vault: {}  Sync: {}",
         bind,
         vault_path.display(),
         sync_status

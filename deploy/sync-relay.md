@@ -1,4 +1,4 @@
-# Engram Sync Relay — public deploy runbook
+# Engram by El AI Intelligence Sync Relay — public deploy runbook
 
 `sync.ellmstack.dev` → Hetzner CX23 (138.199.144.93, server id 125572177)
 → Caddy :443 → `engramd-sync` on 127.0.0.1:8788.

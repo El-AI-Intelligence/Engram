@@ -1,4 +1,4 @@
-# Engram Memory Vault — Unification Design
+# Engram by El AI Intelligence — Unification Design
 
 **Date:** 2026-08-05  
 **Status:** Draft for review  

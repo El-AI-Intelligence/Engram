@@ -1,8 +1,8 @@
-# Engram Sync — End-to-End Encrypted Multi-Device Sync
+# Engram by El AI Intelligence Sync — End-to-End Encrypted Multi-Device Sync
 
 ## Overview
 
-Engram Sync keeps your memory vault synchronized across all your devices
+Engram by El AI Intelligence Sync keeps your memory vault synchronized across all your devices
 with **zero-knowledge encryption**. The sync server never sees your plaintext
 data — all encryption, decryption, and integrity verification happens
 client-side before data leaves your machine.
@@ -61,7 +61,7 @@ minted before 2026-08-20 are account-wide ("unscoped") and are now
 **policy-denied with a 403** — run `engram link` or `engram pair` again on
 affected devices to mint a scoped replacement.
 
-Engram uses **monotonic vector clocks** for conflict resolution:
+Engram by El AI Intelligence uses **monotonic vector clocks** for conflict resolution:
 
 1. Each device maintains a monotonically-increasing counter (the vector clock)
 2. Every push increments the clock and stamps it on the blob
@@ -109,7 +109,7 @@ model.
 Copying API keys by hand is the manual path. The smooth path is one-click
 machine linking, like Cloudflare WARP — no codes to type:
 
-1. Make sure the machine has an Engram account you can sign into (create one
+1. Make sure the machine has an Engram by El AI Intelligence account you can sign into (create one
    from the vault login screen — "New here? Create an account").
 2. On the machine:
 
@@ -284,7 +284,7 @@ touches the push filter — so pulled blobs can't strand older local edits
 
 ## Shared Vaults (Teams v0)
 
-A **team** in Engram v0 is just a set of devices that share two things:
+A **team** in Engram by El AI Intelligence v0 is just a set of devices that share two things:
 
 1. The same vault **passphrase** — sync keys derive from it alone
 2. The same **`vault_id`** and sync server in their sync config
@@ -657,7 +657,7 @@ API_SURFACE.md, section 3.9.
 If you're migrating from another memory system:
 
 1. Export your existing memories as JSONL (one JSON object per line)
-2. Import into Engram: `engram import --file memories.jsonl`
+2. Import into Engram by El AI Intelligence: `engram import --file memories.jsonl`
 3. Configure sync — imported memories will be pushed to the server
 4. Set up other devices — they'll pull the imported memories
 

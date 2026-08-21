@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to Engram are documented here. Format follows
+All notable changes to Engram by El AI Intelligence are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project
 versions with [SemVer](https://semver.org/).
 
@@ -8,7 +8,10 @@ versions with [SemVer](https://semver.org/).
 
 ## [0.1.1] — 2026-08-21
 
-Third-party QC security review remediation (2026-08-20). Full scope:
+Third-party QC security review remediation (2026-08-20) and a product
+rename: the product is now presented as **Engram by El AI Intelligence**
+across the CLI, vault UI, landing page, installers, MCP tool descriptions,
+and documentation (binary and package names are unchanged). Full scope:
 daemon trust model, UI XSS, relay tenant isolation, KDF hardening, and
 misc hardening — all findings reproduced against HEAD before fixing.
 

@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "engramd"
 version = "0.1.0"
-description = "Python client for the Engram Memory Vault"
+description = "Python client for the Engram by El AI Intelligence"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"

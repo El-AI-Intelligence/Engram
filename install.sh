@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ── Engram Memory Vault — Install Script ─────────────────────────────────────
+# ── Engram by El AI Intelligence — Install Script ─────────────────────────────────────
 #
 # One-command install:
 #   curl -fsSL https://engram.ellmstack.dev/install.sh | bash
@@ -49,7 +49,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 echo ""
-echo -e "  ${BOLD}🧠 Engram Memory Vault — Install${RESET}"
+echo -e "  ${BOLD}🧠 Engram by El AI Intelligence — Install${RESET}"
 echo "  Your AI deserves a memory."
 echo ""
 
@@ -63,7 +63,7 @@ if command -v cargo &>/dev/null && cargo --version &>/dev/null; then
         cargo install engramd
     fi
     echo ""
-    echo -e "  ${GREEN}✅ Engram installed!${RESET}"
+    echo -e "  ${GREEN}✅ Engram by El AI Intelligence installed!${RESET}"
     echo ""
     echo "  Quick start:"
     echo "    engram init         Set up your vault"
@@ -85,7 +85,7 @@ case "$(uname -s)" in
     Darwin) OS="darwin" ;;
     *)
         echo -e "  ${RED}✗${RESET} Unsupported OS: $(uname -s)"
-        echo "  Engram supports Linux and macOS."
+        echo "  Engram by El AI Intelligence supports Linux and macOS."
         echo "  On Windows, open PowerShell and run:"
         echo "    iex (irm https://engram.ellmstack.dev/install.ps1)"
         echo "  (or install from source: cargo install engramd)"
@@ -98,7 +98,7 @@ case "$(uname -m)" in
     aarch64|arm64) ARCH="arm64" ;;
     *)
         echo -e "  ${RED}✗${RESET} Unsupported architecture: $(uname -m)"
-        echo "  Engram supports x86_64 and arm64."
+        echo "  Engram by El AI Intelligence supports x86_64 and arm64."
         exit 1
         ;;
 esac
@@ -194,7 +194,7 @@ fi
 "$INSTALL_DIR/engram" --version 2>/dev/null || true
 
 echo ""
-echo -e "  ${GREEN}✅ Engram installed!${RESET}"
+echo -e "  ${GREEN}✅ Engram by El AI Intelligence installed!${RESET}"
 echo ""
 echo "  Quick start:"
 echo "    engram init         Set up your vault"

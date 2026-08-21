@@ -1,4 +1,4 @@
-# Engram Account Authentication — Architecture, Best Practices, Pitfalls
+# Engram by El AI Intelligence Account Authentication — Architecture, Best Practices, Pitfalls
 
 Reference for the account system (milestone 1.2) and a reusable playbook
 for future projects. Written after the signup flow's first real-user run,
@@ -54,7 +54,7 @@ passkeys](https://clerk.com/articles/react-authentication-from-protected-routes-
 [Privacy Guides — email
 security](https://github.com/privacyguides/privacyguides.org/blob/main/blog/posts/email-security.md?plain=1#2).
 
-| Practice | Consensus | Engram |
+| Practice | Consensus | Engram by El AI Intelligence |
 |---|---|---|
 | Session storage | Never in localStorage; HttpOnly SameSite cookie or in-memory | **Deliberate exception:** SPA is on `engram.ellmstack.dev`, relay on `sync.ellmstack.dev` — cookies don't cross domains, and adding a BFF was out of scope. Bearer in localStorage, mitigated by opaque server-side sessions, 7-day TTL, revocation, 401-clears-token everywhere. Revisit if the origins ever merge |
 | Token type | Opaque server-side session over JWT | ✅ opaque rows in `sessions` |

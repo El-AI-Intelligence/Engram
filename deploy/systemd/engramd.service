@@ -1,5 +1,5 @@
 [Unit]
-Description=Engram Memory Vault daemon (engramd)
+Description=Engram by El AI Intelligence daemon (engramd)
 Documentation=https://engram.ellmstack.dev
 After=network.target
 

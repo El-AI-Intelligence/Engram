@@ -1,4 +1,4 @@
-# Engram — Your AI deserves a memory.
+# Engram by El AI Intelligence — Your AI deserves a memory.
 
 [![GitHub release](https://img.shields.io/github/v/release/El-AI-Intelligence/engram?label=latest%20release)](https://github.com/El-AI-Intelligence/engram/releases)
 [![GitHub stars](https://img.shields.io/github/stars/El-AI-Intelligence/engram)](https://github.com/El-AI-Intelligence/engram)
@@ -9,9 +9,9 @@ Built on the Axiom-OS kernel: FTS5 + vector + QEM holographic memory with biolog
 
 > **Status:** early product, actively developed. The core is MIT-licensed and stays that way — the paid layers (cloud sync, team memory) are optional services on top, never required.
 
-## Why Engram
+## Why Engram by El AI Intelligence
 
-AI agents forget everything between sessions. Engram fixes that:
+AI agents forget everything between sessions. Engram by El AI Intelligence fixes that:
 
 - **Zero-knowledge encryption** — AES-256 (SQLCipher). Memories never leave your machine in plaintext; even a self-hosted sync server can't read them.
 - **Semantic search** — auto-downloads a local BERT embedding model (all-MiniLM-L6-v2, ~23MB) on first run. Find memories by meaning, not just keywords. Zero config, no Ollama.
@@ -46,7 +46,7 @@ engram init          # answer Y to install the background service
 
 The release pipeline signs and notarizes macOS binaries (Apple Developer ID).
 All platforms: the daemon auto-starts at login (enable it with `engram init`)
-and, once linked, syncs through your Engram account.
+and, once linked, syncs through your Engram by El AI Intelligence account.
 
 Your daemon runs at `http://localhost:8787` (REST/WS API). For the visual
 vault UI, open https://engram.ellmstack.dev/app — it connects to your local
@@ -90,7 +90,7 @@ Or from source: `cargo install --path crates/engramd` (also provides the `engram
 - [API_SURFACE.md](docs/engram-product/API_SURFACE.md) — REST/WS API contract
 - [REVENUE_ROADMAP.md](docs/engram-product/REVENUE_ROADMAP.md) — the plan for paid layers (cloud sync, team memory) on top of the MIT core
 
-Live site: https://engram.ellmstack.dev — and if Engram is useful, a ⭐ on GitHub is the best signal: [github.com/El-AI-Intelligence/engram](https://github.com/El-AI-Intelligence/engram)
+Live site: https://engram.ellmstack.dev — and if Engram by El AI Intelligence is useful, a ⭐ on GitHub is the best signal: [github.com/El-AI-Intelligence/engram](https://github.com/El-AI-Intelligence/engram)
 
 ## License
 

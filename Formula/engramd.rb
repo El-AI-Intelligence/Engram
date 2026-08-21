@@ -1,4 +1,4 @@
-# Engram Memory Vault — Homebrew Formula
+# Engram by El AI Intelligence — Homebrew Formula
 #
 # Install:
 #   brew tap El-AI-Intelligence/engram
@@ -8,7 +8,7 @@
 #   brew install El-AI-Intelligence/engram/engramd
 
 class Engramd < Formula
-  desc "Engram Memory Vault — Your AI deserves a memory"
+  desc "Engram by El AI Intelligence — Your AI deserves a memory"
   homepage "https://github.com/El-AI-Intelligence/engram"
   license "MIT"
 

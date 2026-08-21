@@ -1,4 +1,4 @@
-// ── Engram Memory Vault — TypeScript config ────────────────────────────
+// ── Engram by El AI Intelligence — TypeScript config ────────────────────────────
 {
   "compilerOptions": {
     "target": "ES2022",

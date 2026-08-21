@@ -1,6 +1,6 @@
-# Kimi K3 — Engram Memory Vault Visual Redesign Prompt
+# Kimi K3 — Engram by El AI Intelligence Visual Redesign Prompt
 
-You are redesigning the Engram Memory Vault UI. The current implementation is
+You are redesigning the Engram by El AI Intelligence UI. The current implementation is
 functional but visually bare — 918 lines of minimal CSS, a vanilla JS SPA
 (860 lines), and a 45-line HTML shell. Your job is to make it look like a
 polished, professional developer tool. Do NOT change any JavaScript logic

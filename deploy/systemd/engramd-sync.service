@@ -1,5 +1,5 @@
 [Unit]
-Description=Engram Sync Relay (engramd-sync)
+Description=Engram by El AI Intelligence Sync Relay (engramd-sync)
 Documentation=https://engram.ellmstack.dev
 After=network.target
 

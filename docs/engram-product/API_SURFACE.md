@@ -1,4 +1,4 @@
-# Engram Memory Vault — API Surface Design
+# Engram by El AI Intelligence — API Surface Design
 
 **Date:** 2026-08-05  
 **Status:** Draft for review  
@@ -18,7 +18,7 @@
 
 ## 2. Authentication
 
-Engram is a **single-user, single-vault** daemon. There is no user system, no
+Engram by El AI Intelligence is a **single-user, single-vault** daemon. There is no user system, no
 JWT issuance, no `/auth/token` endpoint, and no admin API. Auth is exactly
 one mechanism, implemented in `crates/engramd/src/auth.rs`:
 

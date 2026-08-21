@@ -1,6 +1,6 @@
-# Engram Memory Vault — Python SDK
+# Engram by El AI Intelligence — Python SDK
 
-`pip install engramd` — Python client for the Engram Memory Vault.
+`pip install engramd` — Python client for the Engram by El AI Intelligence.
 
 ## Quick start
 
@@ -50,4 +50,4 @@ Or add to Claude Desktop's MCP config:
 
 ## API Reference
 
-See the full API surface in [docs/API_SURFACE.md](https://github.com/El-AI-Intelligence/Engram/blob/main/docs/API_SURFACE.md).
+See the full API surface in [docs/API_SURFACE.md](https://github.com/El-AI-Intelligence/engram/blob/main/docs/API_SURFACE.md).

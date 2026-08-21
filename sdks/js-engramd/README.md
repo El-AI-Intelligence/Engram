@@ -1,6 +1,6 @@
-# Engram Memory Vault — JavaScript/TypeScript SDK
+# Engram by El AI Intelligence — JavaScript/TypeScript SDK
 
-`npm install engramd` — TypeScript SDK + CLI for the Engram Memory Vault.
+`npm install engramd` — TypeScript SDK + CLI for the Engram by El AI Intelligence.
 
 ## Quick start
 

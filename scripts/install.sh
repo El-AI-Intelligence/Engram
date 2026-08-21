@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# install.sh — one-command installer for Engram (engram + engramd + engramd-mcp).
+# install.sh — one-command installer for Engram by El AI Intelligence (engram + engramd + engramd-mcp).
 #
 #     curl -fsSL https://engram.ellmstack.dev/install.sh | bash
 #
@@ -62,6 +62,6 @@ case ":$PATH:" in
 esac
 
 echo
-echo "Engram installed. Next steps:"
+echo "Engram by El AI Intelligence installed. Next steps:"
 echo "  engram onboarding    # encrypted vault + first memory + running daemon (~5 min)"
 echo "  engram mcp install   # connect Claude Desktop, Cursor, Windsurf, Claude Code"

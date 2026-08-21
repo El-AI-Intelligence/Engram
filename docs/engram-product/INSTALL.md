@@ -1,4 +1,4 @@
-# Installing Engram
+# Installing Engram by El AI Intelligence
 
 ## One-command install
 
@@ -82,7 +82,7 @@ engram onboarding
 It creates the vault, captures your first memory, and starts the daemon,
 then prints the dashboard URL and next steps (MCP, sync).
 
-**Sync to your Engram account** (multi-device, WARP-style): create an
+**Sync to your Engram by El AI Intelligence account** (multi-device, WARP-style): create an
 account on the vault's login screen ("New here? Create an account"), then
 run one command — your browser opens, you click once, done:
 

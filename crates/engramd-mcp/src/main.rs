@@ -33,7 +33,7 @@ use std::io::{BufRead, Write};
 
 /// MCP server configuration.
 #[derive(Parser, Debug)]
-#[command(name = "engramd-mcp", version, about = "MCP server for Engram memory vault")]
+#[command(name = "engramd-mcp", version, about = "MCP server for Engram by El AI Intelligence memory vault")]
 struct Cli {
     /// Engramd API base URL
     #[arg(long, default_value = "http://127.0.0.1:8787", env = "ENGRAMD_URL")]
@@ -103,7 +103,7 @@ fn tools_list() -> Value {
         "tools": [
             {
                 "name": "engram_search",
-                "description": "Search your Engram memory vault. Returns memories matching the query with relevance scores. Use this to recall past decisions, bugs, decisions, and context.",
+                "description": "Search your Engram by El AI Intelligence memory vault. Returns memories matching the query with relevance scores. Use this to recall past decisions, bugs, decisions, and context.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -116,7 +116,7 @@ fn tools_list() -> Value {
             },
             {
                 "name": "engram_capture",
-                "description": "Capture a new memory into your Engram vault. Use this to remember important facts, decisions, bugs, or context for future sessions. Duplicates and noise are skipped — the result reports whether the memory was actually stored.",
+                "description": "Capture a new memory into your Engram by El AI Intelligence vault. Use this to remember important facts, decisions, bugs, or context for future sessions. Duplicates and noise are skipped — the result reports whether the memory was actually stored.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -154,7 +154,7 @@ fn tools_list() -> Value {
             },
             {
                 "name": "engram_health",
-                "description": "Check the health and status of your Engram memory vault. Returns vault stats, uptime, and connection status.",
+                "description": "Check the health and status of your Engram by El AI Intelligence memory vault. Returns vault stats, uptime, and connection status.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {}
@@ -162,7 +162,7 @@ fn tools_list() -> Value {
             },
             {
                 "name": "engram_decay",
-                "description": "Trigger memory hygiene (decay and strengthening) on your vault. Useful after a long session to let Engram determine which memories are important.",
+                "description": "Trigger memory hygiene (decay and strengthening) on your vault. Useful after a long session to let Engram by El AI Intelligence determine which memories are important.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {}
@@ -472,7 +472,7 @@ async fn main() {
     let cli = Cli::parse();
 
     eprintln!(
-        "Engram MCP server v{} starting (engramd: {})",
+        "Engram by El AI Intelligence MCP server v{} starting (engramd: {})",
         SERVER_VERSION, cli.engramd_url
     );
 
@@ -577,7 +577,7 @@ async fn main() {
         emit(&stdout, &response);
     }
 
-    eprintln!("Engram MCP server shutting down.");
+    eprintln!("Engram by El AI Intelligence MCP server shutting down.");
 }
 
 fn emit(stdout: &std::io::Stdout, response: &JsonRpcResponse) {

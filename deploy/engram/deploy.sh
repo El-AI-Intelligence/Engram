@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# deploy.sh — install Engram Memory Vault artifacts on this host.
+# deploy.sh — install Engram by El AI Intelligence artifacts on this host.
 #
 #   - Syncs the static landing page and vault UI into /srv/engram/
 #   - Publishes scripts/install.sh and release binaries (verified downloads)
@@ -52,7 +52,7 @@ elif ! grep -qE '^ENGRAMD_API_KEY=.+' /etc/engram/engramd.env; then
 fi
 
 if [[ $ASSUME_YES -ne 1 ]]; then
-  read -r -p "Deploy Engram (landing, vault UI, Caddyfile, engramd unit if absent) to this host? [y/N] " reply
+  read -r -p "Deploy Engram by El AI Intelligence (landing, vault UI, Caddyfile, engramd unit if absent) to this host? [y/N] " reply
   if [[ ! "$reply" =~ ^[Yy]$ ]]; then
     echo "Aborted."
     exit 0

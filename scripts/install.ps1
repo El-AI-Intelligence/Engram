@@ -1,4 +1,4 @@
-# Engram Windows installer — no admin rights, installs to ~/.local/bin.
+# Engram by El AI Intelligence Windows installer — no admin rights, installs to ~/.local/bin.
 #
 # Usage:
 #   iex (irm https://engram.ellmstack.dev/install.ps1)
@@ -20,7 +20,7 @@ $InstallDir  = if ($env:ENGRAM_INSTALL_DIR)  { $env:ENGRAM_INSTALL_DIR }  else {
 $ZipName     = "engramd-windows-x86_64.zip"
 
 Write-Host ""
-Write-Host "  Engram Memory Vault — Windows installer"
+Write-Host "  Engram by El AI Intelligence — Windows installer"
 Write-Host "  ────────────────────────────────────────"
 Write-Host ""
 
@@ -63,7 +63,7 @@ if ($userPath -notlike "*$InstallDir*") {
 $env:Path = "$InstallDir;$env:Path"
 
 Write-Host ""
-Write-Host "  ✅ Engram installed to $InstallDir"
+Write-Host "  ✅ Engram by El AI Intelligence installed to $InstallDir"
 Write-Host ""
 Write-Host "  Next steps:"
 Write-Host "    engram init                  Create your vault (offers a background service)"

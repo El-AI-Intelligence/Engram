@@ -1,6 +1,6 @@
-# Deploying Engram to engram.ellmstack.dev
+# Deploying Engram by El AI Intelligence to engram.ellmstack.dev
 
-Production runbook for hosting the Engram Memory Vault (landing page, vault UI,
+Production runbook for hosting the Engram by El AI Intelligence (landing page, vault UI,
 and `engramd` API) behind Caddy on a single Linux server.
 
 ## Architecture
@@ -30,7 +30,7 @@ and injects the bearer token the API requires, so the SPA's same-origin
 
 ## Server topology (which box is which)
 
-Engram runs on **two separate Hetzner VPSes** — kept split on purpose:
+Engram by El AI Intelligence runs on **two separate Hetzner VPSes** — kept split on purpose:
 
 | Box | Hetzner | Public IP | Serves | Runs |
 |---|---|---|---|---|

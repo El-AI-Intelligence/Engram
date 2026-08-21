@@ -1,5 +1,5 @@
 // ==========================================================================
-// Engram Memory Vault — SPA
+// Engram by El AI Intelligence — SPA
 // ==========================================================================
 
 import { MemoryGraph } from './graph.js';
@@ -356,7 +356,7 @@ function mountAccountChip(anchor, server) {
   anchor.appendChild(menu);
   const renderSignedOut = () => {
     btn.textContent = '\u{1F464} Sign in';
-    btn.title = 'Sign in to your Engram account';
+    btn.title = 'Sign in to your Engram by El AI Intelligence account';
     menu.innerHTML = `<button class="acct-menu-item" id="acct-chip-signin">Sign in</button>`;
     menu.querySelector('#acct-chip-signin').onclick = () => {
       menu.style.display = 'none';
@@ -908,7 +908,7 @@ route('/login', () => {
     app.innerHTML = `
       <div class="modal-overlay">
         <div class="modal login-modal">
-          <div class="login-brand"><span class="brand-gem">◆</span> Engram Vault</div>
+          <div class="login-brand"><span class="brand-gem">◆</span> Engram by El AI Intelligence</div>
           <div class="modal-body">
             <p style="margin-top:0;">This is your <strong>account recovery phrase</strong> — the only way back into your vaults if you forget your password. <strong>Write it down now.</strong> It is shown exactly once and is never stored anywhere.</p>
             <div class="recovery-phrase">${words.map(w => `<span class="recovery-word">${w}</span>`).join('')}</div>
@@ -977,7 +977,7 @@ route('/login', () => {
     app.innerHTML = `
       <div class="modal-overlay">
         <div class="modal login-modal">
-          <div class="login-brand"><span class="brand-gem">◆</span> Engram Vault</div>
+          <div class="login-brand"><span class="brand-gem">◆</span> Engram by El AI Intelligence</div>
           <div class="modal-body">
             <p style="margin-top:0;">Your password changed, but your vault keys are still wrapped under the old one. Enter your <strong>12-word recovery phrase</strong> to re-link them. The phrase is used only in this tab — nothing is sent to the server.</p>
             <input id="rec-phrase" type="text" placeholder="12-word recovery phrase" autocomplete="off" autocapitalize="off" spellcheck="false">
@@ -1041,7 +1041,7 @@ route('/login', () => {
       app.innerHTML = `
         <div class="modal-overlay">
           <div class="modal login-modal">
-            <div class="login-brand"><span class="brand-gem">◆</span> Engram Vault</div>
+            <div class="login-brand"><span class="brand-gem">◆</span> Engram by El AI Intelligence</div>
             <div class="modal-body">
               <p class="faint" style="margin-top:0;">Signed in<span id="pair-acct"></span>. Now link this machine:</p>
               <p class="faint">On the machine, run <code>engram link</code> — it opens this page in a browser and one click finishes the job.</p>
@@ -1103,9 +1103,9 @@ route('/login', () => {
       app.innerHTML = `
         <div class="modal-overlay">
           <div class="modal login-modal">
-            <div class="login-brand"><span class="brand-gem">◆</span> Engram Vault</div>
+            <div class="login-brand"><span class="brand-gem">◆</span> Engram by El AI Intelligence</div>
             <div class="modal-body">
-              <p class="faint" style="margin-top:0;">Sign in to your Engram account.</p>
+              <p class="faint" style="margin-top:0;">Sign in to your Engram by El AI Intelligence account.</p>
               <input id="login-email" type="email" placeholder="Email" autocomplete="username" autocapitalize="off" spellcheck="false">
               <input id="login-password" type="password" placeholder="Password" autocomplete="current-password">
               <div id="login-error"></div>
@@ -1161,9 +1161,9 @@ route('/login', () => {
       app.innerHTML = `
         <div class="modal-overlay">
           <div class="modal login-modal">
-            <div class="login-brand"><span class="brand-gem">◆</span> Engram Vault</div>
+            <div class="login-brand"><span class="brand-gem">◆</span> Engram by El AI Intelligence</div>
             <div class="modal-body">
-              <p class="faint" style="margin-top:0;">Create your Engram account — an email and a password. Vaults you own open themselves; the password never leaves this browser unhashed, and the relay can't read your data.</p>
+              <p class="faint" style="margin-top:0;">Create your Engram by El AI Intelligence account — an email and a password. Vaults you own open themselves; the password never leaves this browser unhashed, and the relay can't read your data.</p>
               <input id="signup-email" type="email" placeholder="Email" autocomplete="username" autocapitalize="off" spellcheck="false">
               <input id="signup-password" type="password" placeholder="Password (12+ characters)" autocomplete="new-password">
               <input id="signup-confirm" type="password" placeholder="Confirm password" autocomplete="new-password">
@@ -1214,7 +1214,7 @@ route('/login', () => {
       app.innerHTML = `
         <div class="modal-overlay">
           <div class="modal login-modal">
-            <div class="login-brand"><span class="brand-gem">◆</span> Engram Vault</div>
+            <div class="login-brand"><span class="brand-gem">◆</span> Engram by El AI Intelligence</div>
             <div class="modal-body">
               <p class="faint" style="margin-top:0;">Reset your account password. Your vaults stay encrypted — after resetting, your recovery phrase re-links them.</p>
               <input id="forgot-email" type="email" placeholder="Email" autocomplete="username" autocapitalize="off" spellcheck="false">
@@ -1282,7 +1282,7 @@ route('/login', () => {
         app.innerHTML = `
           <div class="modal-overlay">
             <div class="modal login-modal">
-              <div class="login-brand"><span class="brand-gem">◆</span> Engram Vault</div>
+              <div class="login-brand"><span class="brand-gem">◆</span> Engram by El AI Intelligence</div>
               <div class="modal-body">
                 <p class="faint" style="margin-top:0;">Your account syncs your vaults across devices.</p>
                 <div id="login-acct"></div>
@@ -1353,9 +1353,9 @@ route('/login', () => {
       app.innerHTML = `
         <div class="modal-overlay">
           <div class="modal login-modal">
-            <div class="login-brand"><span class="brand-gem">◆</span> Engram Vault</div>
+            <div class="login-brand"><span class="brand-gem">◆</span> Engram by El AI Intelligence</div>
             <div class="modal-body">
-              <p class="faint" style="margin-top:0;">This server's own vault (engramd) — separate credentials from your Engram account.</p>
+              <p class="faint" style="margin-top:0;">This server's own vault (engramd) — separate credentials from your Engram by El AI Intelligence account.</p>
               <input id="login-user" type="text" placeholder="Username" autocomplete="username" autocapitalize="off" spellcheck="false">
               <input id="login-pass" type="password" placeholder="Password" autocomplete="current-password">
               <div id="login-error"></div>
@@ -1474,7 +1474,7 @@ route('/handoff/:token', (token) => {
     app.innerHTML = `
       <div class="modal-overlay">
         <div class="modal login-modal">
-          <div class="login-brand"><span class="brand-gem">◆</span> Engram Vault</div>
+          <div class="login-brand"><span class="brand-gem">◆</span> Engram by El AI Intelligence</div>
           <div class="modal-body">
             <div class="error-panel"><p>${esc(msg)}</p></div>
             <div class="login-alt">
@@ -1487,7 +1487,7 @@ route('/handoff/:token', (token) => {
   app.innerHTML = `
     <div class="modal-overlay">
       <div class="modal login-modal">
-        <div class="login-brand"><span class="brand-gem">◆</span> Engram Vault</div>
+        <div class="login-brand"><span class="brand-gem">◆</span> Engram by El AI Intelligence</div>
         <div class="modal-body">
           <p class="faint" style="margin-top:0;">Linking this machine's vault keys to your account…</p>
           <div id="handoff-error"></div>
@@ -1527,7 +1527,7 @@ route('/handoff/:token', (token) => {
       if (A) unlock.setAccountKey(accountId, A);
       let acctPassword = null;
       if (!A) {
-        acctPassword = window.prompt('Enter your Engram account password to link the vault keys (it never leaves this tab):');
+        acctPassword = window.prompt('Enter your Engram by El AI Intelligence account password to link the vault keys (it never leaves this tab):');
         if (!acctPassword) return fail('Account password required — run `engram handoff` again when ready.');
         const wraps = await api.account.wraps(ACCT);
         if (!wraps.password_wrap) return fail('Your account has no password wrap — sign in with your password first, then re-run `engram handoff`.');
@@ -1591,7 +1591,7 @@ route('/link/:id', (id) => {
     app.innerHTML = `
       <div class="modal-overlay">
         <div class="modal login-modal">
-          <div class="login-brand"><span class="brand-gem">◆</span> Engram Vault</div>
+          <div class="login-brand"><span class="brand-gem">◆</span> Engram by El AI Intelligence</div>
           <div class="modal-body">
             <div class="error-panel"><p>${esc(msg)}</p></div>
             <div class="login-alt">
@@ -1604,7 +1604,7 @@ route('/link/:id', (id) => {
   app.innerHTML = `
     <div class="modal-overlay">
       <div class="modal login-modal">
-        <div class="login-brand"><span class="brand-gem">◆</span> Engram Vault</div>
+        <div class="login-brand"><span class="brand-gem">◆</span> Engram by El AI Intelligence</div>
         <div class="modal-body">
           <p class="faint" style="margin-top:0;">A machine running <code>engram link</code> wants to link to this account.</p>
           <div class="mutation">
@@ -1658,7 +1658,7 @@ route('/link/:id', (id) => {
       app.innerHTML = `
         <div class="modal-overlay">
           <div class="modal login-modal">
-            <div class="login-brand"><span class="brand-gem">◆</span> Engram Vault</div>
+            <div class="login-brand"><span class="brand-gem">◆</span> Engram by El AI Intelligence</div>
             <div class="modal-body">
               <p>✓ This machine is now linked to your account.</p>
               <p class="faint">Back in the terminal, <code>engram link</code> finishes on its own. The device appears in Account &amp; Sync after its first sync.</p>
@@ -1691,7 +1691,7 @@ route('/reset/:token', (token) => {
   app.innerHTML = `
     <div class="modal-overlay">
       <div class="modal login-modal">
-        <div class="login-brand"><span class="brand-gem">◆</span> Engram Vault</div>
+        <div class="login-brand"><span class="brand-gem">◆</span> Engram by El AI Intelligence</div>
         <div class="modal-body">
           <p class="faint" style="margin-top:0;">Choose a new password. After the reset, your recovery phrase re-links your vault keys.</p>
           <input id="reset-newpass" type="password" placeholder="New password (12+ characters)" autocomplete="new-password">
@@ -1767,7 +1767,7 @@ function unlockView(opts = {}) {
         <div class="panel" style="max-width:34rem;margin:2rem auto;">
           <div class="panel-header">Unlock a synced vault</div>
           <p class="faint" style="margin:0 1rem;">
-            Read-only view of a vault synced to your Engram account — the vault
+            Read-only view of a vault synced to your Engram by El AI Intelligence account — the vault
             passphrase decrypts everything in this browser. Nothing leaves this
             tab; the relay only ever sees ciphertext.
           </p>
@@ -4446,7 +4446,7 @@ function showOnboarding() {
     if (step === 1) {
       shell(`
         <h3>Welcome — this is your AI's memory</h3>
-        <p>AI assistants forget everything the moment a conversation ends. Engram changes that:
+        <p>AI assistants forget everything the moment a conversation ends. Engram by El AI Intelligence changes that:
         it gives your AI a <strong>long-term memory</strong>, so it can remember your preferences,
         past conversations, and what you were working on.</p>
         <p>This app is the window into that memory. Everything you see here is stored
@@ -4484,7 +4484,7 @@ function showOnboarding() {
     } else if (step === 3) {
       shell(`
         <h3>Look around with demo memories</h3>
-        <p>The easiest way to understand Engram is to see it full. We can load
+        <p>The easiest way to understand Engram by El AI Intelligence is to see it full. We can load
         <strong>12 ready-made demo memories</strong> — everyday examples like dinner plans,
         work rules, and a few AI-generated ideas — already linked together so the
         <strong>Graph</strong> view lights up.</p>
@@ -4554,7 +4554,7 @@ function showOnboarding() {
     } else {
       shell(`
         <h3>What your AI actually sees</h3>
-        <p>Here's the payoff. When you talk to your AI, Engram quietly picks the most
+        <p>Here's the payoff. When you talk to your AI, Engram by El AI Intelligence quietly picks the most
         relevant memories and slips them into the instructions the AI receives —
         that's how it "remembers".</p>
         <p>Press the button to see the exact message your AI would get
@@ -4606,7 +4606,7 @@ route('/tour', async () => {
   app.innerHTML = `
     <div class="page tour-page">
       <div class="tour-hero">
-        <h2>Your AI forgets everything. <span class="accent">Engram remembers.</span></h2>
+        <h2>Your AI forgets everything. <span class="accent">Engram by El AI Intelligence remembers.</span></h2>
         <p>This is a tour of your AI's memory. Read the explanation, then make the app
         come alive with demo memories — fake, clearly marked, and removable in one click.</p>
       </div>
@@ -4615,7 +4615,7 @@ route('/tour', async () => {
         <div class="panel">
           <div class="panel-header">How it works</div>
           <div class="tour-body">
-            <p>AI assistants forget everything the moment a conversation ends. Engram gives
+            <p>AI assistants forget everything the moment a conversation ends. Engram by El AI Intelligence gives
             your AI a <strong>long-term memory</strong> — it quietly records the important
             moments, and recalls them in later conversations.</p>
             <p>Everything is stored <strong>on this computer only</strong>, inside an encrypted
@@ -4648,7 +4648,7 @@ route('/tour', async () => {
         <div class="panel">
           <div class="panel-header">Live demo</div>
           <div class="tour-body">
-            <p>The easiest way to understand Engram is to see it full. Load
+            <p>The easiest way to understand Engram by El AI Intelligence is to see it full. Load
             <strong>12 ready-made demo memories</strong> — everyday examples like dinner plans,
             work rules, and a few AI-generated ideas — already linked together so the
             <strong>Graph</strong> view lights up.</p>
@@ -4695,7 +4695,7 @@ route('/tour', async () => {
             <div id="tour-capture-result" class="ob-result"></div>
 
             <h4>What your AI sees</h4>
-            <p class="faint">Engram quietly picks the most relevant memories and slips them into the
+            <p class="faint">Engram by El AI Intelligence quietly picks the most relevant memories and slips them into the
             instructions your AI receives — that's how it "remembers". Press the button to see
             the exact message your AI would get:</p>
             <div class="tour-demo-actions">

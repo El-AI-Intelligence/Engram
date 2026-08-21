@@ -1,6 +1,6 @@
-# Kimi K3 — Engram Memory Vault UI Prompt
+# Kimi K3 — Engram by El AI Intelligence UI Prompt
 
-Build a standalone web application (desktop-first, responsive, dark mode default) for the **Engram Memory Vault** — a local-first, encrypted memory layer for AI agents. It's a developer tool: the user browses what their AI remembers, configures how memories are assembled into context windows, and observes the memory lifecycle (decay, consolidation, patterns).
+Build a standalone web application (desktop-first, responsive, dark mode default) for the **Engram by El AI Intelligence** — a local-first, encrypted memory layer for AI agents. It's a developer tool: the user browses what their AI remembers, configures how memories are assembled into context windows, and observes the memory lifecycle (decay, consolidation, patterns).
 
 **API:** REST + SSE at `localhost:8787` (see API contract below). Build against the live API — all data comes from the server.
 
@@ -32,10 +32,10 @@ Monospace for IDs, timestamps, code. Sans-serif for content and UI chrome.
 ### 1. Vault Dashboard (`/`)
 Stats cards (total memories, QEM hit rate, decayed last night, new today), strength distribution bar chart, layer breakdown (Epi/Semantic/Imagined counts + %), recent captures feed (last 5 memories with layer icons, source, content preview, relative time), vault health indicators (encrypted, size, QEM warm, last backup).
 
-### 2. Engram Explorer (`/memories`)
+### 2. Engram by El AI Intelligence Explorer (`/memories`)
 Search bar (debounced) + filter pills: layer (All/Episodic/Semantic/Imagined), scope (All/Moment/Episode/Narrative/Rule), source dropdown, tag input, sort dropdown (Relevance/Strength/Recency/Valence), min-strength slider. Results as scrollable cards showing: layer icon (colored), scope badge, content preview (2-3 lines), strength bar (mini horizontal, green→amber→red), valence indicator (colored dot), tags (clickable, filter on click), link count, quarantine warning, relative timestamp. Click navigates to detail. Keyboard nav: j/k/Enter.
 
-### 3. Engram Detail (`/memories/:id`)
+### 3. Engram by El AI Intelligence Detail (`/memories/:id`)
 Full content, strength bar, valence label (Joyful/Positive/Neutral/Challenging), all metadata (created, occurred, last retrieved, retrieval count, source, project, ID). Links panel: outgoing links with type + target preview, incoming links. Evidence panel. Context JSON (collapsible). Actions: edit tags, update valence, ground memory (imagined only), delete (with confirmation).
 
 ### 4. Memory Graph (`/graph`)

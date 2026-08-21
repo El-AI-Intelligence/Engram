@@ -1,4 +1,4 @@
-# Engram Memory Systems — Code Quality Audit
+# Engram by El AI Intelligence Memory Systems — Code Quality Audit
 
 **Date:** 2026-08-05  
 **Scope:** 9 files, ~3,900 lines across ELLM kernel + Axiom-OS  

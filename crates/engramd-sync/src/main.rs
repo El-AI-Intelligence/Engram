@@ -78,7 +78,7 @@ const MAX_BLOBS_PER_PUSH: usize = 1000;
 const TOMBSTONE_RETENTION_DAYS: i64 = 30;
 
 #[derive(Parser, Debug)]
-#[command(name = "engramd-sync", version, about = "Engram Sync Server")]
+#[command(name = "engramd-sync", version, about = "Engram by El AI Intelligence Sync Server")]
 struct Cli {
     /// Path to the sync database directory
     #[arg(short, long, default_value = "./sync-data")]
@@ -640,7 +640,7 @@ async fn main() -> anyhow::Result<()> {
         // Reject oversized bodies to prevent memory-exhaustion DoS
         .layer(axum::extract::DefaultBodyLimit::max(10 * 1024 * 1024));
 
-    info!("Engram Sync Server starting on {}", cli.bind);
+    info!("Engram by El AI Intelligence Sync Server starting on {}", cli.bind);
     let listener = tokio::net::TcpListener::bind(cli.bind).await?;
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())

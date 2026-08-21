@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="dark light">
 <meta name="theme-color" content="#0b0f14">
-<meta name="description" content="ELLM Engram Memory Vault — browse, search and inspect agent memories.">
+<meta name="description" content="Engram by El AI Intelligence — browse, search and inspect agent memories.">
 <!-- CSP for the daemon-served copy; the hosted copy gets its (equivalent)
      policy from deploy/caddy/engram.Caddyfile — keep the two in sync.
      `wasm-unsafe-eval` = hash-wasm Argon2id in the unlock view; loopback
@@ -13,7 +13,7 @@
      frame-ancestors, so this omits it (the daemon also sends the full
      policy as a header, which does include frame-ancestors 'none'). -->
 <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' https://sync.ellmstack.dev http://127.0.0.1:* http://localhost:*; font-src 'self'; form-action 'self'; base-uri 'self'">
-<title>ELLM Engram Vault</title>
+<title>Engram by El AI Intelligence</title>
 <link rel="stylesheet" href="styles.css">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='13' font-size='13'>◆</text></svg>">
 </head>
@@ -24,12 +24,12 @@
 
 <header class="topbar">
   <div class="topbar-row">
-    <a class="brand" href="#/"><span class="brand-gem">◆</span> ELLM <span class="brand-name">Engram Vault</span></a>
+    <a class="brand" href="#/"><span class="brand-gem">◆</span> <span class="brand-name">Engram by El AI Intelligence</span></a>
     <div class="topbar-right">
       <div class="vault-selector" title="Vault selector (decorative)">
         <span class="vault-dot"></span> default <span class="chev">▾</span>
       </div>
-      <button id="tour-btn" class="theme-toggle" title="Tour &amp; demo — how Engram works, load demo memories" aria-label="Open tour and demo">?</button>
+      <button id="tour-btn" class="theme-toggle" title="Tour &amp; demo — how Engram by El AI Intelligence works, load demo memories" aria-label="Open tour and demo">?</button>
       <button id="theme-toggle" class="theme-toggle" title="Toggle light/dark theme" aria-label="Toggle light/dark theme">☀</button>
       <button id="capture-btn" class="icon-btn" title="Quick capture (Ctrl/Cmd+K)" aria-label="Quick capture">＋</button>
       <span id="global-acct-anchor" class="global-acct"></span>
