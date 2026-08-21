@@ -17,7 +17,7 @@ default-members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Engram Memory Vault — your AI deserves a memory."
 authors = ["El-AI-Intelligence"]

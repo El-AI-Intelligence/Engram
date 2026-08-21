@@ -6,6 +6,8 @@ versions with [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.1] — 2026-08-21
+
 Third-party QC security review remediation (2026-08-20). Full scope:
 daemon trust model, UI XSS, relay tenant isolation, KDF hardening, and
 misc hardening — all findings reproduced against HEAD before fixing.
@@ -46,7 +48,7 @@ misc hardening — all findings reproduced against HEAD before fixing.
 - **Pair onto manually-named vaults** — `engram pair --vault-id <id>`
   overrides the passphrase-derived vault id and pins it into
   `config.json`, so devices can join teams whose vault id was named by
-  hand (`engram join`) — passphrase convergence can never reach those.
+  hand (`engram join`) — passphrase convergence can never reach those. (`9b70f31`)
 - **MCP capture honesty** — `engram_capture` checks the daemon's HTTP
   status and reports rejection bodies (401/403) instead of a false
   "captured successfully". (`8cdb5d1`)
