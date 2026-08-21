@@ -1,20 +1,31 @@
 # Engram vs. Claude Code native memory — a measured comparison
 
-**Date:** 2026-08-21 · **Status:** COMPLETE (K=25 ×3 reps, K=100 ×2 reps, clean harness)
+**Date:** 2026-08-21 · **Status:** COMPLETE (K=25 ×3 reps, K=100 ×2 reps, clean harness; environmental impact analysis added)
 
 This documents an A/B benchmark that pits an Engram vault (semantic retrieval via
 `engramd-mcp`) against Claude Code's native memory mechanisms — wholesale
 `CLAUDE.md` injection and index-plus-topic-files — plus a no-memory control, on
-the same synthetic corpus and question set.
+the same synthetic corpus and question set. The cost and token results are also
+read through an environmental lens: inference energy tracks tokens processed,
+so the *shape* of token scaling is the sustainability story.
 
 ## TL;DR
 
-| Condition | K=25 recall | K=100 recall | Cost per q (K=100) | Latency (K=100) |
-|---|---|---|---|---|
-| **Native A1** — every memory injected via CLAUDE.md | 100% | **95%** (2 crossref misses) | $0.17 | 6 s |
-| **Native A2** — CLAUDE.md index + `memories/*.md` topic files | 100% | 100% | $0.20 | 13 s |
-| **Engram (b)** — MCP vault, semantic search | 100% | **100%** | $0.25 | 21 s |
-| **Control (c)** — no memory | 0% | 0% | $0.04 | 9 s |
+> **Sustainability summary:** Engram's per-interaction token load is bounded
+> as knowledge grows; native wholesale injection grows linearly until it
+> fills the context window entirely (≈K 4,000 on the measured slope) and
+> stops working. Engram embeds the knowledge base **once — locally, on the
+> device** — instead of re-broadcasting it into every interaction of every
+> session. The efficiency win is structural and compounds at team scale;
+> below ~100–150 memories it has not yet arrived. See
+> [Environmental impact](#environmental-impact).
+
+| Condition | K=25 recall | K=100 recall | Cost per q (K=100) | In-token growth, 25→100 | Latency (K=100) |
+|---|---|---|---|---|---|
+| **Native A1** — every memory injected via CLAUDE.md | 100% | **95%** (2 crossref misses) | $0.17 | **+11% — linear, no ceiling** | 6 s |
+| **Native A2** — CLAUDE.md index + `memories/*.md` topic files | 100% | 100% | $0.20 | +2.6% | 13 s |
+| **Engram (b)** — MCP vault, semantic search | 100% | **100%** | $0.25 | **+4.5% — bounded by retrieval** | 21 s |
+| **Control (c)** — no memory | 0% | 0% | $0.04 | — | 9 s |
 
 - **Recall parity:** Engram matches or beats native memory at every scale tested,
   including the one place native wholesale injection failed (cross-referencing
@@ -37,6 +48,16 @@ the same synthetic corpus and question set.
   chunks enter context). The measured trend lines cross at roughly **K ≈
   100–150 memories** — right at this benchmark's top end, and well below any
   real team's corpus.
+- **The environmental reading (emphasized):** inference energy tracks tokens
+  processed, so the scaling shape *is* the sustainability story. Injection
+  re-broadcasts the entire knowledge base into every interaction, in every
+  teammate's session, forever — linear growth that fills the context window
+  entirely around K ≈ 4,000 and stops working. Engram's per-query tokens are
+  bounded by top-k retrieval, the corpus is embedded **once — locally, on
+  the device**, and at team scale the deduplication is immediate. The win is
+  structural, not day-one: below ~100–150 memories Engram currently costs a
+  few percent *more* tokens per question. See
+  [Environmental impact](#environmental-impact).
 
 ## What was measured
 
@@ -185,6 +206,96 @@ mechanistic, not guessed: injection cost is `overhead + c·K` by construction.
 Engram also carries a fixed premium per question that A1 does not (MCP round
 trips, ~2–5 extra turns) — worth knowing for low-K, high-frequency use cases
 where injection remains genuinely cheaper.
+
+## Environmental impact
+
+The benchmark measures tokens, not watts — no power instrumentation was
+done. But token volume is the standard proxy for inference energy, since
+datacenter inference compute scales with tokens processed. Read through that
+lens, the cost-scaling result above is also an energy-scaling result, and it
+is the deepest finding of this run:
+
+> **Engram's energy cost per interaction stops growing as knowledge grows.
+> Native injection's grows forever — until it hits the context ceiling and
+> stops working entirely.**
+
+### Linear vs. bounded: what the measurements show
+
+Input tokens per question, mean, measured:
+
+| Corpus | A1 (inject all) | Engram |
+|---|---|---|
+| K=25 | 29,308 | 31,839 |
+| K=100 | 32,449 | 33,257 |
+| Growth at 4× corpus | **+11%** | **+4.5%** |
+
+A1's growth is linear *by construction* — every interaction re-processes the
+entire corpus (~28.3k + 42 tokens per memory, fit through the two measured
+points). Engram's growth comes only from retrieval: search returns its top-k
+hits regardless of corpus size, so per-query context stays bounded (the
+two-point linear fit, ~+19 tokens per memory, is a conservative upper bound —
+the mechanism suggests it flattens further). The measured trend lines cross
+at roughly **K ≈ 110–150 memories**. Beyond that, Engram processes fewer
+tokens per question than wholesale injection, and the gap widens
+indefinitely.
+
+The context ceiling makes this decisive rather than marginal. Context
+windows top out around ~200k tokens. On the measured slope, A1 fills an
+entire window with memory *alone* around **K ≈ 4,000** — after which the
+approach stops being deployable at all. Engram's per-query context grows
+only through its top-k search results, not the corpus: at any corpus size it
+sends memory chunks plus room to think. Retrieval is not just cheaper at
+scale; it is the only shape of memory that survives scale.
+
+### Knowledge should be transported once, not re-broadcast
+
+Wholesale injection re-ships the entire knowledge base on every interaction,
+in every teammate's session, forever. Engram embeds the corpus once and pays
+per query only for the chunks that query needs. Org-wide, the difference
+compounds:
+
+- 20 teammates × 10 memory-dependent questions/day at K=1,000: injection ≈
+  **14M input tokens/day** just to carry knowledge; Engram ≈ **10M** (using
+  the conservative linear fit — the mechanism says less). ~30% fewer tokens
+  per day from the retrieval shape alone.
+- Every 1,000 memories added to the corpus: injection +~8.4M tokens/day
+  (42 tokens × 1,000 memories × 200 interactions). Engram barely moves.
+
+And Engram's retrieval layer is **local**: embeddings and search run on-device
+(local-only inference — no datacenter GPU for retrieval). The only cloud load
+per query is the tokens the model itself consumes. Cloud-RAG and cloud-memory
+alternatives pay for retrieval compute in the datacenter too; Engram does
+not.
+
+### Secondary effects (not measured here, but directionally real)
+
+- **Context churn.** Injected contexts overflow the window sooner, forcing
+  compaction — which re-reads and re-summarizes the whole context: energy
+  spent re-processing knowledge, not answering. Retrieval's small footprint
+  pushes compaction out.
+- **Output-token premium at small scale.** Engram generated ~5.7× more
+  output tokens at K=100 (1,290 vs 225 — the model narrates its search), and
+  output tokens cost more energy per token than input. This narrows Engram's
+  day-one efficiency; as input volume dominates at scale, it fades.
+
+### Where the claim holds, and where it must not be stretched
+
+- **True:** Engram's per-interaction token load is bounded as knowledge
+  grows; injection's is linear and context-capped. At team scale the
+  deduplication of knowledge transport is immediate, and the retrieval layer
+  runs locally.
+- **Not yet true:** "Engram uses less energy per question" for a *small*
+  personal corpus — below ~100–150 memories it currently costs a few percent
+  more tokens, plus the output-token overhead. The win is structural and
+  asymptotic, not day-one.
+- **Not claimed:** no power instrumentation was done — we measured tokens,
+  not joules. Frame it as token-bounded, never carbon-measured.
+- **Anticipated objection:** within one long session, prompt caching lets a
+  repeated injected prefix be re-read cheaply, so native injection is less
+  wasteful intra-session than the per-question numbers suggest. The
+  benchmark's fresh-session design models the first question, cache
+  evictions, and new teammates — the moments full price is paid. Cached
+  tokens still occupy the context budget either way.
 
 ## Lessons learned building the benchmark (all fixed in-harness)
 
