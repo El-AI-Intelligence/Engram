@@ -60,7 +60,8 @@ pub enum Commands {
         #[arg(long)]
         name: Option<String>,
     },
-    /// Pair this machine with your Engram account — one-time code from the site
+    /// Pair this machine with your Engram account — one-time code from the site.
+    /// The code carries the vault it was minted for, so no vault-id flag is needed.
     Pair {
         /// One-time pairing code from the site (e.g. ENG-4F7K-9Q2M-D8T3)
         code: String,
@@ -76,9 +77,8 @@ pub enum Commands {
         /// Device label shown in Account & Sync (optional)
         #[arg(long)]
         name: Option<String>,
-        /// Shared vault ID to pair onto. Overrides the passphrase-derived id —
-        /// required when the team vault has a manually-named id (created with
-        /// `engram join` or an explicit name), which no passphrase can derive.
+        /// Escape hatch: pin the local sync config to this vault id. Normally
+        /// unnecessary — the code carries its vault, and the relay echoes it.
         #[arg(long)]
         vault_id: Option<String>,
     },
@@ -827,40 +827,27 @@ fn resolve_sync_vault_id(
     Ok(crate::sync_client::derive_vault_id_v2(&passphrase))
 }
 
-pub async fn handle_pair(
-    code: String,
+/// Redeem a pairing code and persist the issued key — shared by `engram
+/// pair` and `engram onboarding`'s link branch. The code carries its vault
+/// (chosen in the browser at mint time), so the body sends no vault id;
+/// --vault-id only pins the local config when the relay response lacks one.
+/// Returns (vault_path, fresh_passphrase, pinned vault id from the code),
+/// or None when the passphrase prompt is declined.
+async fn redeem_pairing_code(
+    code: &str,
     vault_opt: Option<PathBuf>,
-    server_url: String,
-    site: String,
-    name: Option<String>,
-    vault_id_opt: Option<String>,
-) -> Result<()> {
-    println!();
-    println!("  ╔══════════════════════════════════════════════════╗");
-    println!("  ║   Engram by El AI Intelligence — Pair This Device║");
-    println!("  ║   One code. One machine.                         ║");
-    println!("  ╚══════════════════════════════════════════════════╝");
-    println!();
-
+    server_url: &str,
+    name: &Option<String>,
+    vault_id_opt: Option<&str>,
+) -> Result<Option<(PathBuf, Option<String>, Option<String>)>> {
     let Some((vault_path, _existing, fresh_passphrase)) =
         ensure_vault_for_sync(vault_opt, "pair").await?
     else {
-        return Ok(());
+        return Ok(None);
     };
 
-    // Redeem the code for an account API key. Codes are single-use and last
-    // 10 minutes — the relay is the source of truth for both. The minted
-    // key is scoped to this vault, so the body carries the client-derived
-    // vault id (pinned config value, else derived from the passphrase).
     let code = code.trim().to_ascii_uppercase();
-    // --vault-id is authoritative (the team's id may not be derivable);
-    // otherwise fall back to the pinned config value, else the passphrase.
-    let vault_id = match vault_id_opt.as_deref() {
-        Some(id) if !id.trim().is_empty() => id.trim().to_string(),
-        Some(_) => anyhow::bail!("--vault-id must not be empty"),
-        None => resolve_sync_vault_id(&vault_path, fresh_passphrase.as_deref())?,
-    };
-    let mut body = serde_json::json!({ "code": code, "vault_id": vault_id });
+    let mut body = serde_json::json!({ "code": code });
     if let Some(ref n) = name {
         body["device_label"] = serde_json::Value::String(n.clone());
     }
@@ -892,12 +879,14 @@ pub async fn handle_pair(
                  Mint a new one from the site: Account & Sync → Pair a device."
             ),
             (429, _) => anyhow::bail!("too many pairing attempts — wait a moment and try again."),
+            (410, "stale_pairing_code") => anyhow::bail!(
+                "this pairing code predates per-vault codes.\n\
+                 Mint a new one from the site: Account & Sync → Pair a device."
+            ),
             (403, "vault_not_owned") => anyhow::bail!(
-                "pairing rejected: this account has no access to that vault.\n\
-                 If the vault is shared, ask its owner to pair you in Account & Sync.\n\
-                 If it is yours, the passphrase on this machine differs from your other\n\
-                 devices — re-check ~/.engram/env — or the team vault has a manually-named\n\
-                 id: re-run with --vault-id <the team's vault id>."
+                "pairing rejected: the account that minted this code has no access to its vault.\n\
+                 Mint the code while signed in as the vault's owner (Account & Sync → Pair a\n\
+                 device); for a team vault, ask its owner."
             ),
             _ => anyhow::bail!("pairing failed: {err_code}"),
         }
@@ -907,14 +896,57 @@ pub async fn handle_pair(
         .get("api_key")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("relay response missing api_key"))?;
+    // The relay echoes the code's vault id — pin it into the config so the
+    // daemon converges immediately (passphrase derivation can't reach a
+    // manually-named team vault id). --vault-id covers older relays.
+    let resp_vault_id = body
+        .get("vault_id")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    save_sync_credential(
+        &vault_path,
+        server_url,
+        api_key,
+        name,
+        resp_vault_id.as_deref().or(vault_id_opt),
+    )?;
+    Ok(Some((vault_path, fresh_passphrase, resp_vault_id)))
+}
 
-    save_sync_credential(&vault_path, &server_url, api_key, &name, vault_id_opt.as_deref())?;
+pub async fn handle_pair(
+    code: String,
+    vault_opt: Option<PathBuf>,
+    server_url: String,
+    site: String,
+    name: Option<String>,
+    vault_id_opt: Option<String>,
+) -> Result<()> {
+    println!();
+    println!("  ╔══════════════════════════════════════════════════╗");
+    println!("  ║   Engram by El AI Intelligence — Pair This Device║");
+    println!("  ║   One code. One machine.                         ║");
+    println!("  ╚══════════════════════════════════════════════════╝");
+    println!();
+
+    let Some((vault_path, fresh_passphrase, pinned)) = redeem_pairing_code(
+        &code,
+        vault_opt,
+        &server_url,
+        &name,
+        vault_id_opt.as_deref(),
+    )
+    .await?
+    else {
+        return Ok(());
+    };
 
     println!();
     println!("  ✅ Paired! The relay issued a new API key — stored in {}", vault_path.join("config.json").display());
     println!("     (the key is masked in all status output; it is not printed here)");
-    if vault_id_opt.is_some() {
-        println!("     (sync pinned to vault {} — --vault-id)", vault_id);
+    if let Some(id) = &pinned {
+        println!("     (sync pinned to vault {id} — the code carries it)");
+    } else if vault_id_opt.is_some() {
+        println!("     (sync pinned to vault {} — --vault-id)", vault_id_opt.as_deref().unwrap());
     }
     if fresh_passphrase.is_some() {
         println!("     (vault created at {})", vault_path.display());
@@ -2175,10 +2207,53 @@ pub async fn handle_onboarding(bind: String) -> Result<()> {
 
     let vault_path = home_dir().join(".engram").join("vault");
     let fresh = !vault_path.join("engrams.db").exists();
+    let mut is_link = false;
 
-    // ── Step 1: vault ──────────────────────────────────────────────────
+    // ── Step 0: new vault, or link to an existing one? ──────────────────
+    // The link path is the pairing flow: the site mints a code FOR the
+    // chosen vault, the code carries the vault id, and this machine pulls
+    // it down instead of starting fresh.
     let mut passphrase = String::new();
     if fresh {
+        println!("New vault, or link this machine to an existing one?");
+        println!("  [1] New vault — start fresh (about 5 minutes)");
+        println!("  [2] Link to an existing vault — your account mints a code on the site");
+        print!("> ");
+        std::io::stdout().flush()?;
+        let mut choice = String::new();
+        std::io::stdin().read_line(&mut choice)?;
+        if choice.trim() == "2" {
+            println!();
+            println!("  On any device with Engram: open the site → Account & Sync → Pair a device,");
+            println!("  pick your vault, and copy the code shown (e.g. ENG-XXXX-XXXX-XXXX).");
+            println!("  If your vault has a team passphrase, enter that same passphrase at the");
+            println!("  next prompt — it unlocks your team's memories on this machine.");
+            print!("Pairing code: ");
+            std::io::stdout().flush()?;
+            let mut code = String::new();
+            std::io::stdin().read_line(&mut code)?;
+            let code = code.trim().to_string();
+            if code.is_empty() {
+                anyhow::bail!("No code entered — run `engram onboarding` again to link.");
+            }
+            let Some((_vp, fresh_passphrase, pinned)) =
+                redeem_pairing_code(&code, None, "https://sync.ellmstack.dev", &None, None).await?
+            else {
+                return Ok(());
+            };
+            passphrase = fresh_passphrase
+                .expect("a fresh vault always prompts for a passphrase");
+            is_link = true;
+            println!();
+            println!("  ✅ Linked! This machine now syncs with the vault the code was minted for.");
+            if let Some(id) = &pinned {
+                println!("     (vault {id})");
+            }
+        }
+    }
+
+    // ── Step 1: vault ──────────────────────────────────────────────────
+    if fresh && !is_link {
         std::fs::create_dir_all(&vault_path)?;
         println!("Encryption passphrase (leave empty for a machine-keyed vault):");
         print!("> ");
@@ -2207,6 +2282,8 @@ pub async fn handle_onboarding(bind: String) -> Result<()> {
             EngramStore::open_with_passphrase(&vault_path, &passphrase).await?
         };
         println!("  ✅ Vault created at {}", vault_path.display());
+    } else if is_link {
+        // Vault was just created by the link above; passphrase is in hand.
     } else {
         println!("Vault found at {} — using it.", vault_path.display());
         // Machine-key open first; a passphrase vault fails that, so ask.
@@ -2223,34 +2300,39 @@ pub async fn handle_onboarding(bind: String) -> Result<()> {
         }
     }
 
-    // ── Step 2: first memory ───────────────────────────────────────────
+    // ── Step 2: first memory (linked vaults skip it — theirs pulls down) ──
     let store = if passphrase.is_empty() {
         EngramStore::open(&vault_path).await?
     } else {
         EngramStore::open_with_passphrase(&vault_path, &passphrase).await?
     };
-    println!();
-    println!("What's one thing your AI should remember about you?");
-    print!("> ");
-    std::io::stdout().flush()?;
-    let mut content = String::new();
-    std::io::stdin().read_line(&mut content)?;
-    let content = content.trim().to_string();
-    let content = if content.is_empty() {
-        "I just set up Engram — my AI memory vault.".to_string()
+    if is_link {
+        println!();
+        println!("  ℹ️  Skipping first-memory capture — the vault's memories sync down within a minute.");
     } else {
-        content
-    };
-    let mut engram = Engram::new_episodic(content, EngramSource::Interaction, serde_json::json!({}));
-    engram.layer = EngramLayer::Semantic;
-    engram.tags = vec!["onboarding".to_string()];
-    match store.write(&engram).await? {
-        axiom_engram::WriteOutcome::Inserted => println!("  ✅ First memory stored."),
-        axiom_engram::WriteOutcome::Duplicate { matched_id } => {
-            println!("  ℹ️  Already remembered (matches {matched_id}) — kept the original.")
-        }
-        axiom_engram::WriteOutcome::NoiseSkipped { reason } => {
-            println!("  ⚠️  Skipped as noise ({reason}) — capture something more specific later.")
+        println!();
+        println!("What's one thing your AI should remember about you?");
+        print!("> ");
+        std::io::stdout().flush()?;
+        let mut content = String::new();
+        std::io::stdin().read_line(&mut content)?;
+        let content = content.trim().to_string();
+        let content = if content.is_empty() {
+            "I just set up Engram — my AI memory vault.".to_string()
+        } else {
+            content
+        };
+        let mut engram = Engram::new_episodic(content, EngramSource::Interaction, serde_json::json!({}));
+        engram.layer = EngramLayer::Semantic;
+        engram.tags = vec!["onboarding".to_string()];
+        match store.write(&engram).await? {
+            axiom_engram::WriteOutcome::Inserted => println!("  ✅ First memory stored."),
+            axiom_engram::WriteOutcome::Duplicate { matched_id } => {
+                println!("  ℹ️  Already remembered (matches {matched_id}) — kept the original.")
+            }
+            axiom_engram::WriteOutcome::NoiseSkipped { reason } => {
+                println!("  ⚠️  Skipped as noise ({reason}) — capture something more specific later.")
+            }
         }
     }
 
