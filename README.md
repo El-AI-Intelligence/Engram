@@ -44,6 +44,10 @@ iex (irm https://engram.ellmstack.dev/install.ps1)
 engram init          # answer Y to install the background service
 ```
 
+Windows builds are unsigned for now: on first run, SmartScreen may show
+"Windows protected your PC" — click **More info → Run anyway** (once per
+release). Code signing is planned once the product has paying users.
+
 The release pipeline signs and notarizes macOS binaries (Apple Developer ID).
 All platforms: the daemon auto-starts at login (enable it with `engram init`)
 and, once linked, syncs through your Engram by El AI Intelligence account.
