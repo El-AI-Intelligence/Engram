@@ -333,10 +333,10 @@ fn expand_tilde(path: &str) -> PathBuf {
 
 pub async fn handle_init() -> Result<()> {
     println!();
-    println!("  ╔═════════════════════════════════════╗");
+    println!("  ╔═══════════════════════════════════════╗");
     println!("  ║   Engram by El AI Intelligence — Setup║");
-    println!("  ║   Your AI deserves a memory.        ║");
-    println!("  ╚═════════════════════════════════════╝");
+    println!("  ║   Your AI deserves a memory.          ║");
+    println!("  ╚═══════════════════════════════════════╝");
     println!();
 
     let home = home_dir();
@@ -466,10 +466,10 @@ pub async fn handle_join(
     name: Option<String>,
 ) -> Result<()> {
     println!();
-    println!("  ╔═════════════════════════════════════════════════╗");
+    println!("  ╔═══════════════════════════════════════════════════╗");
     println!("  ║   Engram by El AI Intelligence — Join a Team Vault║");
-    println!("  ║   One passphrase. One vault.                    ║");
-    println!("  ╚═════════════════════════════════════════════════╝");
+    println!("  ║   One passphrase. One vault.                      ║");
+    println!("  ╚═══════════════════════════════════════════════════╝");
     println!();
 
     let default_path = home_dir().join(".engram").join("vault");
@@ -836,10 +836,10 @@ pub async fn handle_pair(
     vault_id_opt: Option<String>,
 ) -> Result<()> {
     println!();
-    println!("  ╔════════════════════════════════════════════════╗");
+    println!("  ╔══════════════════════════════════════════════════╗");
     println!("  ║   Engram by El AI Intelligence — Pair This Device║");
-    println!("  ║   One code. One machine.                       ║");
-    println!("  ╚════════════════════════════════════════════════╝");
+    println!("  ║   One code. One machine.                         ║");
+    println!("  ╚══════════════════════════════════════════════════╝");
     println!();
 
     let Some((vault_path, _existing, fresh_passphrase)) =
@@ -941,10 +941,10 @@ pub async fn handle_link(
     force: bool,
 ) -> Result<()> {
     println!();
-    println!("  ╔═════════════════════════════════════════════════╗");
+    println!("  ╔═══════════════════════════════════════════════════╗");
     println!("  ║   Engram by El AI Intelligence — Link This Machine║");
-    println!("  ║   Your browser opens. One click. Done.          ║");
-    println!("  ╚═════════════════════════════════════════════════╝");
+    println!("  ║   Your browser opens. One click. Done.            ║");
+    println!("  ╚═══════════════════════════════════════════════════╝");
     println!();
 
     // Already linked? Re-linking orphans the old key (revocable at
@@ -2167,10 +2167,10 @@ pub async fn handle_mcp(command: String, engramd_url: String, dry_run: bool, yes
 /// never argv — argv is visible in `ps`).
 pub async fn handle_onboarding(bind: String) -> Result<()> {
     println!();
-    println!("  ╔═══════════════════════════════════════════════════╗");
+    println!("  ╔═════════════════════════════════════════════════════╗");
     println!("  ║   Engram by El AI Intelligence — 5-minute onboarding║");
-    println!("  ║   Your AI deserves a memory.                      ║");
-    println!("  ╚═══════════════════════════════════════════════════╝");
+    println!("  ║   Your AI deserves a memory.                        ║");
+    println!("  ╚═════════════════════════════════════════════════════╝");
     println!();
 
     let vault_path = home_dir().join(".engram").join("vault");
