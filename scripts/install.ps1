@@ -8,7 +8,7 @@
 # Downloads engramd-windows-x86_64.zip from GitHub Releases (by default -
 # override with the ENGRAM_RELEASE_BASE env var), verifies its sha256 sidecar,
 # and installs engram.exe / engramd.exe / engramd-mcp.exe. Never touches
-# secrets; the vault passphrase is entered interactively by `engram init` later.
+# secrets; the vault passphrase is entered interactively by `engram onboarding` later.
 
 $ErrorActionPreference = 'Stop'
 
@@ -66,7 +66,8 @@ Write-Host ""
 Write-Host "  [OK] Engram by El AI Intelligence installed to $InstallDir"
 Write-Host ""
 Write-Host "  Next steps:"
-Write-Host "    engram init                  Create your vault (offers a background service)"
-Write-Host "    engram pair ENG-XXXX-XXXX    Link this machine to your account"
+Write-Host "    engram onboarding    # vault + first memory + running daemon (~5 min)"
+Write-Host "    engram mcp install   # connect Claude Code, Claude Desktop, Cursor, Windsurf"
+Write-Host "    engram pair ENG-XXXX # link this machine to your Engram account"
 Write-Host "    http://localhost:8787        Vault UI once the daemon is running"
 Write-Host ""
