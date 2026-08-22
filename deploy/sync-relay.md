@@ -180,3 +180,14 @@ localStorage, nothing new terminates at Caddy.
   OPTIONS (Origin + Access-Control-Request-Method) then a full throwaway
   signup→PUT wraps→GET wraps loop (all 200 + CORS headers), rows cleaned
   up. Full postmortem + auth playbook: docs/engram-product/AUTHENTICATION.md
+- **2026-08-21 — per-vault pairing codes (af160a8, T1):** pairing_codes
+  gained `vault_id` + `device_label` via guarded ALTERs on startup — the
+  first engramd-sync migration that ALTERs (still additive; old binaries
+  ignore the extra columns, and a restored pre-migration snapshot gets the
+  ALTER on next start). Mint takes `{vault_id, device_label?}` and runs
+  `validate_key_mint` at mint; redeem reads the vault off the code's row
+  (NULL → 410 re-mint) and ignores body `vault_id` (old CLIs keep working).
+  Deployed together with the SPA vault picker (103740a, site box
+  deploy.sh). Live matrix green: new-shape mint, code-only redeem (row
+  vault + label echo), old-shape redeem, empty-body mint 400;
+  throwaway matrix accounts deleted.
