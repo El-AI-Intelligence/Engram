@@ -177,7 +177,9 @@ engram handoff
 
 One-click machine linking, WARP-style. `engram link` in a terminal →
 browser opens → sign in → click "Link this machine" → the CLI receives an
-account API key automatically. Pairing codes remain the headless/SSH path.
+account API key automatically. Pairing codes remain the headless/SSH path —
+and now **carry their vault**: the site asks which vault the machine joins
+at mint time, so `engram pair CODE` needs no vault-id flag.
 
 **Flow:** the CLI mints an ephemeral X25519 keypair and POSTs the public
 key to `/devices/link-intents` (unauthenticated, 201 `{id, code,

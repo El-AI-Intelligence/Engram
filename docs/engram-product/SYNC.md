@@ -145,19 +145,19 @@ Machines without a browser can still use a one-time pairing code:
 engram pair ENG-XXXX-XXXX-XXXX
 ```
 
-**Manually-named vault ids:** vault ids are normally 64-hex strings derived
-from the passphrase, and devices converge on the same vault automatically.
-If your team's vault id was **named by hand** (e.g. created with
-`engram join --vault-id <id>`), no passphrase derivation can reach it —
-new devices must pair explicitly, or they would silently land in a fresh
-empty vault:
+The site's **Pair a device** flow (Account & Sync, and the login screen's
+Add-device wizard) asks which vault the new machine joins and mints the
+code **for that vault** — the code carries the vault id, so the command
+needs no flags. The relay echoes the code's vault id in the redeem
+response and the CLI pins it into `sync.vault_id`, so the daemon
+converges immediately — including for **manually-named** team vault ids
+(e.g. created with `engram join --vault-id <id>`), which no passphrase
+derivation can reach. `engram onboarding` on a fresh machine offers
+"link to an existing vault" as option 2, which runs the same flow.
 
-```bash
-engram pair ENG-XXXX-XXXX-XXXX --vault-id <the team's vault id>
-```
-
-The flag overrides the derived id at redeem time and pins `sync.vault_id`
-into the vault's `config.json`, so the daemon skips probe-convergence.
+`--vault-id` remains as an escape hatch: it pins the local config when
+the relay response lacks a vault id (a self-hosted relay predating
+per-vault codes).
 
 The device's roster label is taken from `--name` if given, otherwise the
 vault's sync name, otherwise the machine hostname — both commands replace
@@ -167,11 +167,11 @@ you pass `--force` (the old key stays active until revoked in
 Account & Sync → API keys).
 
 Notes: pairing codes are single-use, 10-minute TTL, and stored server-side
-only as sha256 — the plaintext is shown once. Issued keys are **scoped to
-the device's vault** (the vault id is derived from the passphrase at
-pair/link time and minted into the key); the vault UI mints per-vault keys
-the same way. Keys minted before 2026-08-20 are account-wide ("unscoped")
-and the relay now policy-denies them with a 403 — re-run `engram link` or
+only as sha256 — the plaintext is shown once. Each code is minted for one
+vault (validated against the account's ownership at mint) and issued keys
+are **scoped to that vault**; the vault UI mints per-vault keys the same
+way. Keys minted before 2026-08-20 are account-wide ("unscoped") and the
+relay now policy-denies them with a 403 — re-run `engram link` or
 `engram pair` on affected devices. Machine-keyed vaults (created without a
 passphrase) cannot link or pair — sync keys derive from the passphrase, so
 both commands refuse them.
