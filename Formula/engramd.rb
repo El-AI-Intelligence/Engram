@@ -11,10 +11,10 @@ class Engramd < Formula
   desc "Engram by El AI Intelligence — Your AI deserves a memory"
   homepage "https://github.com/El-AI-Intelligence/engram"
   license "MIT"
+  version "0.1.1"
 
-  # Set VERSION before running: export VERSION=0.1.0 && brew install ./Formula/engramd.rb
   # SHA256 from release workflow: sha256sum engramd-*.tar.gz
-  # Update on each release — the release CI generates these in the build step.
+  # Update on each release with: VERSION=vX.Y.Z ./scripts/update-formula.sh
 
   on_macos do
     if Hardware::CPU.arm?
