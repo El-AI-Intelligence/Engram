@@ -28,11 +28,22 @@ set the `ARTIFACT_SIGNING_ENDPOINT` var to its endpoint from the table below).
 SKU: **Basic**. Note the **account name**.
 
 ### 3. Identity validation (the long pole — start first)
+First assign yourself the verifier role (portal errors with
+"Please ensure you have the 'Artifact Signing Identity Verifier' role
+assigned" otherwise): **Subscriptions → your subscription → Access control
+(IAM) → Add role assignment** → role **Artifact Signing Identity Verifier**
+→ member = your own account → assign. Wait a few minutes for propagation,
+then:
+
+Inside the signing account → **Identity validation** → New.
 Inside the signing account → **Identity validation** → New.
 - **Individuals: US/Canada only.** First/last name, email (must match the
   Microsoft account email), address exactly as on a government ID → AU10TIX
   photo-ID scan on a phone → Verified ID credential lands in **Microsoft
-  Authenticator**. Minutes to ~7 business days; renewed annually.
+  Authenticator**. Minutes to ~7 business days; renewed annually. A Microsoft
+  account registered outside a supported country cannot do individual
+  validation (that's the "supported countries/regions" banner) — the OV-cert
+  path is the fallback.
 - Organizations: US/CA/EU/UK, needs 3+ years verifiable tax history.
 
 ### 4. Certificate profile
