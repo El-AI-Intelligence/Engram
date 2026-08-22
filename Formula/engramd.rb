@@ -11,7 +11,7 @@ class Engramd < Formula
   desc "Engram by El AI Intelligence — Your AI deserves a memory"
   homepage "https://github.com/El-AI-Intelligence/engram"
   license "MIT"
-  version "0.1.1"
+  version "0.1.2"
 
   # SHA256 from release workflow: sha256sum engramd-*.tar.gz
   # Update on each release with: VERSION=vX.Y.Z ./scripts/update-formula.sh
@@ -19,20 +19,20 @@ class Engramd < Formula
   on_macos do
     if Hardware::CPU.arm?
       url "https://github.com/El-AI-Intelligence/engram/releases/download/v#{version}/engramd-darwin-arm64.tar.gz"
-      sha256 "e3e47831eb5877942e60e39c537693fe9e4c53afcdfd51fcdc571d5877c52173"
+      sha256 "39aca5821d9cc1839acba0b220d98690f0628b502e10bb1ea5272218f7a20ae8"
     else
       url "https://github.com/El-AI-Intelligence/engram/releases/download/v#{version}/engramd-darwin-x86_64.tar.gz"
-      sha256 "069a10ee2ef989a058c440d72db2f72271c8f3c56b3d76d16de5b1b53e841b14"
+      sha256 "e76db79bcd493a24f381fd18dbfd34cf5fc1dcf574b2916a5f42233e8091e155"
     end
   end
 
   on_linux do
     if Hardware::CPU.arm?
       url "https://github.com/El-AI-Intelligence/engram/releases/download/v#{version}/engramd-linux-arm64.tar.gz"
-      sha256 "d16287a0efe3b91ae3c70cde39b16fee3b430856f7c224220dcc81db162f0652"
+      sha256 "1606dc9336d53eda356c451eb163819fcd5356ab4dd0841d1af6fbc32c13d7e3"
     else
       url "https://github.com/El-AI-Intelligence/engram/releases/download/v#{version}/engramd-linux-x86_64.tar.gz"
-      sha256 "5db0d5b105a6dbb0d60f13d30060054ae4ba758fde8327769597cad9bb117253"
+      sha256 "5921ced29e7ba5a6f987ab455880706cf1812c9a0cc0740cfc3c5261b991f612"
     end
   end
 
