@@ -689,14 +689,22 @@ const PAIRING_CODE_TTL_SECS: i64 = 600;
 /// Cap on live (unused, unexpired) pairing codes per account.
 const PAIRING_CODES_PER_ACCOUNT: i64 = 5;
 
-/// Mint a one-time pairing code for the signed-in account. The plaintext
-/// code is returned exactly once — the relay stores only its sha256
-/// (same discipline as API keys and sessions).
+/// Mint a one-time pairing code for the signed-in account, FOR a specific
+/// vault chosen in the browser (where vault names are visible) — the
+/// redeeming CLI never has to guess a vault id. The plaintext code is
+/// returned exactly once — the relay stores only its sha256 (same
+/// discipline as API keys and sessions).
 async fn mint_pairing_code(
     State(state): State<SyncState>,
     headers: HeaderMap,
+    Json(body): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
     let account_id = authenticate_session(&state, &headers).await?;
+    let vault_id = required_vault_id(&body)?;
+    let device_label = body
+        .get("device_label")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
 
     let code = auth::generate_pairing_code()
         .map_err(|e| err_json(500, "rng_error", &e.to_string()))?;
@@ -727,29 +735,37 @@ async fn mint_pairing_code(
         ));
     }
 
+    // Ownership is validated at mint time — a wrong-vault mint fails before
+    // the code exists, instead of the redeemer discovering it later.
+    validate_key_mint(&conn, &account_id, &vault_id)?;
+
     conn.execute(
-        "INSERT INTO pairing_codes (code_hash, account_id, created_at, expires_at, used) \
-         VALUES (?1, ?2, ?3, ?4, 0)",
+        "INSERT INTO pairing_codes (code_hash, account_id, created_at, expires_at, used, vault_id, device_label) \
+         VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6)",
         rusqlite::params![
             auth::hash_key(&code).to_vec(),
             account_id,
             now.to_rfc3339(),
             expires.to_rfc3339(),
+            vault_id,
+            device_label,
         ],
     )
     .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
-    audit_event(&conn, &account_id, "pairing_code_mint", None);
+    audit_event(&conn, &account_id, "pairing_code_mint", Some(&vault_id));
 
     Ok(Json(json!({
         "code": code, // shown once — the server keeps only its hash
         "expires_in": PAIRING_CODE_TTL_SECS,
+        "vault_id": vault_id,
     })))
 }
 
 /// Redeem a pairing code for an account API key. No session required —
-/// the code itself is the credential (single-use, 10-minute TTL). The body
-/// must carry the client-derived `vault_id`; the minted key is scoped to
-/// that vault (validated against the account's ownership).
+/// the code itself is the credential (single-use, 10-minute TTL). The
+/// vault id comes from the code's row (chosen at mint time in the
+/// browser); the body carries only `code` + optional `device_label`. An
+/// old client's body `vault_id` is ignored for compatibility.
 async fn redeem_pairing_code(
     State(state): State<SyncState>,
     Json(body): Json<Value>,
@@ -772,15 +788,15 @@ async fn redeem_pairing_code(
 
     let code = str_field(&body, "code")?.to_ascii_uppercase();
     let conn = state.conn.lock().await;
-    let row: Option<(String, String, i64)> = conn
+    let row: Option<(String, String, i64, Option<String>, Option<String>)> = conn
         .query_row(
-            "SELECT account_id, expires_at, used FROM pairing_codes WHERE code_hash = ?1",
+            "SELECT account_id, expires_at, used, vault_id, device_label FROM pairing_codes WHERE code_hash = ?1",
             rusqlite::params![auth::hash_key(&code).to_vec()],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )
         .optional()
         .map_err(|e| err_json(500, "database_error", &e.to_string()))?;
-    let (account_id, expires_at, used) = row.ok_or_else(|| {
+    let (account_id, expires_at, used, vault_id_row, device_label) = row.ok_or_else(|| {
         err_json(
             401,
             "invalid_pairing_code",
@@ -806,7 +822,16 @@ async fn redeem_pairing_code(
         ));
     }
 
-    let vault_id = required_vault_id(&body)?;
+    // Codes minted before the per-vault schema have NULL here — they're
+    // dead minutes after deploy thanks to the 10-minute TTL, so refuse
+    // them with a clear re-mint message rather than guessing.
+    let vault_id = vault_id_row.ok_or_else(|| {
+        err_json(
+            410,
+            "stale_pairing_code",
+            "this pairing code predates per-vault codes — mint a new one from the site",
+        )
+    })?;
 
     // Consume the code first: a concurrent redeem must never mint two keys,
     // and a wrong-vault attempt burns the code (fail-closed — no retries
@@ -853,6 +878,7 @@ async fn redeem_pairing_code(
         "rate": 100.0,
         "vault_id": vault_id,
         "created_at": now_str,
+        "device_label": device_label,
     })))
 }
 
@@ -2008,7 +2034,8 @@ mod tests {
              );
              CREATE TABLE pairing_codes (
                  code_hash BLOB PRIMARY KEY, account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
-                 created_at TEXT NOT NULL, expires_at TEXT NOT NULL, used INTEGER NOT NULL DEFAULT 0
+                 created_at TEXT NOT NULL, expires_at TEXT NOT NULL, used INTEGER NOT NULL DEFAULT 0,
+                 vault_id TEXT, device_label TEXT
              );
              CREATE TABLE link_intents (
                  id TEXT PRIMARY KEY, code_hash BLOB NOT NULL, public_key BLOB NOT NULL,
@@ -2604,7 +2631,7 @@ mod tests {
     #[tokio::test]
     async fn mint_pairing_code_requires_session() {
         let state = test_state();
-        let err = mint_pairing_code(State(state), HeaderMap::new())
+        let err = mint_pairing_code(State(state), HeaderMap::new(), Json(json!({})))
             .await
             .expect_err("no session");
         assert_eq!(err.0, StatusCode::UNAUTHORIZED);
@@ -2616,36 +2643,43 @@ mod tests {
         let state = test_state();
         seed_session(&state, "acct-1", "test-token").await;
 
-        let res = mint_pairing_code(State(state.clone()), bearer("test-token"))
-            .await
-            .expect("session valid");
+        let res = mint_pairing_code(
+            State(state.clone()),
+            bearer("test-token"),
+            Json(json!({"vault_id": "vault-a", "device_label": "my laptop"})),
+        )
+        .await
+        .expect("session valid");
         let body = res.0;
         let code = body["code"].as_str().expect("plaintext code returned once");
         assert_eq!(code.len(), 18, "ENG-XXXX-XXXX-XXXX");
         assert!(code.starts_with("ENG-"));
         assert_eq!(body["expires_in"], 600);
+        assert_eq!(body["vault_id"], "vault-a", "code knows its vault");
 
-        // Stored: sha256 only — never the plaintext.
+        // Stored: sha256 only — never the plaintext — plus the vault the
+        // code was minted for and the device label.
         {
             let conn = state.conn.lock().await;
-            let (hash, used): (Vec<u8>, i64) = conn
+            let (hash, used, vid, lbl): (Vec<u8>, i64, String, String) = conn
                 .query_row(
-                    "SELECT code_hash, used FROM pairing_codes",
+                    "SELECT code_hash, used, vault_id, device_label FROM pairing_codes",
                     [],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
                 )
                 .unwrap();
             assert_eq!(hash, auth::hash_key(code).to_vec(), "sha256 at rest");
             assert_ne!(hash, code.as_bytes());
             assert_eq!(used, 0);
+            assert_eq!(vid, "vault-a", "stored code carries its vault");
+            assert_eq!(lbl, "my laptop", "stored code carries the label");
         }
 
         // Redeem — accept lowercase input (typed codes are case-insensitive).
-        // The body carries the client-derived vault_id; the vault is empty on
-        // the relay (founding branch), so the mint is allowed.
+        // The body carries no vault_id: the vault comes from the code itself.
         let res = redeem_pairing_code(
             State(state.clone()),
-            Json(json!({"code": code.to_lowercase(), "vault_id": "vault-a"})),
+            Json(json!({"code": code.to_lowercase()})),
         )
         .await
         .expect("fresh code redeems");
@@ -2653,6 +2687,7 @@ mod tests {
         let api_key = body["api_key"].as_str().expect("full key returned once");
         assert!(api_key.starts_with(auth::API_KEY_PREFIX));
         assert_eq!(body["vault_id"], "vault-a", "minted key is scoped");
+        assert_eq!(body["device_label"], "my laptop", "label echoes back");
         // The minted key authenticates through the normal api_keys path.
         {
             let conn = state.conn.lock().await;
@@ -2689,38 +2724,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pair_redeem_for_foreign_nonempty_vault_is_denied_and_burns_code() {
+    async fn pair_mint_for_foreign_nonempty_vault_is_denied() {
         let state = test_state();
         seed_session(&state, "acct-1", "test-token").await;
         seed_scoped_key(&state, "acct-1", "k1", "vault-a").await;
         seed_blob(&state, "vault-a", "m1", "2026-01-01T00:00:00Z").await;
         seed_blob(&state, "vault-b", "m1", "2026-01-01T00:00:00Z").await;
-        let res = mint_pairing_code(State(state.clone()), bearer("test-token"))
-            .await
-            .expect("mint");
-        let code = res.0["code"].as_str().unwrap().to_string();
 
-        // The account owns vault-a but not vault-b — redeeming for vault-b
-        // must not mint a key for someone else's non-empty vault.
-        let err = redeem_pairing_code(
+        // The account owns vault-a but not vault-b — minting a code FOR
+        // vault-b must fail before the code exists (no code to burn later).
+        let err = mint_pairing_code(
             State(state.clone()),
-            Json(json!({"code": code, "vault_id": "vault-b"})),
+            bearer("test-token"),
+            Json(json!({"vault_id": "vault-b"})),
         )
         .await
         .expect_err("foreign non-empty vault");
         assert_eq!(err.0, StatusCode::FORBIDDEN);
         assert_eq!(err.1["code"], "vault_not_owned");
+        {
+            let conn = state.conn.lock().await;
+            let count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM pairing_codes", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(count, 0, "denied mint leaves no code behind");
+        }
 
-        // Fail-closed: the wrong-vault attempt burned the code — no retry
-        // with a stolen code against the right vault.
-        let err = redeem_pairing_code(
-            State(state),
-            Json(json!({"code": code, "vault_id": "vault-a"})),
+        // Old CLIs still send body.vault_id at redeem — it is ignored; the
+        // row's vault wins. The key is scoped to vault-a, not vault-b.
+        let res = mint_pairing_code(
+            State(state.clone()),
+            bearer("test-token"),
+            Json(json!({"vault_id": "vault-a"})),
         )
         .await
-        .expect_err("burned");
-        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
-        assert_eq!(err.1["code"], "invalid_pairing_code");
+        .expect("mint for owned vault");
+        let code = res.0["code"].as_str().unwrap().to_string();
+        let res = redeem_pairing_code(
+            State(state),
+            Json(json!({"code": code, "vault_id": "vault-b"})),
+        )
+        .await
+        .expect("old-style body still redeems");
+        assert_eq!(res.0["vault_id"], "vault-a", "row's vault, not body's");
     }
 
     #[tokio::test]
@@ -3036,13 +3082,21 @@ mod tests {
         let state = test_state();
         seed_session(&state, "acct-1", "test-token").await;
         for _ in 0..PAIRING_CODES_PER_ACCOUNT {
-            mint_pairing_code(State(state.clone()), bearer("test-token"))
-                .await
-                .expect("under the cap");
-        }
-        let err = mint_pairing_code(State(state), bearer("test-token"))
+            mint_pairing_code(
+                State(state.clone()),
+                bearer("test-token"),
+                Json(json!({"vault_id": "vault-a"})),
+            )
             .await
-            .expect_err("cap reached");
+            .expect("under the cap");
+        }
+        let err = mint_pairing_code(
+            State(state),
+            bearer("test-token"),
+            Json(json!({"vault_id": "vault-a"})),
+        )
+        .await
+        .expect_err("cap reached");
         assert_eq!(err.0, StatusCode::CONFLICT);
         assert_eq!(err.1["code"], "too_many_codes");
     }

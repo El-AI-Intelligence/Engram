@@ -513,6 +513,27 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("migration: added link_intents.vault_id");
     }
 
+    // pairing_codes.vault_id + device_label (2026-08-21): codes are minted
+    // FOR a vault chosen in the browser, so the redeeming CLI sends no
+    // vault id at all. NULL on pre-migration rows — redeem 410s those (the
+    // 10-minute TTL makes them dead shortly after deploy anyway).
+    for (col, sql) in [
+        ("vault_id", "ALTER TABLE pairing_codes ADD COLUMN vault_id TEXT"),
+        ("device_label", "ALTER TABLE pairing_codes ADD COLUMN device_label TEXT"),
+    ] {
+        let has_col: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('pairing_codes') WHERE name = ?1",
+                [col],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if has_col == 0 {
+            conn.execute(sql, [])?;
+            tracing::info!("migration: added pairing_codes.{col}");
+        }
+    }
+
     // ── Run tombstone cleanup on startup ───────────────────────────────
     let deleted: u64 = conn
         .query_row(
