@@ -72,7 +72,9 @@ echo "Synced landing page and vault UI to /srv/engram/"
 
 install -m 0644 "$REPO_ROOT/scripts/install.sh" /srv/engram/landing/install.sh
 install -m 0644 "$REPO_ROOT/scripts/install.ps1" /srv/engram/landing/install.ps1
-echo "Published install.sh + install.ps1 (https://engram.ellmstack.dev/install.sh)"
+install -m 0644 "$REPO_ROOT/scripts/uninstall.sh" /srv/engram/landing/uninstall.sh
+install -m 0644 "$REPO_ROOT/scripts/uninstall.ps1" /srv/engram/landing/uninstall.ps1
+echo "Published install.sh + install.ps1 + uninstall.sh + uninstall.ps1"
 
 # Optional: stage the CI-built Windows zip on the mirror (the server can't
 # build Windows binaries itself):
