@@ -182,7 +182,7 @@ const api = {
     get: (server) => acctGet(server, '/account'),
     createKey: (server, vaultId) => acctPost(server, '/account/keys', vaultId ? { vault_id: vaultId } : {}),
     revokeKey: (server, keyId) => acctDel(server, '/account/keys/' + encodeURIComponent(keyId)),
-    pairCodes: (server) => acctPost(server, '/devices/pair-codes', {}),
+    pairCodes: (server, vaultId) => acctPost(server, '/devices/pair-codes', vaultId ? { vault_id: vaultId } : {}),
     // ── Email+password account routes (password_routes.rs) ────────────────
     signup: (server, email, password) => acctPost(server, '/auth/signup', { email, password }),
     signin: (server, email, password) => acctPost(server, '/auth/signin', { email, password }),
@@ -1056,23 +1056,8 @@ route('/login', () => {
             </div>
           </div>
         </div>`;
-      document.getElementById('pair-mint').onclick = async () => {
-        const el = document.getElementById('pair-once');
-        el.innerHTML = '<div class="faint">Requesting a pairing code…</div>';
-        try {
-          const res = await api.account.pairCodes(PAIR_CODE_SERVER);
-          el.innerHTML = pairCodeHtml(res.code);
-          wirePairCodeCopies(el);
-          sessionStorage.setItem(PAIR_POLL_KEY, '1');
-        } catch (e) {
-          if (e.status === 401) {
-            api.account.setToken(null);
-            toast('Account session expired — sign in again', 'error');
-            renderLoginView('account');
-            return;
-          }
-          el.innerHTML = `<div class="error-panel"><p>${esc(e.message)}</p></div>`;
-        }
+      document.getElementById('pair-mint').onclick = () => {
+        mintPairCode(PAIR_CODE_SERVER, document.getElementById('pair-once'));
       };
       document.getElementById('pair-back').onclick = (e) => { e.preventDefault(); renderLoginView('account'); };
       document.getElementById('pair-logout').onclick = async (e) => {
@@ -1310,23 +1295,8 @@ route('/login', () => {
                 <div id="login-pair-once"></div>
               </div>`;
             document.getElementById('login-unlock').onclick = () => navigate('#/unlock');
-            document.getElementById('login-pair').onclick = async () => {
-              const once = document.getElementById('login-pair-once');
-              once.innerHTML = '<div class="faint">Requesting a pairing code…</div>';
-              try {
-                const res = await api.account.pairCodes(PAIR_CODE_SERVER);
-                once.innerHTML = pairCodeHtml(res.code);
-                wirePairCodeCopies(once);
-                sessionStorage.setItem(PAIR_POLL_KEY, '1');
-              } catch (e) {
-                if (e.status === 401) {
-                  api.account.setToken(null);
-                  toast('Account session expired — sign in again', 'error');
-                  renderLoginView('account');
-                  return;
-                }
-                once.innerHTML = `<div class="error-panel"><p>${esc(e.message)}</p></div>`;
-              }
+            document.getElementById('login-pair').onclick = () => {
+              mintPairCode(PAIR_CODE_SERVER, document.getElementById('login-pair-once'));
             };
             document.getElementById('login-acct-logout').onclick = async (e) => {
               e.preventDefault();
@@ -3509,6 +3479,57 @@ async function webauthnLogin(server) {
   }
 }
 
+// Vault picker → pairing code. The code is minted FOR the chosen vault
+// (the relay validates ownership at mint), so the pairing command needs
+// no vault-id flag — the code carries it. Shared by the login screen's
+// Add-device wizard and the Settings → Account & Sync panel.
+async function mintPairCode(server, el) {
+  el.innerHTML = '<div class="faint">Loading your vaults…</div>';
+  let vaults;
+  try {
+    vaults = await unlock.listVaults(server);
+  } catch (e) {
+    el.innerHTML = `<div class="error-panel"><p>${esc(e.message)}</p></div>`;
+    return;
+  }
+  if (!vaults.length) {
+    el.innerHTML = '<div class="error-panel"><p>No vaults yet — a machine must create or link a vault before more devices can pair to it.</p></div>';
+    return;
+  }
+  el.innerHTML = `
+    <div class="settings-note">
+      <strong>Pick the vault this machine joins:</strong>
+      <div style="margin:0.5rem 0;">
+        ${vaults.map((v, i) => `
+          <label style="display:flex;align-items:center;gap:0.5rem;padding:0.4rem 0.6rem;border:1px solid var(--border, rgba(128,128,128,0.35));border-radius:8px;margin-bottom:0.4rem;cursor:pointer;">
+            <input type="radio" name="pair-vault" value="${esc(v.vault_id)}"${i === 0 ? ' checked' : ''}>
+            <span>${esc(v.label || v.vault_id.slice(0, 8))}</span>
+            <span class="faint">${v.live_count ?? 0} ${(v.live_count ?? 0) === 1 ? 'memory' : 'memories'}</span>
+          </label>`).join('')}
+      </div>
+      <button class="btn btn-sm btn-primary" id="pair-pick-go">Get pairing code</button>
+    </div>`;
+  document.getElementById('pair-pick-go').onclick = async () => {
+    const chosen = document.querySelector('input[name="pair-vault"]:checked');
+    if (!chosen) { toast('Pick a vault first', 'error'); return; }
+    el.innerHTML = '<div class="faint">Requesting a pairing code…</div>';
+    try {
+      const res = await api.account.pairCodes(server, chosen.value);
+      el.innerHTML = pairCodeHtml(res.code);
+      wirePairCodeCopies(el);
+      sessionStorage.setItem(PAIR_POLL_KEY, '1');
+    } catch (e) {
+      if (e.status === 401) {
+        api.account.setToken(null);
+        toast('Account session expired — sign in again', 'error');
+        renderLoginView('account');
+        return;
+      }
+      el.innerHTML = `<div class="error-panel"><p>${esc(e.message)}</p></div>`;
+    }
+  };
+}
+
 // Shared pairing-code panel: used by the login screen's Add-device wizard
 // and the Settings → Account & Sync panel. The code is single-use and
 // expires in 10 minutes (server-side); copy buttons wire via delegation-
@@ -4103,16 +4124,8 @@ route('/settings', async () => {
       } catch (e) { toast(e.message || 'Key creation failed', 'error'); }
     };
 
-    document.getElementById('acct-pair').onclick = async () => {
-      const el = document.getElementById('acct-pair-once');
-      el.innerHTML = '<div class="faint">Requesting a pairing code…</div>';
-      try {
-        const res = await api.account.pairCodes(server);
-        el.innerHTML = pairCodeHtml(res.code);
-        wirePairCodeCopies(el);
-      } catch (e) {
-        el.innerHTML = `<div class="error-panel"><p>${esc(e.message)}</p></div>`;
-      }
+    document.getElementById('acct-pair').onclick = () => {
+      mintPairCode(server, document.getElementById('acct-pair-once'));
     };
 
     bodyEl.querySelectorAll('[data-revoke]').forEach(btn => {
