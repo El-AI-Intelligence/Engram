@@ -7,6 +7,11 @@
 # macOS binaries are signed + notarized with a Developer ID Application
 # certificate when the APPLE_* secrets are present; when absent the build
 # ships unsigned with a warning (by design — never blocks a release).
+# Windows binaries are signed via Azure Artifact Signing when the AZURE_*
+# secrets and ARTIFACT_SIGNING_* vars are present (see
+# docs/engram-product/SIGNING.md); when absent they ship unsigned with a
+# warning. Signing matters on Windows beyond cosmetics: Smart App Control
+# hard-blocks unsigned binaries with NO user-facing bypass.
 
 name: Release
 
@@ -22,6 +27,8 @@ on:
 permissions:
   contents: write
   packages: write
+  # azure/login OIDC needs the GitHub JWT to exchange for an Azure token.
+  id-token: write
 
 jobs:
   # ── Run tests ────────────────────────────────────────────────────────────
@@ -81,6 +88,16 @@ jobs:
       APPLE_ID: ${{ secrets.APPLE_ID }}
       APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
       APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      # Azure Artifact Signing (Windows). Secrets can't be referenced in a
+      # job-level `if`, so the guard is surfaced as env (same idiom as the
+      # crates.io publish job below).
+      HAS_AZURE_SIGNING: ${{ secrets.AZURE_CLIENT_ID != '' }}
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      ARTIFACT_SIGNING_ENDPOINT: ${{ vars.ARTIFACT_SIGNING_ENDPOINT || 'https://eus.codesigning.azure.net' }}
+      ARTIFACT_SIGNING_ACCOUNT: ${{ vars.ARTIFACT_SIGNING_ACCOUNT }}
+      ARTIFACT_SIGNING_PROFILE: ${{ vars.ARTIFACT_SIGNING_PROFILE }}
     strategy:
       fail-fast: false
       matrix:
@@ -173,6 +190,52 @@ jobs:
 
       - name: Build
         run: cargo build --release -p engramd -p engramd-mcp --target ${{ matrix.target }}
+
+      # ── Windows: sign with Azure Artifact Signing (secrets-guarded) ──────
+      # MUST run before packaging so the zip and its .sha256 sidecar contain
+      # the signed binaries. OIDC: the runner's GitHub JWT (id-token: write)
+      # is exchanged via azure/login against a federated credential on the
+      # signing App Registration.
+      - name: Azure login (OIDC)
+        if: matrix.os == 'windows-latest' && env.HAS_AZURE_SIGNING == 'true'
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sign Windows binaries (Artifact Signing)
+        if: matrix.os == 'windows-latest' && env.HAS_AZURE_SIGNING == 'true'
+        uses: azure/artifact-signing-action@v2
+        with:
+          endpoint: ${{ env.ARTIFACT_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ env.ARTIFACT_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ env.ARTIFACT_SIGNING_PROFILE }}
+          # All three binaries that ship in the zip. Artifact Signing
+          # certificates live ~3 days, so the RFC3161 timestamp is what
+          # keeps signatures valid after expiry.
+          files: |
+            ${{ github.workspace }}\target\x86_64-pc-windows-msvc\release\engram.exe
+            ${{ github.workspace }}\target\x86_64-pc-windows-msvc\release\engramd.exe
+            ${{ github.workspace }}\target\x86_64-pc-windows-msvc\release\engramd-mcp.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Verify Windows signatures
+        if: matrix.os == 'windows-latest' && env.HAS_AZURE_SIGNING == 'true'
+        shell: pwsh
+        run: |
+          foreach ($bin in 'engram.exe', 'engramd.exe', 'engramd-mcp.exe') {
+            $sig = Get-AuthenticodeSignature "target/${{ matrix.target }}/release/$bin"
+            Write-Host "$bin -> $($sig.Status) | $($sig.SignerCertificate.Subject)"
+            if ($sig.Status -ne 'Valid') { Write-Error "$bin signature invalid: $($sig.StatusMessage)"; exit 1 }
+          }
+
+      - name: Warn when shipping unsigned Windows binaries
+        if: matrix.os == 'windows-latest' && env.HAS_AZURE_SIGNING != 'true'
+        run: |
+          echo "::warning::Azure Artifact Signing not configured (AZURE_* secrets / ARTIFACT_SIGNING_* vars absent) — Windows binaries ship UNSIGNED. SmartScreen will warn, and Smart App Control machines cannot run them at all (no user bypass). Setup: docs/engram-product/SIGNING.md"
 
       # ── Package: unix (unsigned or pre-signing) ───────────────────────────
       - name: Package (unix)
